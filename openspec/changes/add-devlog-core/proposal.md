@@ -1,6 +1,6 @@
 ## Why
 
-The four-role OpenSpec agent workflow (orchestrator/architect, worker(s), reviewer, supervisor) talks
+The OpenSpec agent workflow (analyst/architect, worker(s), reviewer, supervisor) talks
 through `DEVLOG.md`, a Markdown file every role edits by hand. The format asks for two contradictory
 disciplines in one file — an append-only thread *plus* a pinned `## NEXT` block that must be rewritten in
 full on every write — and nothing enforces either. In a real four-section change `## NEXT` grew to 14 KB
@@ -42,7 +42,7 @@ the point of writing and doing the right thing is the path of least resistance.
 - `append-only-log`: the record model — record kinds, authorship and role attribution, section/block
   references, and Markdown bodies supplied on stdin and stored verbatim.
 - `work-items`: item lifecycle — kinds, tool-assigned IDs, blocking flag, addressee, `close` records,
-  state derived from open + close, and the orchestrator-only close guardrail.
+  state derived from open + close, and the declared-closer close guardrail.
 - `next-state`: NEXT as a repeated append-only narrative record whose latest instance is current,
   rendered together with the open items.
 - `external-references`: generic `namespace:id` references, attachable to records and queryable.

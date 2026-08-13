@@ -19,9 +19,9 @@
       (`append-only-log`)
 - [ ] 2.5 Implement exclusive locking and atomic append: the complete line or nothing, `seq` assigned
       under the lock (D11)
-- [ ] 2.6 Implement the `header` record — carrying `format`, `tool`, `change` and the declared `roles`
-      (D13); written on file creation, and appended again whenever the writing tool version or the role
-      set differs from the last header
+- [ ] 2.6 Implement the `header` record — carrying `format`, `tool`, `change`, the declared `roles` and
+      `closers` (D13), and no `role` of its own; written on file creation, and appended again whenever the
+      writing tool version or the declaration differs from the last header
 - [ ] 2.7 Round-trip test: write a log of every record kind, re-read it, assert every field and the
       ordering survive
 
@@ -42,15 +42,16 @@
 - [ ] 4.4 `devlog item --type --to --blocking` — raises an item, assigns the next `#n`, prints the
       identifier (D6, D9)
 - [ ] 4.5 `devlog close --item --state` — requires a body as the reason; refuses a close from any role
-      other than the orchestrator, with a message naming the guardrail (`work-items`)
+      the header did not declare as a closer, with a message naming the guardrail (`work-items`)
 - [ ] 4.6 `devlog verdict --section --block --outcome --commit` — typed review verdicts (D7)
 - [ ] 4.7 `devlog next` — appends the narrative record (`next-state`)
 - [ ] 4.8 `--ref ns:id` accepted and stored on every write command, repeatable, unvalidated (D10,
       `external-references`)
 - [ ] 4.9 Reject writes that omit the author role, and validate enum values (`type`, `state`, `outcome`)
       against their permitted sets
-- [ ] 4.10 `devlog header --change --role <r>` (repeatable) — declares the project's role set, creating
-      the log or appending a new header when the set changes (D13)
+- [ ] 4.10 `devlog header --change --role <r>` (repeatable) `--closer <r>` (repeatable) — declares the
+      project's role set and which roles may close items, creating the log or appending a new header when
+      the declaration changes; the `header` record itself carries no role (D13)
 - [ ] 4.11 Reject a write whose `--role` is not in the latest header's declared set, reporting which
       roles are declared (D13, `append-only-log`)
 

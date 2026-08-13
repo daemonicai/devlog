@@ -8,7 +8,7 @@ place.
 
 #### Scenario: Updating what comes next
 
-- **WHEN** the orchestrator records a new NEXT
+- **WHEN** the architect records a new NEXT
 - **THEN** it is appended, it becomes current, and the previous NEXT remains in the history unaltered
 
 #### Scenario: Reading the current NEXT
@@ -29,7 +29,7 @@ because those are derived from the items themselves.
 
 #### Scenario: Tracked state is not retyped
 
-- **WHEN** the orchestrator records a NEXT while several items are open
+- **WHEN** the architect records a NEXT while several items are open
 - **THEN** it writes only the narrative, and the open items are not repeated in the body
 
 ### Requirement: The current state is rendered from the narrative plus the open items

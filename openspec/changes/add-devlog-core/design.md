@@ -211,7 +211,7 @@ One JSON object per line. Fields common to all kinds:
 | `kind` | string | one of the eight kinds; determines the remaining fields |
 | `seq` | int | assigned under lock, strictly increasing, contiguous — the total order |
 | `ts` | string | ISO 8601 UTC |
-| `role` | string | must be one of the roles declared in the log's latest `header` (D13) |
+| `role` | string | must be one of the roles declared in the log's latest `header`; absent on `header` itself (D13) |
 | `section` | string | optional — the `tasks.md` section, e.g. `"3"` |
 | `block` | string | optional — task range, e.g. `"3.1-3.3"` |
 | `to` | string | optional — addressed role |
@@ -222,7 +222,7 @@ Per-kind fields:
 
 | `kind` | Additional fields | Purpose |
 |---|---|---|
-| `header` | `format` int, `tool` string, `change` string, `roles` array of string | provenance and the project's declared role set; first line, and appended again whenever a different tool version writes or the role set changes (D13) |
+| `header` | `format` int, `tool` string, `change` string, `roles` array of string, `closers` array of string | provenance, the project's declared role set, and which of those roles may close items; carries no `role` of its own; first line, and appended again whenever a different tool version writes or the declaration changes (D13) |
 | `section` | `title`, `base` (commit sha) | opens a section and fixes the supervisor's diff range |
 | `brief` | — | the architect's block brief, addressed to a worker |
 | `post` | — | thread traffic: progress, answers, handoffs |
@@ -234,7 +234,7 @@ Per-kind fields:
 Example:
 
 ```jsonl
-{"kind":"header","seq":1,"ts":"2026-08-12T09:00:00Z","format":1,"tool":"devlog 0.1.0","change":"add-devlog-core","roles":["architect","worker-frontend","reviewer","supervisor"]}
+{"kind":"header","seq":1,"ts":"2026-08-12T09:00:00Z","format":1,"tool":"devlog 0.1.0","change":"add-devlog-core","roles":["analyst","architect","worker-frontend","reviewer","supervisor"],"closers":["architect"]}
 {"kind":"section","seq":2,"ts":"2026-08-12T09:01:00Z","role":"architect","section":"3","title":"Submission form","base":"a1b2c3d","body":"Submission form, validation, and the submit pipeline."}
 {"kind":"brief","seq":3,"ts":"2026-08-12T09:02:00Z","role":"architect","section":"3","block":"3.1-3.3","to":"worker-frontend","refs":[{"ns":"D","id":"2"}],"body":"Build the form + validation.\n\n**Decision:** debounce on submit, not keystroke."}
 {"kind":"item","seq":5,"ts":"2026-08-12T10:15:00Z","role":"worker-frontend","section":"3","block":"3.1-3.3","item":1,"type":"question","to":"architect","blocking":true,"refs":[{"ns":"S","id":"4"}],"body":"Spec says 300ms, design says 500ms. Which wins?"}
@@ -256,10 +256,11 @@ understands is refused with a clear message rather than guessed at.
 - **More calls per block than the Markdown file required.** Three findings become three invocations
   (D6), and reviews now emit a typed verdict (D7). The trade is deliberate: ceremony at write time buys
   state that cannot drift.
-- **Reviewer approval does not close the finding.** Only the orchestrator closes, so an approval is a
+- **Reviewer approval does not close the finding.** Only a declared closing role closes, so an approval is a
   signal and the close is a separate step. In the example log that is 41 verdicts and 7 request-changes
   worth of extra traffic. Kept because the Product Owner set the guardrail explicitly.
 - **The close guardrail is not enforcement.** Roles are self-declared; the tool refuses a close from a
-  non-orchestrator, but nothing prevents an agent claiming the role. Documented as a guardrail, and a
+  role the header did not declare as a closer, but nothing prevents an agent claiming that role.
+  Documented as a guardrail, and a
   spec scenario asserts the documentation says so.
 - **Zig 0.16 is pre-1.0.** Build API churn between releases is expected maintenance.

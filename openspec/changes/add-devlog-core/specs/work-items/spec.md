@@ -65,22 +65,25 @@ or superseded.
 - **WHEN** a closed item is inspected
 - **THEN** who closed it, when, and why are all recoverable
 
-### Requirement: Only the orchestrator may close an item
+### Requirement: Only a declared closing role may close an item
 
-The tool SHALL refuse a close from any role other than the orchestrator. This SHALL be a guardrail rather
-than a security boundary: the calling role is self-declared and unverified, so the tool SHALL make the
-correct path the easy one while the documentation SHALL state plainly that the restriction relies on
-agents honouring it.
+The `header` SHALL declare which of the project's roles may close items. The tool SHALL refuse a close
+from any role not so declared. This SHALL be a guardrail rather than a security boundary: the calling role
+is self-declared and unverified, so the tool SHALL make the correct path the easy one while the
+documentation SHALL state plainly that the restriction relies on agents honouring it.
+
+The closing role SHALL be named by the project rather than fixed by the tool, consistent with the role set
+itself being declared per project.
 
 #### Scenario: A worker attempts to close an item
 
-- **WHEN** a worker tries to close an item
-- **THEN** the tool refuses and explains that only the orchestrator closes items
+- **WHEN** a worker tries to close an item and is not a declared closing role
+- **THEN** the tool refuses and explains which roles may close items
 
 #### Scenario: A reviewer signals rather than closes
 
 - **WHEN** a reviewer is satisfied that a finding it raised has been addressed
-- **THEN** it records that judgement, and the item remains open until the orchestrator closes it
+- **THEN** it records that judgement, and the item remains open until a declared closing role closes it
 
 #### Scenario: The limits of the guardrail are documented
 

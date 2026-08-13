@@ -1195,6 +1195,189 @@ bug is an argument for the spec. Second: the supervisor's section review sat **u
 tree while this was diagnosed. A `git checkout` or `git stash` on that path would have destroyed it with no
 copy anywhere. Commit the DEVLOG when a post lands, not only when a block does.
 
+**[architect]** **Product Owner decisions on supervisor findings B2 and B3 — both settled, artefacts
+amended, `VALIDATE_EXIT:0`.**
+
+**B2 — the `header` is exempt from attribution.** Their call: the record that declares the role set does
+not itself carry a role. That dissolves the circularity rather than working around it — requiring the
+first header to name a role drawn from the set it is establishing is unsatisfiable, not merely awkward.
+`design.md`'s `role` row now reads "absent on `header` itself"; `append-only-log` gains an exemption
+sentence and a `#### Scenario: The header carries no role`; 2.6 and 4.10 say the header carries no role of
+its own.
+
+**B3 — `orchestrator` is retired as a role name entirely.** Their words: *"`orchestrator` should never be
+used as a role; the top-level/main Claude session acts as `analyst` and `architect`, with `architect`
+being the one that will most often be used in a devlog, briefing the other agents, presenting decisions
+from the Product Owner."* So the log's vocabulary now matches `CLAUDE.md`'s two hats rather than inventing
+a third term for the same session.
+
+**B3's second half — who may close.** Retiring the name left the close guardrail with no subject, and
+`work-items` needs one. Put to the Product Owner as a distinct question, because the obvious fix — teach
+the tool the name `architect` — would have put a role name back into the format that D13 had just taken
+out. They chose: **the header declares its closers**, alongside the roles. `devlog header` gains a
+repeatable `--closer <r>`, the record gains a `closers` array, and `work-items`' requirement is now
+*"Only a declared closing role may close an item"*. D13 stays whole: the tool still fixes no vocabulary,
+and a project that renames its roles keeps its guardrail. Rejected alternatives are recorded in the
+question rather than here — hardcoding `architect` (re-fixes vocabulary), and first-declared-role-wins
+(invisible at the call site; reordering flags would move the authority silently).
+
+Amended: `design.md` (record schema `role` and `header` rows, the example header line, two D7
+consequence bullets), `specs/work-items/spec.md` (requirement retitled, two scenarios), 
+`specs/next-state/spec.md` (two scenarios), `specs/append-only-log/spec.md` (exemption + scenario),
+`tasks.md` (2.6, 4.5, 4.10), `proposal.md` (two references). **`docs/adrs/ADR-0003` is deliberately left
+saying "orchestrator/architect"** — it is a dated, accepted record of a decision made on 2026-08-12, and
+amending it would falsify history rather than correct it.
+
+`src/main.zig:28` and `:123` still ship "(orchestrator only)" in `--help` — that is code, and goes into
+the remediation block with B4.
+
+**[worker]** Remediation block, B4 + the code half of B3. Ticks nothing, no new `N.M` numbers — the
+findings and this post are the record.
+
+**B4 — repeated `--role` no longer silently overwrites.** `src/main.zig:53` gains `role_repeated: bool`;
+`parseArgs`'s `--role` branch (`:78-93`) now sets it instead of last-wins assignment when `p.role` is
+already set, and `run()` reports it in the same ambiguity-precedence tier as `unknown_flag` /
+`missing_value_for` / `role_empty` (`:180-183`) — before `--help`/`--version`, per the section's own
+ruling.
+
+**Scope call, as asked: took the narrow fix (reject the repeat), not the broad one (make `--role`
+genuinely repeatable now).** Reasoning: `--role`'s two meanings are command-scoped and not yet unified.
+For every command except `header`, `--role` is single-valued — "the calling role" that 4.9 will validate
+as exactly one declared role per write. Task 4.10's `devlog header --role <r>` (repeatable) means
+something structurally different: it's collecting a *set* to declare, not naming one caller. Building
+genuine repeatability into `parseArgs` today would mean either (a) making `--role` collect an array
+unconditionally, silently changing the single-valued semantics every other command depends on before 4.9
+exists to enforce "exactly one", or (b) teaching the dispatcher which command it's parsing for before
+flags are resolved, so it can choose arity per command — that's exactly the "record-writing structure
+4.10 owns" the brief warned off. It would also require an allocator through `parseArgs`/`Parsed`/`run`
+(currently zero-allocation by design, per the block-1.4 comment), a signature change 4.10 may want to make
+for its own reasons but that this remediation block has no brief to make. The narrow fix — reject a second
+`--role` outright, for every command including `header` — removes the silent-overwrite hazard today
+without deciding 4.10's arity question for it. `devlog header --role architect --role reviewer` now
+correctly fails loud (`--role given more than once`) rather than silently declaring one role; 4.10 is free
+to relax that check specifically for `header` once it builds the collecting structure it needs anyway.
+
+Also added one line to the global `--role` help text (`Given at most once.`) so the constraint is
+discoverable, not just enforced — ADR-0003 makes `--help` the whole discovery mechanism.
+
+**B3, code half — "orchestrator" retired from `--help`.** `src/main.zig:28` (command table) and `:123`
+(top-level help) both changed from `Close a work item with a reason (orchestrator only).` to `Close a
+work item with a reason (declared closers only).` — matches the amended `work-items` requirement title
+("Only a declared closing role may close an item") and `tasks.md:44-45`'s wording. `grep -rn orchestrator
+src/` now returns nothing.
+
+**Tests.** 3 added, all in the ambiguity-precedence family alongside the existing `role_empty`/
+`unknown_flag` tests: a second `--role` is rejected rather than overwritten; a repeated `--role` beats a
+well-formed `--version` on the same line (mirrors the existing "an unknown flag beats --version" test);
+and a repeated `--role` whose second value is itself empty is still reported as *repeated*, not as
+*empty* (pins the check order in `parseArgs`). 25 tests total — counted with `grep -c '^test '
+src/main.zig`, not self-reported from memory, per the last two rounds' correction.
+
+**Gates, full set, in-sandbox:**
+```
+BUILD_EXIT:0
+TEST_EXIT:0
+FORMAT_EXIT:0
+Change 'add-devlog-core' is valid
+VALIDATE_EXIT:0
+GATES_EXIT:0
+```
+
+Out of scope, untouched: B1 (DEVLOG restore) and B2 (header exemption) — both already closed by the
+architect's posts above this one. No record types, JSON, log file, locking, or stdin work. No `tasks.md`
+ticks, no commit, no `Makefile` edit.
+
+**[worker]** → @reviewer — B4 (narrow fix, reasoning above) and B3's code half ready for audit.
+
+**[reviewer]** Audit of the section 1 remediation block, working-tree diff on top of `befbdae`. Re-ran
+the gates myself from a clean cache: `BUILD_EXIT:0 TEST_EXIT:0 FORMAT_EXIT:0`, `Change 'add-devlog-core'
+is valid`, `VALIDATE_EXIT:0 GATES_EXIT:0`. Also ran `zig build test --summary all` directly: `25/25 tests
+passed` — matches the reported count exactly, first time in three rounds. Noted for the record since the
+last two rounds needed correcting on this.
+
+**Verdict: Approve.**
+
+**1. The narrow fix is the right call, and it doesn't store up new trouble for 4.10 — the trouble it
+half-exposes was already unavoidable.** Even under the old last-wins behaviour, `header --role architect
+--role reviewer` would have collapsed to a single role (`"reviewer"`), which is just as unusable for
+4.10 as today's outright rejection — `Parsed.role: ?[]const u8` cannot represent a *set* either way, so
+4.10 was always going to need a new data model for `header`'s declaration, not a relaxation of an
+existing one. Rejecting loud is strictly better than the alternative it replaces: a caller probing
+`header --role X --role Y` today gets an honest "not supported yet" rather than a silently-collapsed,
+wrong-looking success. The worker's own comment says 4.10 is "free to relax that check specifically for
+`header`" — confirmed true by inspection: the check is one `if (p.role != null)` gate inside a single
+branch (`src/main.zig:81-93`), trivially bypassable for one command once the dispatcher is taught which
+command it's parsing for.
+
+That said, there's a real seam here worth naming for whoever briefs 4.10, not a defect in this block:
+`tasks.md:52`'s `--role <r>` (repeatable, on `header`) and every other command's `--role` (single-valued,
+attribution) are **the same flag name for two different concepts** — one collects a set to declare, the
+other names one caller — and that overload predates this remediation round (it's baked into 4.10's task
+text itself). Today's global, position-independent, single-valued `--role` handling can't express both,
+so 4.10 will need real command-scoped arity in the dispatcher, not just a relaxed repeat-check. Worth one
+sentence in that brief so the worker doesn't have to rediscover the tension from scratch.
+
+**2. `role_repeated` sits correctly in the precedence tier — placed by care, not by structure, exactly as
+predicted.** Checked the actual position (`src/main.zig:200-203`): it's grouped with `unknown_flag` /
+`missing_value_for` / `role_empty`, above the "past this point the line is coherent" boundary comment at
+`:205`, ahead of `--help`/`--version`. This is the fourth ambiguity condition added since the precedence
+tier was established two rounds ago, and it landed in the right place — but by the same mechanism I
+flagged as fragile last round: nothing in the code forces it there, the worker read the existing pattern
+and matched it. Getting it right once is evidence the convention is *followable*, not evidence it's
+*enforced* — a fifth condition (plausibly 4.8's `--ref` shape check) is still one misplaced `if` away
+from silently landing in the wrong tier, clean build and format included. Repeating the suggestion from
+last round, now with more weight behind it since it's the pattern actually recurring:
+`Parsed.isAmbiguous()` (or equivalent) would make the category a single checkable expression instead of
+four ordered `if`s relying on comment discipline. Non-blocking here; worth surfacing in whichever brief
+adds the next condition.
+
+One asymmetry found while probing the boundary, not in the ruling this time but in `parseArgs`'s own
+internal ordering — confirmed against the rebuilt binary, not just traced:
+```
+$ devlog --role "" --role architect post
+devlog: --role requires a non-empty value
+```
+An empty-then-valid `--role` reports `role_empty`, not `role_repeated`, because `p.role` is only ever set
+in the *valid* branch (`src/main.zig:85`) — the empty first occurrence never populates it, so the
+`p.role != null` repeat-check the second time through sees nothing to have repeated. The reverse order
+(valid-then-empty) is tested and correctly reports "repeated" (`src/main.zig:390-397`); this order isn't.
+Both orderings still fail loud with a true, honest message and exit 1 — nothing is silently accepted — so
+this is a diagnostic-wording asymmetry, not a correctness gap. Not blocking; a nit worth a fourth test if
+anyone's back in this function for 4.9.
+
+**3. Coherence of the six amended artefacts against the code and each other — checked line by line, all
+consistent.** `grep -rn orchestrator` across `openspec/changes/add-devlog-core/` and `src/` returns
+nothing except `DEVLOG.md` (the historical record, correctly untouched) — `docs/adrs/ADR-0003` still says
+"orchestrator/architect" as directed, a dated record left alone. Cross-checked every amended file against
+the other five:
+- `design.md:214`'s `role` row ("absent on `header` itself") agrees with `append-only-log/spec.md:32-36`'s
+  new exemption sentence and scenario, and with the example header record (`design.md:237`) which now
+  carries `roles` and `closers` but no `role` field of its own.
+- `design.md:225`'s `header` row, `specs/work-items/spec.md:65-83`'s retitled requirement ("Only a
+  declared closing role may close an item"), `tasks.md:44-45` (4.5) and `tasks.md:52-54` (4.10) all use
+  the same "declared closer(s)" language — no artefact still says "the orchestrator."
+- `specs/next-state/spec.md`'s two scenarios now attribute NEXT-writing to "the architect," matching
+  `proposal.md`'s "analyst/architect" framing and `CLAUDE.md`'s two-hat model — no third role name
+  invented to fill the gap.
+- `src/main.zig:28,138`'s `--help` text ("declared closers only") matches `work-items`'s requirement
+  title exactly, not a paraphrase that could drift.
+- The example header line's `closers":["architect"]` is drawn from the same `roles` array two fields
+  over — internally consistent, not an orphaned value.
+
+Nothing in the code assumes the retired model: `main.zig` never validates `--role` against any set, never
+special-cases a role name, and never requires `--role` on `header` specifically (role enforcement is
+4.9/4.11's, unbuilt) — so there's nothing in this block that could contradict B2's exemption even latently.
+
+**4. Test count verified, not trusted:** `grep -c '^test ' src/main.zig` → 25, `zig build test --summary
+all` → `25/25 tests passed`. Matches the report exactly.
+
+**Everything else re-checked:** the three new tests (`src/main.zig:369-397`) each assert a real outcome
+(exit code + stderr substring), not just that the code runs; no `Makefile` edit; no `tasks.md` ticks; no
+commit; B1 and B2 correctly left to the architect's posts rather than touched here.
+
+Remediation block is clear for gates, ticks, and commit. Ready for the supervisor's re-run on the whole
+section.
+
 ## NEXT
 
 **[architect]** Section 1 is code-complete but **NOT closed** — the supervisor returned `Request changes`

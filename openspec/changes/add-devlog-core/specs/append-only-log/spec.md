@@ -29,10 +29,19 @@ flexibility is in what a project may declare, not in whether a writer may invent
 writing — an undeclared role is far more often a typo that would silently fragment attribution than a
 genuine new participant.
 
+The `header` record SHALL be exempt from attribution, because it is the record that establishes the
+declared set: requiring it to carry a role drawn from the set it is itself declaring cannot be satisfied
+for the first header in a log.
+
 #### Scenario: Attribution is required
 
-- **WHEN** an agent writes a record without stating its role
+- **WHEN** an agent writes a record of any kind other than `header` without stating its role
 - **THEN** the tool rejects the write and explains that attribution is required
+
+#### Scenario: The header carries no role
+
+- **WHEN** the record declaring the project's roles is written
+- **THEN** it is accepted without a role, since it is what establishes which roles exist
 
 #### Scenario: A project declares its own roles
 

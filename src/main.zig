@@ -25,7 +25,7 @@ const commands = [_]CommandSpec{
     .{ .name = "brief", .summary = "Post the architect's block brief to a worker.", .section = "4" },
     .{ .name = "post", .summary = "Post general working-channel traffic.", .section = "4" },
     .{ .name = "item", .summary = "Raise a work item and print its identifier.", .section = "4" },
-    .{ .name = "close", .summary = "Close a work item with a reason (orchestrator only).", .section = "4" },
+    .{ .name = "close", .summary = "Close a work item with a reason (declared closers only).", .section = "4" },
     .{ .name = "verdict", .summary = "Record a typed review verdict for a block.", .section = "4" },
     .{ .name = "next", .summary = "Append the current NEXT narrative.", .section = "4" },
     .{ .name = "resume", .summary = "Show the current NEXT, open items for a role, and its latest brief.", .section = "6" },
@@ -51,6 +51,7 @@ const Parsed = struct {
     log_path: ?[]const u8 = null,
     role: ?[]const u8 = null,
     role_empty: bool = false,
+    role_repeated: bool = false,
     help: bool = false,
     version: bool = false,
     command: ?[]const u8 = null,
@@ -80,7 +81,20 @@ fn parseArgs(args: []const [:0]const u8) Parsed {
                 if (p.missing_value_for == null) p.missing_value_for = "--role";
             } else {
                 i += 1;
-                if (args[i].len == 0) p.role_empty = true else p.role = args[i];
+                // A second --role is a parse ambiguity, not a last-wins
+                // overwrite (DEVLOG ## 1, supervisor finding B4): the tool
+                // cannot tell which value the caller meant, so silently
+                // keeping one and dropping the other is exactly the class
+                // of accident this tool exists to prevent. `header`'s
+                // repeatable --role (task 4.10) is a distinct, command-
+                // scoped meaning this dispatcher does not build yet.
+                if (p.role != null) {
+                    p.role_repeated = true;
+                } else if (args[i].len == 0) {
+                    p.role_empty = true;
+                } else {
+                    p.role = args[i];
+                }
             }
         } else if (p.command == null and !std.mem.startsWith(u8, arg, "-")) {
             p.command = arg;
@@ -110,7 +124,8 @@ fn printTopHelp(w: *Io.Writer) void {
         \\                   command below. Never inferred or guessed.
         \\    --role <role>  The calling role, as declared for this project by
         \\                   'devlog header' (any name the project has
-        \\                   declared). Carried on every write.
+        \\                   declared). Carried on every write. Given at most
+        \\                   once.
         \\    --help         Show this help, or a command's help after its name.
         \\    --version      Print the tool version and exit.
         \\
@@ -120,7 +135,7 @@ fn printTopHelp(w: *Io.Writer) void {
         \\    brief     Post the architect's block brief to a worker.
         \\    post      Post general working-channel traffic.
         \\    item      Raise a work item and print its identifier.
-        \\    close     Close a work item with a reason (orchestrator only).
+        \\    close     Close a work item with a reason (declared closers only).
         \\    verdict   Record a typed review verdict for a block.
         \\    next      Append the current NEXT narrative.
         \\    resume    Show NEXT, open items, and the latest brief for a role.
@@ -179,6 +194,11 @@ fn run(args: []const [:0]const u8, stdout: *Io.Writer, stderr: *Io.Writer) u8 {
 
     if (p.role_empty) {
         stderr.print("devlog: --role requires a non-empty value\n", .{}) catch {};
+        return 1;
+    }
+
+    if (p.role_repeated) {
+        stderr.print("devlog: --role given more than once — see --help\n", .{}) catch {};
         return 1;
     }
 
@@ -344,6 +364,36 @@ test "header (D13) is a known command, listed and dispatched like the rest" {
 
 test "--role with an empty value is rejected" {
     try expectRun(std.testing.allocator, &.{ "--role", "", "post" }, 1, null, "non-empty");
+}
+
+test "a second --role is rejected, not silently overwritten (supervisor finding B4)" {
+    try expectRun(
+        std.testing.allocator,
+        &.{ "--role", "architect", "--role", "reviewer", "post" },
+        1,
+        null,
+        "--role given more than once",
+    );
+}
+
+test "a repeated --role beats a well-formed --version on the same line" {
+    try expectRun(
+        std.testing.allocator,
+        &.{ "--role", "architect", "--role", "reviewer", "--version" },
+        1,
+        null,
+        "--role given more than once",
+    );
+}
+
+test "a repeated --role where the second value is empty is still reported as repeated" {
+    try expectRun(
+        std.testing.allocator,
+        &.{ "--role", "architect", "--role", "", "post" },
+        1,
+        null,
+        "--role given more than once",
+    );
 }
 
 test "--log with no following value is rejected" {
