@@ -19,6 +19,9 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
     });
     root_module.addOptions("build_options", options);
+    // Exists solely so the "version is embedded via the build option, not
+    // duplicated" test in src/main.zig can reach build.zig.zon directly —
+    // no production code consumes "manifest".
     root_module.addAnonymousImport("manifest", .{ .root_source_file = b.path("build.zig.zon") });
 
     const exe = b.addExecutable(.{

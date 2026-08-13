@@ -4,9 +4,9 @@
       single binary with no third-party dependencies (ADR-0001, ADR-0002)
 - [x] 1.2 Add the MPL 2.0 `LICENSE` and per-file licence headers (D12)
 - [x] 1.3 Add `zig build test` wiring and one trivial passing test, so every later section has a harness
-- [ ] 1.4 Implement subcommand dispatch and global flags (`--log <path>`, `--role`, `--help`,
+- [x] 1.4 Implement subcommand dispatch and global flags (`--log <path>`, `--role`, `--help`,
       `--version`), with `--help` output for the top level and each subcommand (ADR-0003)
-- [ ] 1.5 Implement the error-reporting convention — non-zero exit, message on stderr, nothing partial
+- [x] 1.5 Implement the error-reporting convention — non-zero exit, message on stderr, nothing partial
       written
 
 ## 2. Record model and the log file
@@ -19,8 +19,9 @@
       (`append-only-log`)
 - [ ] 2.5 Implement exclusive locking and atomic append: the complete line or nothing, `seq` assigned
       under the lock (D11)
-- [ ] 2.6 Implement the `header` record — written on file creation, and appended again whenever the
-      writing tool version differs from the last header
+- [ ] 2.6 Implement the `header` record — carrying `format`, `tool`, `change` and the declared `roles`
+      (D13); written on file creation, and appended again whenever the writing tool version or the role
+      set differs from the last header
 - [ ] 2.7 Round-trip test: write a log of every record kind, re-read it, assert every field and the
       ordering survive
 
@@ -48,6 +49,10 @@
       `external-references`)
 - [ ] 4.9 Reject writes that omit the author role, and validate enum values (`type`, `state`, `outcome`)
       against their permitted sets
+- [ ] 4.10 `devlog header --change --role <r>` (repeatable) — declares the project's role set, creating
+      the log or appending a new header when the set changes (D13)
+- [ ] 4.11 Reject a write whose `--role` is not in the latest header's declared set, reporting which
+      roles are declared (D13, `append-only-log`)
 
 ## 5. Derived state
 

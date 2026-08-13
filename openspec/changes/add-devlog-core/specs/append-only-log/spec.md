@@ -19,18 +19,35 @@ expressed as further records that refer to the earlier one.
 
 ### Requirement: Every record is attributed to a role
 
-Every record SHALL carry the role that wrote it. The roles SHALL cover the workflow's participants:
-orchestrator/architect, worker (including per-stack workers), reviewer, and supervisor.
+Every record SHALL carry the role that wrote it. The set of roles SHALL be declared per project rather
+than fixed by the tool, so that a project can name whatever participants its workflow actually has. The
+declared set SHALL live in the log's own `header` record, so a log carries its own vocabulary and an agent
+reading it cold needs nothing external to interpret attribution.
+
+A write whose role is not in the declared set SHALL be rejected, naming the declared roles. The
+flexibility is in what a project may declare, not in whether a writer may invent a role at the point of
+writing — an undeclared role is far more often a typo that would silently fragment attribution than a
+genuine new participant.
 
 #### Scenario: Attribution is required
 
 - **WHEN** an agent writes a record without stating its role
 - **THEN** the tool rejects the write and explains that attribution is required
 
+#### Scenario: A project declares its own roles
+
+- **WHEN** a project declares a role set naming the participants of its workflow
+- **THEN** every declared role may write records, whatever those roles are named
+
 #### Scenario: A per-stack worker is distinguishable
 
-- **WHEN** a worker specialised to a stack writes a record
+- **WHEN** a project declares a worker specialised to a stack and that worker writes a record
 - **THEN** the record identifies that specific worker, not merely "a worker"
+
+#### Scenario: An undeclared role is refused
+
+- **WHEN** an agent writes a record with a role the header never declared
+- **THEN** the tool rejects the write and reports which roles are declared
 
 ### Requirement: Records reference the work they concern
 

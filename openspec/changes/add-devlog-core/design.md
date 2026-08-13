@@ -176,6 +176,32 @@ MPL 2.0. Distribution mirrors memlite: statically linked tarballs attached to ta
 macOS arm64 and Linux x86_64/arm64. Posture is "I use this, here's the source, PRs welcome, fork it if
 you want" — no support commitment implied or offered.
 
+### D13 — Roles are declared per project, in the header
+
+The tool fixes no role vocabulary. A project declares the roles its workflow actually has, and the
+declaration lives in the log's own `header` record, so the log carries its vocabulary with it and an agent
+reading it cold needs nothing external to interpret attribution. `devlog header` writes that record: it
+creates the log, and re-declaring later appends a new header, exactly as a tool-version change already
+does. The latest header wins.
+
+A write whose `role` is not in the declared set is **rejected**, naming the declared roles. The
+flexibility is in what a project may declare, not in whether a writer may invent a role mid-stream: an
+undeclared role is far more often `reviewr` than a genuine new participant, and a typo that silently
+fragments attribution is exactly the class of accident this tool exists to prevent. Adding a participant
+is a deliberate act — one `devlog header` call — rather than a side effect of a misspelling.
+
+**Rejected — a fixed enum of `architect`/`worker`/`worker-<stack>`/`reviewer`/`supervisor`.** It encodes
+one workflow's roster into the format. The four-role split is `dmons`' convention, not a property of
+keeping an append-only log, and a project with a different shape should not have to fork the tool.
+
+**Rejected — accept any non-empty string, with the declared set as documentation.** Maximum permissiveness
+at the point of writing, but it makes attribution silently unreliable: nothing catches the typo, and the
+derived per-role views (`resume --role`, the addressee index) quietly split in two.
+
+**Rejected — accept with a warning on stderr.** Costs the tool a third outcome between success and
+failure. Agents parse exit codes reliably and prose unreliably, so a warning is a rejection that doesn't
+work.
+
 ## Record schema
 
 One JSON object per line. Fields common to all kinds:
@@ -185,7 +211,7 @@ One JSON object per line. Fields common to all kinds:
 | `kind` | string | one of the eight kinds; determines the remaining fields |
 | `seq` | int | assigned under lock, strictly increasing, contiguous — the total order |
 | `ts` | string | ISO 8601 UTC |
-| `role` | string | `architect`, `worker`, `worker-<stack>`, `reviewer`, `supervisor` |
+| `role` | string | must be one of the roles declared in the log's latest `header` (D13) |
 | `section` | string | optional — the `tasks.md` section, e.g. `"3"` |
 | `block` | string | optional — task range, e.g. `"3.1-3.3"` |
 | `to` | string | optional — addressed role |
@@ -196,7 +222,7 @@ Per-kind fields:
 
 | `kind` | Additional fields | Purpose |
 |---|---|---|
-| `header` | `format` int, `tool` string, `change` string | provenance; first line, and appended again whenever a different tool version writes |
+| `header` | `format` int, `tool` string, `change` string, `roles` array of string | provenance and the project's declared role set; first line, and appended again whenever a different tool version writes or the role set changes (D13) |
 | `section` | `title`, `base` (commit sha) | opens a section and fixes the supervisor's diff range |
 | `brief` | — | the architect's block brief, addressed to a worker |
 | `post` | — | thread traffic: progress, answers, handoffs |
@@ -208,7 +234,7 @@ Per-kind fields:
 Example:
 
 ```jsonl
-{"kind":"header","seq":1,"ts":"2026-08-12T09:00:00Z","format":1,"tool":"devlog 0.1.0","change":"add-devlog-core"}
+{"kind":"header","seq":1,"ts":"2026-08-12T09:00:00Z","format":1,"tool":"devlog 0.1.0","change":"add-devlog-core","roles":["architect","worker-frontend","reviewer","supervisor"]}
 {"kind":"section","seq":2,"ts":"2026-08-12T09:01:00Z","role":"architect","section":"3","title":"Submission form","base":"a1b2c3d","body":"Submission form, validation, and the submit pipeline."}
 {"kind":"brief","seq":3,"ts":"2026-08-12T09:02:00Z","role":"architect","section":"3","block":"3.1-3.3","to":"worker-frontend","refs":[{"ns":"D","id":"2"}],"body":"Build the form + validation.\n\n**Decision:** debounce on submit, not keystroke."}
 {"kind":"item","seq":5,"ts":"2026-08-12T10:15:00Z","role":"worker-frontend","section":"3","block":"3.1-3.3","item":1,"type":"question","to":"architect","blocking":true,"refs":[{"ns":"S","id":"4"}],"body":"Spec says 300ms, design says 500ms. Which wins?"}
