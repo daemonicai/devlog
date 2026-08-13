@@ -1378,55 +1378,214 @@ commit; B1 and B2 correctly left to the architect's posts rather than touched he
 Remediation block is clear for gates, ticks, and commit. Ready for the supervisor's re-run on the whole
 section.
 
+**[supervisor]** Section review, **round two**, same range `331878d..HEAD` — now six commits, adding
+`befbdae` (DEVLOG restoration) and `ecb6afc` (remediation block).
+
+### Verdict: **Approve** — section 1 is closed
+
+Gates re-run independently: `BUILD_EXIT:0 TEST_EXIT:0 FORMAT_EXIT:0 VALIDATE_EXIT:0 GATES_EXIT:0`. Test
+count counted myself: **25**.
+
+All four blockers are resolved. The D13 amendment now closes across every artefact, and section 1 is
+sound ground for section 2. Details below, then what I could not verify, then notes for `## NEXT`.
+
+---
+
+### B1 — DEVLOG restoration: verified as far as the evidence permits
+
+I checked the restoration rather than taking it. Against `eccfabe`, the one surviving revision:
+
+- its entire pre-`## NEXT` body — all 334 lines — appears **verbatim** in this file; zero lines absent
+  under an exact whole-line comparison;
+- the only 26 non-blank `eccfabe` lines not present are inside its **superseded `## NEXT`**, which is the
+  one section the format permits rewriting, so their absence is correct rather than loss;
+- exactly one `## NEXT` heading exists at line 1381 — the bootstrap-note occurrence at line 5 is now
+  intact prose (`DEVLOG.md:3–5`), the truncation is repaired, and the two are no longer confusable;
+- the `[architect]` census is 15, of which 3 post-date the incident — leaving **12 restored**, matching
+  the incident post's stated figure.
+
+**On the two caveats, which I was asked to weigh rather than accept.** Both concern content that never
+existed in any git revision, so neither is independently verifiable by me or by anyone — and that is
+precisely why stating them is the right call. A restored record that declares its own uncertain edges is
+a *better* record than an undamaged one that never had to; a silent reconstruction would have been the
+serious failure. The architect-post floor is honestly bounded and the arithmetic checks out. The
+unrecovered `## NEXT` rewrite is, by the format's own rule, not part of the durable record — `## NEXT` is
+the one rewritable section, so an intermediate state of it was never promised to survive. Neither caveat
+constitutes an open finding.
+
+The incident post (`DEVLOG.md:1159–1196`) is worth more than the text it replaced. It is the empirical
+case for the outer loop and for `next-state`'s "appended record, latest wins" design, made at the
+project's own expense. Keep it in the archive.
+
+---
+
+### B2 — Header attribution: closed, and closed more thoroughly than I asked
+
+`design.md:214` (`role` … "absent on `header` itself"), `design.md:225` and the example at `:237`,
+`append-only-log/spec.md:32–34` plus the new `#### Scenario: The header carries no role` at `:41–44`, and
+`tasks.md:22–24`. The exemption dissolves the circularity rather than special-casing around it.
+
+Worth calling out: `append-only-log/spec.md:38` was **also** amended — "an agent writes a record of any
+kind other than `header`". That scenario would otherwise have contradicted the new exemption three lines
+below it, and nothing in my finding pointed at it. That is the amendment being followed through rather
+than patched.
+
+---
+
+### B3 — The closer guardrail: closed, and the harder question was asked
+
+Retiring `orchestrator` left the guardrail subjectless, and splitting that out as its own Product Owner
+question — rather than reaching for the obvious `architect` hardcode — was the correct instinct. Hardcoding
+would have put a role name back into the format that D13 had just taken out, re-creating the exact defect
+one decision earlier. The chosen shape keeps D13 whole.
+
+Landed across `work-items/spec.md:68–79` (requirement retitled and rewritten, guardrail-not-a-security-
+boundary language preserved intact), `design.md:225`/`:237`/`:263`, `next-state/spec.md`, `tasks.md:44–45`,
+`:52`, `proposal.md:3`/`:45`, and `src/main.zig:28`/`:138`. I grepped: **no `orchestrator` remains in any
+change artefact, spec, or source file.**
+
+**On `docs/adrs/ADR-0003` — I agree with the call, and would hold it firmly.** An ADR is a dated record of
+what was decided and why, at that moment. Editing an accepted one to track a later decision destroys the
+property that makes the set worth keeping, and would over time make the ADRs indistinguishable from
+current documentation — which is what `design.md` is for. Two things make it safe here beyond the
+principle: the sentence at `ADR-0003:10` is *descriptive context about consumers*, not a normative
+vocabulary definition, so nothing can be built wrong from it; and ADR-0003's actual decision (CLI, not
+MCP) is untouched by D13. If the vocabulary change ever warrants ADR standing, the mechanism is a
+superseding ADR, not an in-place edit.
+
+---
+
+### B4 — Repeated `--role`: closed correctly, and narrowly
+
+`src/main.zig:54` adds `role_repeated`; `:91–97` sets it instead of last-wins; `:200–203` reports it in the
+**ambiguity tier**, above `--version`/`--help` — I verified the ordering, not just the presence. Three
+tests (`:369–397`) each assert exit code *and* stderr substring, including the one that matters most:
+a repeated `--role` beating a well-formed `--version` on the same line.
+
+I checked one edge the tests do not: `--role "" --role x` reports "requires a non-empty value" rather than
+"given more than once", because `role_empty` is tested first. Both faults sit in the same tier and both
+reject loudly at exit 1, so the outcome is correct and only the message names the first fault. Not a
+finding — noted so nobody rediscovers it as one.
+
+Deferring genuine command-scoped arity to 4.10 is the right call. No command needs it yet, building it now
+would be speculative, and the seam is named in the code (`:88–90`), by the reviewer, and in `## NEXT`.
+
+---
+
+### Is this sound ground for section 2?
+
+Yes, and specifically:
+
+- **2.1–2.3 (record model, JSON, parsing)** can be built from `## Record schema` alone — it is now
+  internally consistent: `role` common-but-header-exempt, `header` carrying `roles` + `closers`, the
+  example line matching the tables, and the forward-compatibility rule stated at `design.md:246–247`.
+- **2.2 (bodies verbatim)** — nothing in section 1 reads, trims or normalises a body; there is no
+  competing path to grow into.
+- **2.5 (locking, atomic append)** — section 1 touches the filesystem nowhere, so 2.5 arrives at clean
+  ground with no write path to reconcile and nothing to erode. `run()` will widen to take an allocator and
+  an `Io` handle; `expectRun` (`:267`) is a single seam, so all 25 tests widen in one edit.
+- **2.6 (the header record)** — has an unambiguous contract for the first time. This was the thing B2 and
+  B3 were blocking, and it is the immediate next thing to be built.
+
+The invariants all hold across the whole range: `build.zig.zon:6` `.dependencies = .{}`, no filesystem
+access in `src/`, no MCP or daemon surface, no embeddings, no repair/compact/migrate path, no `#n`
+namespace collision, and the close guardrail still described as a guardrail and never as a security
+boundary. Version remains genuinely single-source. Gate coverage is complete for everything the section
+shipped.
+
+Two things I flagged in round one and am **not** re-raising as findings, because they were correctly
+handled: block 1.1–1.3's missing `LABEL_EXIT` lines (a recorded version boundary, properly not
+backfilled), and the 14 `--help` stubs (the right shape — a data table with one renderer).
+
+---
+
+### Not blocking, but do these before section 4 — for `## NEXT` (@architect, yours to fold in)
+
+1. **D13's own body text never mentions `closers`.** `design.md:179–203` still describes only the `roles`
+   set. The decision that the header also declares its closers — with two considered-and-rejected
+   alternatives, `architect`-hardcoding and first-declared-role-wins — lives in the schema table, the
+   specs, tasks, code, and a DEVLOG post, but **not in `## Decisions`**, which is the binding record. The
+   DEVLOG post at `:1220–1222` says as much explicitly. Nothing is contradictory or unimplementable, which
+   is why this is not a blocker — but the rejected alternatives are the valuable part, `architect`-
+   hardcoding is exactly what a future maintainer will propose again, and D13 already carries three
+   `**Rejected —**` paragraphs because that reasoning is worth keeping. One paragraph, or a D14.
+2. **The agent definitions still state the retired rule as binding.** `.claude/agents/worker.md:65` quotes
+   "**Only the orchestrator may close an item** (`work-items`)" — a requirement that no longer exists under
+   that name or that rule; `reviewer.md:96` and `supervisor.md:113` carry the same retired framing. These
+   are the standing instructions handed to the agents that will implement and audit 4.5. The real defence
+   is that you write each block brief with spec excerpts, so this will not silently produce a hardcoded
+   `architect` — but it is drift between the surface and its documentation, it is in this section's range
+   (`4b14b81`), and it is a three-line fix. Do it before 4.5 is briefed, not after.
+3. **`tasks.md:52` overloads `--role`, and the conflict is now concrete rather than latent.** The
+   dispatcher *rejects* a repeated `--role` (`src/main.zig:200`); 4.10 needs it repeatable. Correctly
+   deferred, and recorded in three places — just make sure 4.10's brief carries the resolution (a
+   distinctly-named flag, or genuine command-scoped arity) rather than rediscovering it.
+4. **`Parsed.isAmbiguous()` — the reviewer is right, and it is now a fourth condition.** `src/main.zig:185–203`
+   is four ordered `if`s whose correctness rests on comment discipline; a new condition added below the
+   boundary comment at `:205` compiles and formats clean while being silently wrong. Section 2 adds none,
+   so this is not urgent — 4.8's `--ref ns:id` shape check is the forcing move. Do it there at the latest.
+
+My round-one notes N1–N9 are already folded in above this heading; nothing in them changed.
+
 ## NEXT
 
-**[architect]** Section 1 is code-complete but **NOT closed** — the supervisor returned `Request changes`
-with four blockers. Both blocks landed (`eccfabe` = 1.1–1.3, `3a32d66` = 1.4–1.5), all five boxes ticked,
-gates green (`BUILD_EXIT:0 TEST_EXIT:0 FORMAT_EXIT:0 VALIDATE_EXIT:0 GATES_EXIT:0`), 22 tests — counted,
-not quoted.
+**[architect]** **Section 1 is CLOSED** — supervisor `Approve` after one remediation round. Resume at
+**section 2**, opening it with its own `Base:` post (`git rev-parse --short HEAD`).
 
-**Next action is a remediation block**, which ticks nothing and takes no new `N.M` numbers. Two of its four
-items are decisions before they are edits, and both belong to the Product Owner:
+Landed: `eccfabe` (1.1–1.3), `3a32d66` (1.4–1.5), `befbdae` (DEVLOG restoration), `ecb6afc` (remediation).
+All five boxes ticked, gates `GATES_EXIT:0`, **25** tests — counted, not quoted.
 
-- **B1 — DEVLOG destroyed and restored.** Done; see the incident post above. What remains is to **commit
-  it**, which is urgent: the supervisor's own section review is currently uncommitted working-tree state.
-- **B2 — the first `header` record is unwritable as specified.** `design.md:214` makes `role` non-optional
-  and requires it to be one of the roles declared in the latest header, but the header is what declares
-  them, and `design.md:237`'s own example header carries no `role`. `append-only-log/spec.md:20` grants no
-  exemption and 4.11 has no carve-out. Latent before D13, load-bearing after it. 2.6 hits it immediately.
-  **Needs a decision**, then edits across four artefacts.
-- **B3 — "orchestrator" is enforced but no longer defined.** D13 deleted the sentence naming the roles,
-  yet `work-items/spec.md:68`, `next-state/spec.md:11,:32`, `tasks.md:44-45` and `design.md:259-264` all
-  turn on "the orchestrator", and `src/main.zig:28`/`:123` already ship "(orchestrator only)" in `--help`.
-  `roles` is a flat array with no way to mark which entry holds that authority, so **task 4.5 is not
-  implementable as amended**. **Needs a decision.**
-- **B4 — repeated `--role` silently overwrites** (`src/main.zig:53`, `:78-84`), last-wins with no
-  diagnostic, while `tasks.md:52` specifies it repeatable on `header`. Silent token loss is what this
-  section's own precedence ruling forbids. Straightforward code fix.
+**Section 2 is the first section that touches the filesystem.** Record model, JSON, `seq`, locked atomic
+appends, the `header` record. Three things the supervisor asked be *named* in its brief rather than
+discovered:
 
-**Open `❓` for the architect, to settle in section 2's brief:** every failure returns exit `1`. Tasks 2.3,
-4.11 and 6.6 all describe failures a caller may want to tell apart. No spec mandates distinct codes, so it
-is a decision — but section 2 is where it gets locked in.
+- `run()` has no allocator and no `Io` handle (`src/main.zig:159`). The `expectRun` seam makes that one
+  edit rather than 25.
+- There is no error-construction mechanism — seven hand-composed `stderr.print` + `return 1` sites today,
+  which becomes dozens across different workers if left as a pattern to copy.
+- **Every failure returns exit `1`.** Tasks 2.3, 4.11 and 6.6 all describe failures a caller may want to
+  tell apart. No spec mandates distinct codes, so this is an architect `❓` — and section 2 is where it
+  gets locked in. Settle it in the brief.
 
-Standing facts for a cold start:
+Also note 1.5's "nothing partial written" currently holds *structurally*, because nothing touches the
+filesystem at all. Section 2 is where that claim gets tested for real, against a lock (D11).
+
+**Carried, none blocking:**
+
+1. **D13's body text never mentions `closers`** (`design.md:179–203`). The decision is in the schema table,
+   the specs, tasks, code and a DEVLOG post — but not in `## Decisions`, where the two *rejected*
+   alternatives are the valuable part. Hardcoding `architect` is exactly what a future maintainer proposes
+   again. One paragraph, or a D14.
+2. **The agent definitions still state the retired rule as binding** — `.claude/agents/worker.md:65` quotes
+   "Only the orchestrator may close an item", with `reviewer.md:96` and `supervisor.md:113` framing it the
+   same way. Three lines. **Before 4.5 is briefed.** Product Owner's call, since these are scaffold-owned
+   and the same drift may exist upstream in `dmons`.
+3. **`tasks.md:52`'s `--role` overload is concrete, not latent** — the dispatcher rejects a repeat while
+   4.10 needs it repeatable. Carry the resolution into 4.10's brief; the dispatcher will need genuine
+   command-scoped arity, not a relaxed check. Settle `--change` vs `--log` naming there too.
+4. **`Parsed.isAmbiguous()`** — four ordered `if`s at `src/main.zig:185–203` whose correctness rests on
+   comment discipline. Four conditions have now landed correctly by care, not structure. Section 2 adds
+   none; **4.8's `--ref ns:id` check is the forcing move.**
+5. **For 8.5** — `zig build test -Dversion=X` fails, because the override makes `build_options.version` and
+   `manifest.version` disagree and the test reads it as skew. 8.5 is where the override is meant to be used.
+6. **Diagnostic nit** — `--role "" --role x` reports "requires a non-empty value" rather than "given more
+   than once". Same tier, same exit 1, first fault named. Recorded so nobody rediscovers it as a finding.
+7. Supervisor notes **N1–N9** are in its first section post, including that `main.zig:146` cites a
+   `tasks.md` path that moves under `archive/` when this change ships.
+
+**Standing facts for a cold start:**
 
 - Workflow is `dmons` 0.4.0: gates run via `make`, reports quote `LABEL_EXIT:<n>`. Gates run **in-sandbox**
   — `~/.cache/zig` is on the write allowlist. A `manifest_create PermissionDenied` or `unable to load
   'std.zig'` means that entry went missing, not a broken toolchain.
-- **Version is single-source.** `build.zig.zon:3` is the only semver literal in tracked source;
-  `build.zig` defaults `-Dversion` to `manifest.version`; the test asserts no skew. The manifest reaches
-  the test module via an anonymous import because Zig 0.16 refuses a direct `@import("../build.zig.zon")`.
-  The exe is byte-identical with and without it (1 872 872 bytes) — ADR-0002 holds.
-- **Zig 0.16 changed `main`'s signature**: `pub fn main(init: std.process.Init) !void` is required to read
-  argv or write stdout/stderr; `std.process.argsAlloc` and `std.io.getStdOut` are gone. Verified twice
-  against a fresh `zig init`. Write against 0.16's API, never a remembered one.
-- **Parse-ambiguity errors beat `--help`/`--version`** — see the ruling above. Any new error condition in
-  section 4 must be placed on the correct side of that line.
+- **Version is single-source**: `build.zig.zon:3` is the only semver literal in tracked source.
+- **Zig 0.16 changed `main`'s signature** — `pub fn main(init: std.process.Init) !void`;
+  `std.process.argsAlloc` and `std.io.getStdOut` are gone. Write against 0.16's API, never a remembered one.
+- **Parse-ambiguity errors beat `--help`/`--version`.** Any new error condition must be placed on the
+  correct side of that line.
+- **Roles are declared per project in the `header`** (D13), which itself carries no role; the header also
+  declares `closers`. `orchestrator` is retired — the main session is `analyst` and `architect`.
 - **When rewriting this section, match `^## NEXT$` at start of line.** The bootstrap note contains the
   literal string in prose. See the incident post.
-
-Carried forward, non-blocking: the **8.5** reconciliation (`zig build test -Dversion=X` fails, because the
-override makes `build_options.version` and `manifest.version` disagree and the test reads it as skew); the
-supervisor's **N1–N9** notes above, including that `main.zig:146` cites a `tasks.md` path that moves under
-`archive/` when this change ships; and the reviewer's suggestion of a named `Parsed.isAmbiguous()` predicate
-for **4.8/4.9** so the precedence rule is enforced by structure rather than comment discipline.
+- **Commit the DEVLOG when a post lands, not only when a block does.** Two supervisor reviews have sat as
+  uncommitted working-tree state, recoverable from nowhere.
