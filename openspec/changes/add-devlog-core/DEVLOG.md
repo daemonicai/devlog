@@ -155,23 +155,214 @@ and Linux x86_64/arm64) is where the real command appears. Inventing a recipe no
 that fails silently by never running. When 8.5 lands, the Makefile gains `publish` — and that is the
 Architect's edit, not the worker's.
 
+**[architect]** **Sandbox gate restriction lifted — `~/.cache/zig` is now on the write allowlist.** At
+the Product Owner's direction, `sandbox.filesystem.allowWrite` in `~/.claude/settings.json` gained
+`~/.cache/zig` (Zig's `global_cache_dir`, per `zig env`). The running session picked it up without a
+restart: a sandboxed write into that directory succeeds, and `make gates` **inside** the sandbox now
+closes at `BUILD_EXIT:0 TEST_EXIT:0 FORMAT_EXIT:0 VALIDATE_EXIT:0 GATES_EXIT:0`.
+
+The `TEST_EXIT:0` is the load-bearing part of that evidence. A green `make build` in-sandbox was always
+achievable off a warm `.zig-cache`, but `make test` failed in-sandbox regardless, because compiling the
+test binary reaches for the global cache separately. It passing is the permission actually being granted,
+not a cache artefact. Caveat kept honest: a **fully** cold verification needs `make clean` first, and
+`make clean` is the Product Owner's target, so this has not been run from a genuinely empty cache.
+
+This supersedes the two posts above for future blocks. It does **not** invalidate them — they record
+what was true at the time, and nothing is being backfilled. Gates may now run in-sandbox; the exit-line
+convention is unchanged and still the only acceptable evidence.
+
+**[reviewer]** Audit of block 1.1–1.3, diff `331878d..cc3c0b6` (`build.zig`, `build.zig.zon`,
+`src/main.zig`, `LICENSE`, `.gitignore`). Re-ran the gates myself before reviewing: `BUILD_EXIT:0`,
+`TEST_EXIT:0`, `FORMAT_EXIT:0`, `VALIDATE_EXIT:0` — quoted from `make build` / `make test` / `make
+format` / `make validate`, not inferred from the logs above them.
+
+**Verdict: Request changes** — one blocker, otherwise clean.
+
+**Blocker**
+
+- `build.zig:11` vs `build.zig.zon:3` — the version `"0.1.0"` is a literal in both places
+  (`b.option([]const u8, "version", …) orelse "0.1.0"` in `build.zig`, `.version = "0.1.0"` in
+  `build.zig.zon`). Confirmed: this is exactly the duplication the open finding flagged, not a false
+  alarm. The brief was explicit — "Wire it as a build option … rather than a hand-duplicated constant …
+  One source of truth" — and as written there are two literals that can independently drift once
+  someone bumps one and not the other. `src/main.zig:13`'s test (`"version is embedded via the build
+  option, not duplicated"`) doesn't catch this either: it only proves `build_options.version` threads
+  through to the module, and asserts against a third hardcoded `"0.1.0"`, so it stays green whichever of
+  the two build-side literals is stale. Task 2.6 stamps this string into every `header` record's `tool`
+  field, which is what makes the drift risk load-bearing rather than cosmetic.
+
+  **Concrete fix, verified against Zig 0.16.0 in this sandbox** (see scratch repro below): have
+  `build.zig` read the default from the manifest instead of restating it —
+  ```zig
+  const manifest = @import("build.zig.zon");
+  // ...
+  const version = b.option([]const u8, "version", "devlog version string") orelse manifest.version;
+  ```
+  I built a throwaway package with this exact shape (`@import("build.zig.zon")` at the top of
+  `build.zig`, `manifest.version` used as a build-time default) and it compiles and resolves the field
+  correctly under the Zig 0.16.0 on `PATH` here. That makes `build.zig.zon`'s `.version` the single
+  source of truth; `-Dversion=…` still works as an explicit override (useful for 8.5's release tooling
+  later) without a second baked-in default to keep in sync.
+
+**Nits**
+
+- `src/main.zig:13` — once the fix above lands, the test name ("not duplicated") will finally be true of
+  the code, not just aspirational; no change needed to the test itself, just noting the two should now
+  agree.
+
+**Everything else checked and clean**
+
+- `build.zig.zon:6` — `.dependencies = .{}`, no C interop, ADR-0001/ADR-0002 satisfied.
+- `build.zig` — 0.16 build API used correctly throughout (`b.createModule`, `root_module.addOptions`,
+  `b.addTest({.root_module = …})`); matches what `zig init` emits for 0.16.0 and builds/tests clean in
+  this sandbox.
+- `build.zig.zon:5` — `.minimum_zig_version = "0.16.0"` matches the pinned target exactly.
+- `src/main.zig:11` — `pub fn main() !void {}`. Genuinely near-trivial; no command surface pre-built,
+  nothing from 1.4's brief pulled forward.
+- `src/main.zig:13-15` — the one required test asserts a real value (`build_options.version ==
+  "0.1.0"`), not a vacuous pass; satisfies 1.3.
+- `LICENSE` — spot-checked structure (Definitions, Exhibit A, Exhibit B, 373 lines) against the genuine
+  MPL 2.0 text; verbatim, no drift.
+- `build.zig:1-3`, `src/main.zig:1-3` — MPL short-form header present verbatim on both `.zig` files,
+  matches D12 and the brief's convention.
+- `.gitignore` — `zig-out/` and `.zig-cache/`, matches brief, nothing over- or under-scoped.
+- No file in this diff touches the `Makefile` (it didn't exist yet at `cc3c0b6` — added in `4b14b81`,
+  outside this block's scope).
+- Scope check against 1.1–1.3's tasks: no record types, JSON, log file, stdin handling, or subcommand
+  present — correctly left for later sections.
+
+**Architectural note (non-blocking)** — worth the Architect's eye when briefing 1.4: once `build.zig`
+reads `manifest.version` as above, `--version`'s implementation in 1.4 should pull from the same
+`build_options.version` this block already wires through, not read `build.zig.zon` a second way. Not a
+finding against this block — just flagging the interface 1.4 should reuse rather than re-derive.
+
+→ @worker for the one blocker above; re-audit once the fix lands.
+
+**[worker]** Blocker fixed. `build.zig:6` adds `const manifest = @import("build.zig.zon");` and line 12's
+`orelse` now reads `manifest.version` instead of a hardcoded `"0.1.0"` — confirmed the import compiles
+and resolves in *this* build (`make build` → `BUILD_EXIT:0`), not just the reviewer's throwaway repro.
+`-Dversion=…` is untouched as the explicit override for 8.5.
+
+For the test: comparing `build_options.version` against a fourth hardcoded literal in `src/main.zig`
+would still pass on skew, so instead of that I gave the test itself a path back to the manifest.
+`src/main.zig` can't `@import("../build.zig.zon")` directly — Zig 0.16 refuses an import outside the
+module's root path (`error: import of file outside module path`) — so `build.zig` now also does
+`root_module.addAnonymousImport("manifest", .{ .root_source_file = b.path("build.zig.zon") })`,
+mirroring how it already exposes `build_options`. The test imports that as `@import("manifest")` and
+asserts `build_options.version == manifest.version` — both sides now trace to the one file on disk;
+there is no longer a fourth copy anywhere.
+
+**Skew experiment, as asked:**
+1. Set `build.zig.zon`'s `.version` to `"9.9.9"`. `make build` → `BUILD_EXIT:0`, `make test` →
+   `TEST_EXIT:0` — both sides move together, confirming the wiring holds.
+2. To prove the test isn't vacuously green, temporarily reverted *only* the `build.zig` fix (`orelse
+   manifest.version` → `orelse "0.1.0"`) while the manifest was still `9.9.9`. `make test` → `TEST_EXIT:1`,
+   failing with `expected: 9.9.9, found: 0.1.0` at the `expectEqualStrings` line — the test catches skew
+   exactly as intended.
+3. Restored `build.zig`'s `manifest.version` and `build.zig.zon`'s `.version` back to `"0.1.0"`. Tree is
+   clean at `0.1.0` again.
+
+**Gates, full set, tree restored:**
+```
+BUILD_EXIT:0
+TEST_EXIT:0
+FORMAT_EXIT:0
+VALIDATE_EXIT:0
+GATES_EXIT:0
+```
+
+Files touched: `build.zig`, `src/main.zig`. Nothing else — no `tasks.md` ticks, no commit, no `Makefile`
+edit, no 1.4 work.
+
+**[worker]** → @reviewer — blocker fix for 1.1–1.3 ready for re-audit.
+
+**[reviewer]** Re-audit of the blocker fix, working-tree diff on top of `cc3c0b6` (`build.zig`,
+`src/main.zig`). Re-ran the gates myself from a clean `zig-out`/`.zig-cache` and quote the exit lines:
+`BUILD_EXIT:0 TEST_EXIT:0 FORMAT_EXIT:0 VALIDATE_EXIT:0 GATES_EXIT:0`.
+
+**Verdict: Approve.**
+
+Checked all three things worth independent verification rather than trust:
+
+1. **Tree restored to `0.1.0` everywhere** — confirmed. `grep -rn "9\.9\.9"` across the tree returns
+   nothing, and `git diff cc3c0b6 -- build.zig.zon` is empty — `build.zig.zon:3` is untouched at
+   `.version = "0.1.0"`, exactly as it was before the skew experiment.
+
+2. **Anonymous-import cost to the shipped artifact** — checked empirically, not assumed. Built the exe
+   at `cc3c0b6` (before the fix) and at the current working tree (after `root_module.addAnonymousImport`
+   is added at `build.zig:22`) from clean caches and compared `stat -f%z`: **1872872 bytes, identical, in
+   both cases.** Zig's lazy per-declaration analysis means `@import("manifest")` in `src/main.zig:7` is
+   only reachable from the `test` block, so the plain `zig build` (exe) path never pulls `build.zig.zon`'s
+   content into scope — no size cost, ADR-0002's near-1 MB / dependency-free posture holds. On the
+   design question — is `addAnonymousImport` on the *shared* `root_module` (used for both `exe` and
+   `exe_tests`) a clean 0.16 idiom or a workaround — I reproduced the worker's claimed error
+   independently: `@import("../build.zig.zon")` directly from `src/main.zig` fails with `error: import of
+   file outside module path` under Zig 0.16.0 (module root is `src/`, manifest lives one level up at the
+   repo root). Given that hard restriction, wiring the manifest in via the build script — the same
+   mechanism already used for `build_options` at `build.zig:21` — is the correct, not merely expedient,
+   way to do this in 0.16. No objection.
+
+3. **Test genuinely non-vacuous** — mostly yes, with one narrow caveat worth recording rather than
+   blocking on. `src/main.zig:19`'s `expectEqualStrings(manifest.version, build_options.version)`
+   compares two *independent* comptime imports of the same file (`build.zig`'s direct
+   `@import("build.zig.zon")` feeding `build_options.version`, versus the test's `@import("manifest")`
+   anonymous-import of the same path) — so it fails exactly when the wiring the blocker was about
+   regresses (e.g. someone reverts `build.zig:11` back to a hardcoded literal), which is precisely what
+   it's for. I reproduced the worker's skew experiment's shape myself with a different mutation to
+   confirm it isn't tuned to only their one case: running `zig build test -Dversion=2.0.0` — a legitimate
+   use of the `-Dversion` override the fix intentionally preserved — makes `build_options.version`
+   become `"2.0.0"` while `manifest.version` (read directly from the unmodified `build.zig.zon`) stays
+   `"0.1.0"`, and the test fails with exactly that mismatch. That's not a bug in the test — it's correctly
+   non-vacuous — but it does mean **`-Dversion=…` and `zig build test` are not currently compatible**:
+   passing an explicit version override breaks the test suite, not just the build. Nothing in this block
+   or the Makefile does that today, so it's not a blocker here, but it's a landmine for whoever wires
+   8.5's release tooling (which is exactly where `-Dversion` was kept around for). Flagging as an
+   architectural note, not a finding against this fix.
+
+**Nit** — `build.zig:22`'s `addAnonymousImport("manifest", …)` is only ever consumed by the test in
+`src/main.zig:7`; worth a one-line comment at the `build.zig` call site saying so, so a future reader
+doesn't go looking for a production consumer of `manifest` alongside `build_options`. Not blocking.
+
+**Architectural note for whoever briefs 8.5 (release tarballs)** — `zig build test -Dversion=<x>` will
+fail on `src/main.zig:19`'s assertion for any `<x>` other than the current `build.zig.zon` version,
+because the test's `manifest` import doesn't see the override. If release tooling ever needs to stamp a
+different version at build time, either don't run `zig build test` in the same invocation as
+`-Dversion`, or the test will need to stop comparing against the static manifest. Not urgent — nothing
+between here and 8.5 exercises this path — just don't let it be a surprise then.
+
+Nothing further outstanding from the original review. Block 1.1–1.3 is clear to commit.
+
 ## NEXT
 
-**[architect]** Section 1 open, base `331878d`. Block 1.1–1.3 is **implemented but not reviewed** —
-committed as `cc3c0b6`, a WIP safety commit taken at the Product Owner's request before the scaffold
-migration, explicitly **not** the block commit. No boxes are ticked in `tasks.md`.
+**[architect]** Section 1 open, base `331878d`. **Block 1.1–1.3 is landed** — reviewer approved after one
+remediation round, gates green (`BUILD_EXIT:0 TEST_EXIT:0 FORMAT_EXIT:0 VALIDATE_EXIT:0 GATES_EXIT:0`),
+`1.1`–`1.3` ticked in `tasks.md`. The earlier WIP commit `cc3c0b6` is superseded by the block commit; it
+remains in history as the pre-review safety point it was labelled as, not as a second claim on the block.
 
 Workflow is now `dmons` 0.4.0: gates run through `make`, reports quote `LABEL_EXIT:<n>`.
 
-**Run gates outside the sandbox.** Zig's global cache is not on the sandbox write allowlist, so
-`make test` exits 1 with a `PermissionDenied` that reads like a broken std lib rather than a permission
-problem. A green `make gates` *inside* the sandbox is not trustworthy — it can be resting on a warm
-`.zig-cache` from an earlier unsandboxed run.
+**Gates run in-sandbox again** as of the allowlist change above — `~/.cache/zig` is writable, and the
+full set closes `GATES_EXIT:0` without `dangerouslyDisableSandbox`. If a gate ever fails with
+`manifest_create PermissionDenied` or `unable to load 'std.zig'`, that is the allowlist entry missing,
+not a broken toolchain — re-check `~/.claude/settings.json` before debugging anything else.
 
-Open finding carried into the 1.1–1.3 review: the version `0.1.0` is duplicated between
-`build.zig.zon`'s `.version` and `build.zig:11`'s `orelse` default, so the brief's single-source-of-truth
-requirement is unmet. Task 2.6 stamps that string into every `header` record's `tool` field, and the
-existing test passes either way.
+**Version is now single-source.** `build.zig.zon`'s `.version` is the one copy; `build.zig` defaults
+`-Dversion` to `manifest.version`, and the test asserts `build_options.version == manifest.version`. The
+manifest reaches the test module through an anonymous import (`build.zig:22`) because Zig 0.16 refuses a
+direct `@import("../build.zig.zon")` from `src/main.zig`. Measured, not assumed: the exe is byte-identical
+before and after (1 872 872 bytes both), since lazy analysis keeps the test-only import out of the exe
+path — ADR-0002 holds.
 
-Resume at: spawn `reviewer` on block 1.1–1.3 (hand it the version-duplication finding), then brief
-1.4–1.5.
+Two notes carried forward, both non-blocking:
+
+- **For 8.5 (release tooling).** `zig build test -Dversion=X` now *fails* — a legitimate use of the
+  override makes `build_options.version` and `manifest.version` disagree, and the test reads that as skew.
+  Nothing runs tests with `-Dversion` today, but 8.5 is exactly where the override is meant to be used, so
+  whoever wires it needs to reconcile the two.
+- **Nit for 1.4's block.** `build.zig:22`'s `addAnonymousImport("manifest", …)` exists solely for the test
+  and says so nowhere. One comment line, so a future reader doesn't hunt for a production consumer.
+
+Resume at: brief block **1.4–1.5** (subcommand dispatch and global flags; the error-reporting
+convention). `--version` there must consume the same `build_options.version` threaded through 1.1–1.3 —
+do not re-derive it from the manifest a second way. When 1.4–1.5 lands, section 1's last block is done and
+the `supervisor` runs on `331878d..HEAD`.

@@ -1,9 +1,9 @@
 ## 1. Project skeleton
 
-- [ ] 1.1 Initialise the Zig 0.16 project — `build.zig`, `build.zig.zon`, `src/main.zig` — producing a
+- [x] 1.1 Initialise the Zig 0.16 project — `build.zig`, `build.zig.zon`, `src/main.zig` — producing a
       single binary with no third-party dependencies (ADR-0001, ADR-0002)
-- [ ] 1.2 Add the MPL 2.0 `LICENSE` and per-file licence headers (D12)
-- [ ] 1.3 Add `zig build test` wiring and one trivial passing test, so every later section has a harness
+- [x] 1.2 Add the MPL 2.0 `LICENSE` and per-file licence headers (D12)
+- [x] 1.3 Add `zig build test` wiring and one trivial passing test, so every later section has a harness
 - [ ] 1.4 Implement subcommand dispatch and global flags (`--log <path>`, `--role`, `--help`,
       `--version`), with `--help` output for the top level and each subcommand (ADR-0003)
 - [ ] 1.5 Implement the error-reporting convention — non-zero exit, message on stderr, nothing partial

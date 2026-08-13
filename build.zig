@@ -3,12 +3,13 @@
 // file, You can obtain one at https://mozilla.org/MPL/2.0/.
 
 const std = @import("std");
+const manifest = @import("build.zig.zon");
 
 pub fn build(b: *std.Build) void {
     const target = b.standardTargetOptions(.{});
     const optimize = b.standardOptimizeOption(.{});
 
-    const version = b.option([]const u8, "version", "devlog version string") orelse "0.1.0";
+    const version = b.option([]const u8, "version", "devlog version string") orelse manifest.version;
     const options = b.addOptions();
     options.addOption([]const u8, "version", version);
 
@@ -18,6 +19,7 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
     });
     root_module.addOptions("build_options", options);
+    root_module.addAnonymousImport("manifest", .{ .root_source_file = b.path("build.zig.zon") });
 
     const exe = b.addExecutable(.{
         .name = "devlog",

@@ -4,6 +4,7 @@
 
 const std = @import("std");
 const build_options = @import("build_options");
+const manifest = @import("manifest");
 
 /// Placeholder entry point. Block 1.4 replaces this with real subcommand
 /// dispatch; this block only establishes the build, the version option, and
@@ -11,5 +12,9 @@ const build_options = @import("build_options");
 pub fn main() !void {}
 
 test "version is embedded via the build option, not duplicated" {
-    try std.testing.expectEqualStrings("0.1.0", build_options.version);
+    // build_options.version defaults (absent -Dversion=…) to manifest.version
+    // (build.zig.zon), threaded through by build.zig. Comparing against the
+    // manifest itself — not a hardcoded literal — catches skew if that wiring
+    // ever breaks.
+    try std.testing.expectEqualStrings(manifest.version, build_options.version);
 }
