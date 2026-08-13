@@ -34,19 +34,40 @@ Read it to pick up in-flight context; write to it as you act. The `/devlog` skil
 Until `devlog` ships and the `dmon-dev` skill is repointed at it (task 9.4), this change is built using
 the very mechanism it replaces. Expect the `## NEXT` fragility that motivated the project.
 
-### Commands
+### Commands — the Makefile is the command surface
 
-- Build: `zig build` — must be clean.
-- Test: `zig build test` — all green.
-- Format: `zig fmt --check .` — clean.
-- Validate a change: `openspec validate <change-name> --strict`.
-- List changes: `openspec list` (or the directories under `openspec/changes/`, excluding `archive/`).
+Every gate runs through the root **`Makefile`**. Build, test, format, and spec validation are `make`
+targets; **do not call the underlying toolchain directly**. That keeps the command names stable as the
+toolchain moves underneath them, and — the load-bearing part — **every gate target prints its own exit
+code** as `LABEL_EXIT:<n>` on its last line.
+
+**Read the exit line, not the output.** A gate passed only if you saw `BUILD_EXIT:0`. Tools routinely
+exit non-zero while printing output that scans exactly like a clean run, and a gate has been reported as
+passing on that basis before. Quote the code; don't interpret the log. In this project the live example
+is `zig fmt --check .`, which exits 1 while printing nothing but a list of file paths — output that reads
+like an inventory rather than a failure.
+
+- Build: `make build` → `BUILD_EXIT:0`.
+- Test: `make test` → `TEST_EXIT:0`, all green.
+- Format: `make format` → `FORMAT_EXIT:0`.
+- Validate the active change(s): `make validate` → `VALIDATE_EXIT:0`.
+- Whole gate set in one pass: `make gates` → `GATES_EXIT:0`. It runs the set with `-k`, so one
+  invocation reports **every** failing gate instead of hiding the rest behind the first.
+- List active changes: `make changes` (or the directories under `openspec/changes/`, excluding
+  `archive/`).
+
+`make clean` is **not** a gate and no agent runs it — it is the Product Owner's.
+
+**The Makefile is yours (Architect), not the workers'.** When a block adds a project, a test suite, or a
+stack that the existing targets don't cover, *you* update the Makefile and say so in the DEVLOG. A worker
+that needs a target changed stops and reports it; it does not edit the Makefile, and it does not route
+around it by calling the raw toolchain.
 
 ---
 
 # OpenSpec Workflow
 
-<!-- dmons-scaffold: 0.3.1 -->
+<!-- dmons-scaffold: 0.4.0 -->
 
 **This section is authoritative.** If a skill's behavior ever conflicts with what's written here,
 **follow this document.**
@@ -109,7 +130,7 @@ All agents are defined for this repo. Delegate; don't shortcut by writing the im
 1. Read `proposal.md`, `design.md`, and the relevant `specs/<capability>/spec.md` for the section(s)
    you're about to work.
 2. **Working tree must be clean** (`git status`). If it's dirty, stop and ask.
-3. **Change must validate**: `openspec validate <change-name> --strict`. If it doesn't, stop and ask.
+3. **Change must validate**: `make validate` → `VALIDATE_EXIT:0`. If it doesn't, stop and ask.
 4. **Be on the change branch** `change/<change-name>`. Create it from the default branch if missing:
    `git switch -c change/<change-name>`.
 
@@ -157,11 +178,16 @@ see the section as a whole. Post it **before** any block of the section is commi
    verdict to the DEVLOG.
 4. **Review loop.** Worker and reviewer resolve findings **in the DEVLOG thread** — reviewer posts
    findings, worker fixes and responds, reviewer re-audits. **Repeat until the reviewer signs off.**
-5. **Gates — all must pass before ticking any box:**
-   - `zig build` clean (no errors)
-   - `zig build test` green — the block's new tests **and** all existing tests
-   - `openspec validate <change-name> --strict`
-   - `zig fmt --check .` clean
+5. **Gates — all must pass before ticking any box.** Run each and **read its exit line**; a gate passed
+   only when you saw its `LABEL_EXIT:0`:
+   - `make build` → `BUILD_EXIT:0` (no errors)
+   - `make test` → `TEST_EXIT:0` — the block's new tests **and** all existing tests
+   - `make format` → `FORMAT_EXIT:0`
+   - `make validate` → `VALIDATE_EXIT:0`
+
+   `make gates` runs the whole set in one `-k` pass and is the quickest way to get the full picture —
+   but a green `GATES_EXIT:0` is what you're after, and a red one still needs the individual exit lines
+   to say which gate failed. Never conclude a gate passed from reading its output; quote the code.
 
    A block commits green. If a block must land with a failing test for a sound technical reason (e.g. a
    red test a later block in the same section turns green), that is a deliberate Architect call — state
