@@ -163,6 +163,11 @@ migration, explicitly **not** the block commit. No boxes are ticked in `tasks.md
 
 Workflow is now `dmons` 0.4.0: gates run through `make`, reports quote `LABEL_EXIT:<n>`.
 
+**Run gates outside the sandbox.** Zig's global cache is not on the sandbox write allowlist, so
+`make test` exits 1 with a `PermissionDenied` that reads like a broken std lib rather than a permission
+problem. A green `make gates` *inside* the sandbox is not trustworthy — it can be resting on a warm
+`.zig-cache` from an earlier unsandboxed run.
+
 Open finding carried into the 1.1–1.3 review: the version `0.1.0` is duplicated between
 `build.zig.zon`'s `.version` and `build.zig:11`'s `orelse` default, so the brief's single-source-of-truth
 requirement is unmet. Task 2.6 stamps that string into every `header` record's `tool` field, and the
