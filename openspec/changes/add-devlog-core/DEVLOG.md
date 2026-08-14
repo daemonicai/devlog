@@ -3895,6 +3895,279 @@ have no concern with anything visible in an adjacent block from here.
 
 `BUILD_EXIT:0 TEST_EXIT:0 FORMAT_EXIT:0 VALIDATE_EXIT:0 GATES_EXIT:0`. No commits, no ticks.
 
+---
+
+**[supervisor]** **Section 3 review — `Request changes`.** Scope `git diff 5d2e805..HEAD` (`46a0913`,
+`6db3d5c`). Gates re-run: `BUILD_EXIT:0 TEST_EXIT:0 FORMAT_EXIT:0 VALIDATE_EXIT:0 GATES_EXIT:0`, 72 tests.
+Working tree clean.
+
+One blocker. It is not a defect in block 3's diff — the reviewer's audit of that diff was right — it is a
+contradiction between what section 3 *promises* about bodies and what section 2's codec can *deliver*.
+Neither block's diff shows it; only the pair does.
+
+**B1 — a body that is not valid UTF-8 is accepted, written, and then permanently unreadable. The tool
+writes a record it cannot parse back, and exits `0`.**
+
+The mechanism, verified against the pinned 0.16.0 stdlib rather than assumed:
+
+- `src/body.zig:7-11` states the binding contract in the strongest terms the change has yet written down:
+  bodies are bytes, "**no UTF-8 validation** … If the bytes happen to be invalid UTF-8, that is the
+  caller's business, not this module's; do not 'fix' that by adding validation later."
+- `src/record.zig:353-354` emits the body with `s.write(common.body)`. `std.json/Stringify.zig:506`
+  silently switches representation on content: `if (!emit_strings_as_arrays and
+  utf8ValidateSlice(slice)) return self.stringValue(slice);` — otherwise it falls through to
+  `beginArray()` and writes **a JSON array of byte numbers**. `record.write` passes no options, so this is
+  the live path. It returns no error; the write succeeds.
+- `src/record.zig:623` reads the field back with `requireString(obj, "body", diag)`. An array value is
+  `error.InvalidFieldType` — "field 'body' must be a string".
+- `src/log.zig:141-164` (`openLocked`) parses the **whole** log before every append. So one such record
+  fails not just its own read: every subsequent `devlog` invocation of any kind — write or read — fails on
+  that line. In an append-only log with no repair path (D5, and `append-only-log` forbids one by design)
+  the only recovery is hand-editing the file this tool exists to stop people hand-editing.
+
+Confirmed empirically against 0.16.0: a `[]const u8` containing `\xff\xfe` stringifies to
+`{"body":[98,97,...]}` without error, and `std.json.parseFromSlice` accepts that document — so the failure
+lands on `requireString`, silently and one invocation later, not at the point of damage.
+
+Against the section's own spec this is unmet, not merely risky. `append-only-log` requires a body be
+"stored exactly as supplied" and "reproduced unchanged when read back". For this input class it is stored
+in a different shape and is never read back at all.
+
+Note what makes this a section finding rather than a block one. Before section 3, nothing in the codebase
+asserted that a body could be arbitrary bytes; `record.zig` was written against bodies that happened to be
+text. `body.zig:7-11` is the first place the tool commits to accepting bytes it will not inspect — so
+section 3 is where the contradiction was created, even though the fix most likely lands in `record.zig`.
+And section 3's own round-trip test (`src/body.zig:286-356`) is the first test that walks the whole path;
+its eight cases are pure ASCII. The single non-ASCII byte sequence anywhere in `src/` is
+`src/body.zig:202`'s U+00A0, which is valid UTF-8 and never goes near the log.
+
+**Suggested remediation shape** (@architect — yours to carve; this is the outline, not the block):
+
+1. **Adopt the invariant explicitly: the tool never writes a record it cannot parse back.** That is the
+   property being violated, and it is worth stating once in `design.md` (a clause on D5, or a D14) rather
+   than discovering it again per field. Every string field in a record has this hazard, not just `body` —
+   `role`, `ts`, `title`, `base`, `section`, `block`, `to`, `tool`, `change`, `roles`, `closers`, and
+   `Ref.ns`/`Ref.id` all reach `Stringify.write` the same way and all arrive from argv.
+2. **Enforce it in one place — `record.write` (or a guard it calls) — not per command.** A per-field check
+   scattered across section 4's ten commands is the "one derivation implemented twice" failure this
+   project keeps having to avoid. One guard, one error, one message.
+3. **Decide the refusal point and record it.** Refusing invalid UTF-8 is the only option that keeps the log
+   readable, so `src/body.zig:7-11`'s "the caller's business" comment has to change either way — it is
+   currently a documented property the tool does not have. Whether the refusal lives at the boundary
+   (`readBody`, as a third refusal alongside terminal and empty) or at the codec (`record.write`) is a
+   decision, not an implementation detail: the codec catches argv too, the boundary gives a better message.
+   My preference is the codec, with `body.zig`'s comment amended to say the bytes are unvalidated *here*
+   and validated at the point of encoding.
+4. **A test that pins it**, at the same altitude as the section's round-trip test: a body containing
+   invalid UTF-8 is refused before anything is written, and the log is byte-identical afterwards. Plus a
+   non-ASCII-but-valid body (the U+00A0 case, or any accented text) carried through the *full* path — that
+   case is currently untested through the codec and is the common one in real prose.
+
+**Everything else in the section is coherent, and the following are notes, not blockers.**
+
+**N-a — two error-reporting mechanisms now exist, and they disagree about the prefix.** Section 1's `## NEXT`
+flagged N3 ("no mechanism for error construction") as a hazard; this is the section where the second
+mechanism appeared. `record.Diagnostics` (`src/record.zig:378-414`) is an allocator-backed out-param the
+callee fills and the caller prints — used by `record.zig` and `log.zig`, and its messages carry **no**
+`devlog: ` prefix (`src/record.zig:422`: `"missing required field '{s}'"`). `body.writeRefusalMessage`
+(`src/body.zig:111-120`) is a pure error→message mapping the callee writes to a writer — and its messages
+**do** carry the prefix (`src/body.zig:114, 117`). `main.zig` has a third shape: seven inline
+`stderr.print("devlog: …\n")` sites. A section-4 command must use all three in one function, and the
+predictable defect is concrete rather than aesthetic: route both through a common `fail()` and body
+refusals print `devlog: devlog: refusing…`. Cheapest fix is to make it structural before section 4 writes
+ten commands: one `fail(stderr, fmt, args) u8` that owns the prefix and the newline, with
+`writeRefusalMessage` dropping its prefix to match `Diagnostics`. This is N3's four-line helper, now with a
+second reason to exist.
+
+**N-b — `log.zig` is the only one of the three modules with an inferred error set.** `record.zig` declares
+`ParseError` and `SeqError`; `body.zig` declares `ReadBodyError`. `log.zig:71` declares
+`AppendRecordError` but neither public function uses it — `appendHeader` (`:392`) and `appendRecord`
+(`:432`) both return bare `!`. It was a defensible single choice in section 2; with a third module landed
+it now reads as drift, and the module section 4 must `switch` on is the one that publishes no set. Worth
+settling before section 4's first `catch`.
+
+**N-c — `ReadBodyError` advertises a variant `readBody` proves cannot occur.** `error.StreamTooLong` is in
+the set (`src/body.zig:46`) while `src/body.zig:66-82` converts it to `unreachable` with a careful proof
+that it is structurally impossible under `.unlimited`. Both cannot be true of the public surface. Section 4
+will write a `switch` arm for a case that cannot happen, or fall into `writeRefusalMessage`'s `else`.
+Remove it from the set, or stop claiming unreachability.
+
+**N-d — the whitespace-only refusal exists only in code and thread prose.** D5 says "terminal, or empty";
+the implementation refuses whitespace-only as well (`src/body.zig:85, 94-99`), on an architect ruling
+recorded in this thread. That is the right call, but 8.4 requires the format and behaviour be
+reimplementable from the documents alone, and this behaviour is in neither `design.md` nor the spec. One
+clause, alongside the D5/`durable-format` wording already parked as NEXT item 14.
+
+**N-e — the record model and the input path disagree about whether an empty body is legal.**
+`Attributed.body` defaults to `""` (`src/record.zig:86`) and `requireString` accepts `""` on read
+(`:623`), so a log line with `"body":""` is valid to the parser while `readBody` refuses to produce one.
+Harmless today; it becomes a real question when 8.4 documents whether `body` may be empty. Decide which is
+authoritative rather than letting the reader infer it.
+
+**N-f — two test helpers now read a whole log file for assertion.** `log.zig`'s private `readAllLog`
+(`src/log.zig:465`) and the inline open/length/alloc/`readPositionalAll` at `src/body.zig:342-347`. Second
+copy, and section 5's read commands will want a third. A shared test helper is the shape; not worth a block
+on its own.
+
+**N-g — `src/body.zig:78` cites `log.zig:449` by line number.** Accurate today (`.header => unreachable`
+is at `src/log.zig:449`), and the comment it anchors is genuinely good. But a cross-file line reference in
+a comment rots silently — name the function (`withSeq`) instead.
+
+**A seam note for section 4's first brief, which is the block that gives `3.2` a caller.** Two ordering
+constraints that are invisible from either side alone:
+
+- **`readBody` must run before the log is opened.** `openLocked` **creates** the log when it is missing
+  (`src/log.zig:162`). A command that opens first and reads the body second turns a terminal or
+  empty-body refusal into a zero-byte `DEVLOG.jsonl` on disk — breaking 1.5's "nothing partial written"
+  and pre-empting 6.6's "never create it silently".
+- **`readBody` is not universal.** `HeaderRecord` (`src/record.zig:141-149`) carries no `body`, so
+  `devlog header` (4.10) must not call it. A uniform "every write command reads stdin" wiring would make
+  `devlog header` demand a body that has nowhere to go.
+
+**On `3.2` and the ordering question — the judgment call is right; the parking place is wrong.**
+
+`3.2` is implemented and I can audit it as code: `src/body.zig:62` is the first statement of `readBody`,
+before the reader is even constructed, so no terminal ever reaches a blocking read. What cannot be
+discharged is the *verification*, and only because it depends on an artefact section 4 produces. That is a
+verification-ordering dependency, not unfinished work, and deadlocking the outer loop on it would be
+following the letter of the workflow against its purpose. Treating `Approve` as closing the section's code
+is the right call.
+
+The part I would change: **`## NEXT` is the wrong tenant for an obligation that must survive into another
+section.** `CLAUDE.md` makes NEXT the one rewritable block in an append-only document, and this change has
+already lost things out of it. Bind `3.2` to the work instead:
+
+- Name the Product Owner's TTY check as an explicit **done-gate in the brief of the first section-4 block
+  that wires a command to `readBody`** — that block does not commit until the check is run. A brief is
+  append-only and gets read at exactly the moment the obligation becomes dischargeable, which NEXT does
+  not.
+- Keep a one-line pointer in NEXT, but the brief is the load-bearing copy.
+- **State plainly in this thread that `3.2` is ticked retroactively, inside section 4's timeline.**
+  Otherwise `CLAUDE.md §1.4` does exactly what it is designed to do on the next cold start: sees an
+  unticked box under a closed section and re-opens section 3.
+
+The alternative — renumbering `3.2` into section 4 so the dependency is structural rather than procedural
+— is arguably cleaner and is a `tasks.md` edit that is yours to make. I would not do it: it re-cuts a
+section that is otherwise sound, and the gate-in-the-brief achieves the same discharge without
+re-validating the change. Your call and the Product Owner's, not mine.
+
+**Audited and clean:** `5d2e805` (the `dmons` 0.5.0 scaffold, the base rather than a commit in range)
+touches only `.claude/`, `CLAUDE.md`, `.gitignore` and a Makefile version stamp — gate targets and
+`LABEL_EXIT` contract unchanged, nothing the change relies on contradicted. No new dependency
+(`build.zig.zon:6` still `.dependencies = .{}`); `build.zig` and `Makefile` untouched by `6db3d5c`, and
+every test in the section is reached by the existing `make test` target via `main.zig`'s test block. No
+filesystem write added anywhere in section 3 — `body.zig` reads stdin and nothing else, so ADR-0002's "the
+log is the only state" is not eroded. No rewrite, truncate, repair, compact or migrate path. No dispatch
+wiring or subcommand: `main.zig`'s only change is the test-discovery import, matching `record`/`log`
+exactly, so nothing reached into section 4's territory. No MCP, no daemon, no embeddings, no `#n`
+namespace collision. Nothing section 2 built was re-implemented (the round-trip test *uses* `appendHeader`,
+`appendRecord` and `parseLog` rather than reproducing them). Every comment in `body.zig` other than the
+UTF-8 claim in B1 describes what the code actually does — I checked each against the code, including the
+`allocRemaining`/`Limit.subtract` proof at `:69-80`, which is correct as written.
+
+**Process note:** the section-1 supervisor post left three bare `##` headings in this file
+(`## Suggested remediation shape`, `## What I checked and found clean`, `## For ## NEXT`), which a
+`^## ` scan reads as sections alongside the real `## N.` headings. Bold labels only from here — the
+DEVLOG's section structure is what gives every supervisor review its scope.
+
+→ @architect
+
+---
+
+**[architect]** **Product Owner decision on B1: refuse invalid UTF-8.** Artefacts amended,
+`VALIDATE_EXIT:0`. The code fix is a remediation block, briefed below.
+
+**B1 is mine.** The instruction the worker followed — *"A body is bytes. If it happens to be invalid
+UTF-8, that is the caller's business, not yours — say so in a comment so the next reader doesn't 'fix'
+it"* — is in my block-3 brief, verbatim. The worker implemented exactly that and documented it exactly as
+told. What I told it to build was not implementable in this format, and I wrote the instruction that
+made the resulting comment sound authoritative enough to survive two audits.
+
+**Recorded as D14 — the tool never writes a record it cannot read back**, with the mechanism written down
+so nobody rediscovers it: `std.json.Stringify` switches representation on content, so an invalid-UTF-8
+body silently becomes an array of byte numbers, the reader requires a string, and since every command
+parses the whole log first, one such record breaks **every subsequent invocation** in an append-only file
+with no repair path. Exit `0`, log destroyed.
+
+**Enforced at the serialisation boundary, not per command.** Every string field carries the same hazard —
+the rest arrive from `argv`, equally unvalidated — so one check in `record.write` covers all of them,
+where a per-command check would have to be remembered eight times in section 4.
+
+**Rejected — teaching the reader to accept the array-of-bytes form**, which would keep "stored exactly as
+supplied" literally true for every input. It buys fidelity for a class that does not occur (bodies are
+Markdown written by agents; invalid UTF-8 means a corrupt file, not an exotic body) and charges for it in
+the one place this project cannot afford it: `8.4` needs the format reimplementable from prose alone, and
+*"a body is a string, except when it is an array of integers"* is exactly what a second implementation
+gets wrong. Recorded in D14 rather than only here.
+
+**Amended, after sweeping repo-wide and case-insensitively per the standing rule** — which found five
+artefacts asserting the retired property, not the two I would have remembered:
+
+- `specs/append-only-log/spec.md` — the requirement now states the UTF-8 constraint and the
+  never-write-what-you-cannot-read promise behind it, plus two scenarios: invalid UTF-8 refused with the
+  log byte-identical, and valid non-ASCII stored unchanged. The second matters as much as the first — it
+  is the common real case and nothing tested it.
+- `design.md` — D14 added; D5's "no encoding validation" marked as narrowed by exactly this one property.
+- `.claude/agents/worker.md`, `reviewer.md`, `supervisor.md` — all three carried "stored verbatim, never
+  interpreted" as an absolute. Now they carry D14 and, more usefully, its boundary: this is the *only*
+  content property inspected, and trimming, CRLF translation and BOM stripping remain forbidden.
+
+Only `src/body.zig:7-11` still states the retired claim, and that is the remediation block's to fix.
+
+**The pattern is now three for three.** Every mid-change decision in this project — D11's temp file, D13's
+closers, now D14 — has had restatements scattered further than the decision's author remembered. The
+sweep is no longer a lesson; it is a step.
+
+---
+
+**[architect]** **Brief — remediation block, section 3 → @worker.** Supervisor findings B1 and N-a. **No
+new task numbers and nothing to tick** — every box in section 3 that can be ticked already is, and `3.2`
+stays unticked for its own reason (below).
+
+**B1 — enforce D14: refuse a record the tool cannot read back.**
+
+- **Read D14 first** (`design.md`, after D13) and the amended `specs/append-only-log/spec.md`. They are
+  the authority; this brief summarises.
+- **Enforce in `record.write`, once, not per command.** Every string field has the hazard, not just
+  `body` — the others arrive from `argv`. Validate what you are about to serialise and return an error
+  rather than writing.
+- **Nothing may be written on the refusal path.** The log must be **byte-identical** afterwards, which
+  given 2B's atomic replace means failing before the temp file is renamed — ideally before it exists.
+  Test that, don't assert it.
+- **Amend `src/body.zig:7-11`.** It currently documents a property the tool does not have, in the
+  strongest terms in the change. Replace with what is now true, and cite D14 so the next reader gets the
+  reasoning rather than just the rule.
+- **Tests:** invalid UTF-8 refused with the log byte-identical afterwards; **and a valid non-ASCII body
+  through the full path** — accented letters, CJK, emoji. The second is the common real case and section
+  3's eight round-trip cases are all ASCII, which is how this survived block review.
+
+**N-a — one failure-reporting mechanism, not two.** `Diagnostics` messages carry no prefix
+(`record.zig:422`); `writeRefusalMessage` carries `devlog: ` (`body.zig:114, 117`); `main.zig` has seven
+inline sites. A body refusal currently prints **`devlog: devlog: refusing…`** — a real defect, not only
+inelegance. Route both through **one** `fail()` that owns the prefix, and leave the call sites passing
+only the message. Section 1's `## NEXT` flagged the missing error-construction mechanism as a hazard
+before either existed; section 4 adds eight commands on top, so this is the last cheap moment.
+
+**Also close these, all small and all named by the supervisor:**
+
+- **N-b** — `log.zig:71`'s `AppendRecordError` is declared and unused while `:392`/`:432` return bare `!`.
+  Use it or delete it.
+- **N-c** — `ReadBodyError` advertises `StreamTooLong` (`body.zig:46`) that `body.zig:66-82` proves
+  unreachable. Remove it from the set.
+- **N-d** — the whitespace-only refusal exists only in code and thread prose; D5 says "empty". Say what
+  the code does, in D5 or the spec, and tell me which you changed.
+- **N-e** — `Attributed.body` defaults to `""` (`record.zig:86`) and parses back fine, while `readBody`
+  refuses an empty body. Two answers to one question. Make them agree, or say why they should not.
+- **N-f** — `body.zig:342-347` is a second copy of `log.zig:465`'s read-whole-log test helper.
+- **N-g** — `body.zig:78` cites `log.zig:449` **by line number**, which rots on the next edit above it.
+  Cite the symbol.
+
+**Do not** touch section 4's territory: no commands, no dispatch wiring. **Do not** re-open `3.2` — it is
+implemented and correct; its verification is the Product Owner's and is scheduled into section 4.
+
+**Done-gates:** `make gates` → `GATES_EXIT:0`, quoting each `LABEL_EXIT:<n>`. Post to this thread as you
+go, then `→ @reviewer`. No commits, no ticks.
+
 ## NEXT
 
 **[architect]** **Section 3 is OPEN** at base `5d2e805`, as a single block `3.1–3.4` — the stdin read

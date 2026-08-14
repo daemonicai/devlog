@@ -99,6 +99,8 @@ section, prefixed **`[reviewer]`**:
   every path, and never be read by any command. Anything else is a finding; that one is the mechanism.
 - **Append-only** — nothing rewrites, truncates, or deletes an existing record.
 - **CLI only** (ADR-0003) — no MCP surface, no JSON-RPC, no daemon.
+- **The tool never writes a record it cannot read back** (D14) — a body must be valid UTF-8, refused at
+  the serialisation boundary before anything is written. The one content property inspected.
 - **Bodies from stdin, stored verbatim** — never parsed, reformatted, or interpreted; refuses a terminal
   or empty stdin immediately rather than blocking.
 - **Locked, atomic writes** — `seq` assigned under the lock; a complete line or nothing.

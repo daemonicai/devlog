@@ -79,6 +79,11 @@ The prose of a record SHALL be supplied on standard input rather than as a comma
 SHALL be stored exactly as supplied. The tool SHALL NOT parse, reformat, or reinterpret a body. Everything
 the tool reasons about SHALL be explicit metadata supplied alongside the body.
 
+A body SHALL be valid UTF-8, and a write whose body is not SHALL be refused before anything is written.
+This is the one property of a body the tool inspects, and it exists to keep a stronger promise: **the tool
+SHALL NOT write a record it cannot read back**. Storing a body it could not later parse would corrupt the
+log permanently, since the log is append-only and has no repair path. Refusal is the narrower failure.
+
 #### Scenario: A long body with Markdown structure
 
 - **WHEN** a body containing headings, emphasis, tables, and fenced code blocks is supplied on standard
@@ -89,6 +94,17 @@ the tool reasons about SHALL be explicit metadata supplied alongside the body.
 
 - **WHEN** a body contains text resembling a command, an identifier, or a status marker
 - **THEN** the tool treats it as prose and derives no meaning from it
+
+#### Scenario: A body that is not valid UTF-8
+
+- **WHEN** a body containing bytes that are not valid UTF-8 is supplied on standard input
+- **THEN** the write is refused with a clear message
+- **AND** the log is unchanged, byte for byte
+
+#### Scenario: A body of valid non-ASCII text
+
+- **WHEN** a body containing accented letters, CJK characters, or emoji is supplied
+- **THEN** it is stored and reproduced unchanged, like any other body
 
 ### Requirement: Records have a definite order
 

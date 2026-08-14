@@ -117,7 +117,9 @@ DEVLOG, ask the Architect for it (`❓ @architect`) rather than guessing a range
   before the command exits; anything else accumulating is the finding.
 - **Append-only** — did any block introduce a path that rewrites, truncates, or deletes a record?
 - **CLI only** (ADR-0003) — no MCP surface, JSON-RPC, or daemon crept in.
-- **Bodies verbatim from stdin** — did any block start parsing, trimming, or normalising a body?
+- **Bodies verbatim from stdin** — did any block start parsing, trimming, or normalising a body? The one
+  permitted inspection is D14's UTF-8 validity check at the serialisation boundary, which exists so the
+  tool never writes a record it cannot read back.
 - **Declared-closer-only close remains a documented guardrail** (D13) — checked against the latest
   `header`'s `closers`, never a hardcoded role name, and never hardened into or described as a security
   boundary. `orchestrator` is retired as a role; this project declares `architect`.

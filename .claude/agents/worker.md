@@ -69,6 +69,10 @@ If a task seems to require breaking one of these, **stop and surface it** — do
 - **CLI only** (ADR-0003). No MCP server surface, no JSON-RPC, no daemon.
 - **Bodies arrive on stdin and are stored verbatim** (D5). Never parsed, never reformatted, never
   interpreted. Refuse immediately when stdin is a terminal or empty — **never block**.
+- **The tool never writes a record it cannot read back** (D14). A body must be valid UTF-8 and a write
+  whose body is not is refused before anything is written — enforced once in serialisation, not per
+  command, since every string field has the same hazard. This is the *only* content property the tool
+  inspects: still no trimming, no CRLF translation, no BOM stripping, no interpretation.
 - **Writes are locked and atomic** (D11). `seq` is assigned under the lock; a write appends a complete
   line or nothing.
 - **Only a declared closing role may close an item** (`work-items`) — the `closers` array on the

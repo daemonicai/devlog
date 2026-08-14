@@ -116,6 +116,10 @@ it is unchanged: the tool cleans up after itself and touches nothing else.
 message. A hung invocation is worse than an error in an agent harness — it burns the turn with no
 diagnostic.
 
+**Amended by D14 during section 3**: "no encoding validation" was overstated. A body must be valid UTF-8,
+because this format cannot store one that is not and still read it back. That is the only property of a
+body the tool inspects — see D14 for why, and for what remains untouched.
+
 **Rejected — `--body-file <path>` with the tool deleting the file afterwards** (the Product Owner's
 initial suggestion): unsafe for the reason above. **Rejected — a `devlog draft` / `--draft` handshake**
 where the tool owns and therefore may delete the file: correct but costs a second round-trip and a new
@@ -232,6 +236,34 @@ derived per-role views (`resume --role`, the addressee index) quietly split in t
 **Rejected — accept with a warning on stderr.** Costs the tool a third outcome between success and
 failure. Agents parse exit codes reliably and prose unreliably, so a warning is a rejection that doesn't
 work.
+
+### D14 — The tool never writes a record it cannot read back; bodies must be valid UTF-8
+
+**Added during section 3, on a supervisor finding.** D5 said bodies are bytes and the tool validates no
+encoding. That is not implementable in this format. Zig's `std.json.Stringify` switches representation on
+content: a valid-UTF-8 string is emitted as a JSON string, and an invalid one silently becomes **an array
+of byte numbers**. No error is raised and the write succeeds — but the reader requires a string, so the
+record fails to parse. Since every command parses the whole log before doing anything, one such body
+breaks **every subsequent invocation, read and write**, in a file that is append-only by design and has no
+repair path. The tool would have corrupted its own log, permanently, while exiting `0`.
+
+So the invariant is: **the tool never writes a record it cannot read back.** A body must be valid UTF-8,
+and a write whose body is not is refused before anything is written.
+
+This is enforced in serialisation, not per command. Every string field has the same hazard, not just
+`body` — the rest arrive from `argv`, which is equally unvalidated — and a check at the write boundary
+covers all of them once, where a per-command check would have to be remembered eight times.
+
+D5's "no encoding validation" is narrowed by exactly this one property and nothing else. There is still no
+trimming, no CRLF translation, no BOM stripping, and no interpretation of content; UTF-8 validity is a
+question about whether the log survives, not about what the prose means.
+
+**Rejected — teach the reader to accept the array-of-bytes form**, which would keep "stored exactly as
+supplied" literally true for every possible input. It buys fidelity for an input class that does not
+occur in practice (bodies are Markdown written by agents; invalid UTF-8 means a corrupt file, not an
+exotic body) and charges for it in the one place this project cannot afford complexity: `8.4` requires the
+format be reimplementable from the prose specification alone, and "a body is a string, except when it is
+an array of integers" is exactly the kind of clause a second implementation gets wrong.
 
 ## Record schema
 
