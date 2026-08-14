@@ -4540,6 +4540,185 @@ tick so the next cold start does not re-open a closed section.
 
 → @architect
 
+## 4. Write commands
+
+**[architect]** Base: `b59f249` — the eight record kinds get their commands: the log is created and its
+role set declared, and every kind of record an agent writes (`section`, `brief`, `post`, `item`, `close`,
+`verdict`, `next`) can be appended, attributed, referenced, and validated at the point of writing.
+
+Pre-flight: working tree clean, `VALIDATE_EXIT:0`, on `change/add-devlog-core`.
+
+**`3.2` ticks inside this section, not in section 3.** Section 3's supervisor closed with the terminal
+refusal implemented and audited but unticked, because confirming the binary *refuses* rather than *hangs*
+against a real TTY is a `CLAUDE.md §4` human-in-the-loop check and no test harness can supply a terminal.
+The done-gate lives in block 4A's brief below, because 4A is the first block that wires a command to
+`readBody`. Section 3 is closed; this is not a reopening.
+
+---
+
+**[architect]** **Section 4 carve — three blocks.** The split is by *what the code has to learn*, not by
+the order `tasks.md` lists the tasks in. `tasks.md` lists the cross-cutting rules (`4.8`–`4.11`) last
+because they read as qualifications; they are in fact the foundation, and two of the three blocks below
+are therefore **non-contiguous in task numbers**. Stated plainly so nobody reads it as an accident:
+
+- **Block 4A — `4.3`, `4.8`, `4.10`, `4.11` — the write spine.** `devlog header` and `devlog post`: the
+  minimum pair that makes a write real end to end. `header` creates the log and declares the role set;
+  `post` is the exemplar general write, and the only kind of record that is *purely* the common fields
+  plus a body. Everything structural lands here — command-scoped flag arity, `--ref ns:id`, the
+  timestamp, role validation against the latest header **under the lock**, and the ordering rule that
+  puts every refusal before any filesystem effect. The section's risk is concentrated in this block by
+  design.
+- **Block 4B — `4.1`, `4.2`, `4.7` — the plain variations.** `section` (`--title`, `--base`), `brief`
+  (`--to`), `next`. Three commands that are `post` plus zero or two extra string fields and a different
+  `kind`. No new mechanism; if this block needs one, 4A got something wrong and that is worth knowing.
+- **Block 4C — `4.4`, `4.5`, `4.6`, `4.9` — the logic-bearing trio.** `item` (assigns and prints `#n`),
+  `close` (the closer guardrail), `verdict` (typed outcome). These are the three commands carrying enum
+  fields, so `4.9`'s enum half lands with them and `4.9` ticks here. `4.9`'s *other* half — "reject writes
+  that omit the author role" — is implemented in 4A as a consequence of `4.11`, and the box waits for the
+  enums so it is ticked once, when it is wholly true.
+
+Every task in `4.1`–`4.11` appears in exactly one block.
+
+---
+
+**[architect]** **Six decisions I am binding before 4A is briefed.** Five of them are the section-3
+supervisor's carried findings (`C1`, `C2`) and `## NEXT`'s `N1` and carried items 3 and 4 — all four were
+recorded precisely so this block would not rediscover them. None is a spec amendment; where one goes
+beyond what a spec says, I say so, and no repo-wide sweep is owed.
+
+**A1 — `N1`: role validation happens inside `appendRecord`, not before it.** `4.11` and `4.5` both need
+the latest header's `roles`/`closers` *at write time*, and `appendRecord` (`src/log.zig:442`) is the only
+thing holding the lock and the parsed log. Of `## NEXT`'s two shapes, I am taking the first:
+**`appendRecord` performs the check itself** and returns a typed error, with the declared roles reported
+through `diag`. Rejected — a public `openLocked` variant returning the parsed log and header to
+`main.zig`: it exports lock lifetime to the call site, where every future command has to get release
+right, and invites exactly the second unlocked parse the alternative exists to avoid. The check `append
+Record` performs is "is this writer entitled to write this record": role ∈ `roles` for every kind, **and**
+role ∈ `closers` additionally when the record is a `.close`. One place enforces D13 and the `work-items`
+guardrail, and `close` (4C) inherits it rather than re-implementing it.
+
+**A2 — a non-header write never creates the log.** `openLocked` creates the file (`src/log.zig:162`),
+which is right for `appendHeader` and wrong for everything else: a `post` against a path with no log would
+create an empty file and *then* fail A1's no-header check, leaving a zero-byte `DEVLOG.jsonl` behind —
+which is `C2`'s hazard, and breaks `1.5`. So `appendRecord` opens **without creating**, and a missing log
+is an error naming `devlog header` as the fix. `appendHeader` keeps creation; it is the only thing that
+has it. `durable-format` requires this of *reads* ("rather than creating one silently") and is silent about
+writes — extending it to writes is my ruling, consistent with the spec and not an amendment to it.
+
+**A3 — `C2`: refusals precede filesystem effect, as an ordering rule with a test per command.** Every
+write command runs: parse argv → validate flags and enums → read the body (if that command takes one) →
+*then* touch the filesystem. **`devlog header` never calls `readBody` at all**, because `HeaderRecord` has
+no body. A2 removes the seam this rule guards; the rule stays because the seam has now appeared twice.
+
+**A4 — `C1`: two shapes for a failure message, not three, and `fail()` prints all of them.** The three
+shapes today are `Diagnostics.message` (a plain string), `writeRefusalMessage` (writer-based), and
+`error.InvalidUtf8` (no message at all, naming no field). Collapse to: **static messages are a pure
+`fn (err) []const u8`**, and **dynamic ones — anything that must name a declared role, a field, or a path
+— go through `Diagnostics`**, which already owns an allocated, owned message. `body.writeRefusalMessage`
+becomes `body.refusalMessage(err) []const u8` and `main.zig` prints it through `fail()` exactly as it
+prints `Diagnostics.message`. And **`record.write` gains a `diag`**, so D14's `error.InvalidUtf8` can name
+the field that was not valid UTF-8 instead of failing anonymously — the spec now promises "refused with a
+clear message" and nothing can currently produce one. Rejected — one central `errorMessage(anyerror)`
+across modules: it would be a god-function that has to know every module's error set, which is the
+staleness hazard `## NEXT`'s note on inferred error sets already argued against.
+
+**A5 — carried item 3: flag arity becomes command-scoped, and `--change` and `--log` both stay.** `header`
+needs `--role` **repeatable** (it declares the set) while every other command needs it **exactly once**
+(it attributes one write), so the global "a second `--role` is an ambiguity" check has to become a
+property of the command rather than of the parser. Two-phase parse: find the command, `--help`,
+`--version` and any global parse ambiguity first; then parse the rest of argv against that command's flag
+spec. **The `CLAUDE.md` ruling that parse-ambiguity errors beat `--help`/`--version` survives both phases
+unchanged** — it is the one behaviour in `main.zig` with the most tests behind it and the least room to
+drift. On naming: `--log <path>` is the file and `--change <name>` is the change slug stored in the
+`header` record. They are different things, both needed, and neither is renamed; `devlog header --help`
+must say which is which, because that is the only place the distinction bites.
+
+**A6 — carried item 4: `Parsed`'s ordered `if`s are replaced, not extended.** Four conditions at
+`src/main.zig:216–230` have landed correctly four times by comment discipline. `4.8` adds `--ref`
+malformation as a fifth, which `## NEXT` named the forcing move, so: **first fault wins is encoded once**
+— a single `?ParseFault` set at the first fault and reported at one call site — rather than N booleans
+checked in a hand-ordered sequence. Every existing `main.zig` test must still pass unchanged; the message
+text and the precedence they pin are the specification of this rework, not casualties of it.
+
+**Two smaller calls, mine, recorded so they are not rediscovered as findings:**
+
+- **Timestamps.** `ts` is `YYYY-MM-DDTHH:MM:SSZ`, UTC, seconds precision — the shape in `design.md`'s
+  record-schema example. **The clock is injected into `run`, not called from inside a command**, so every
+  command's record is assertable against a pinned `ts`. Which Zig 0.16 API supplies the wall clock is the
+  worker's to determine against the pinned stdlib — 0.16 moved this, so do not write a remembered API.
+- **What a write prints on success.** Silence, exit `0` — with two exceptions. `item` prints its
+  identifier, because `work-items` requires the tool return it (4C's problem, not 4A's). `header` prints
+  one line naming its outcome, because `created` / `appended` / `unchanged` are three genuinely different
+  things that all exit `0`, and an agent that cannot tell them apart cannot tell whether its declaration
+  took effect. No write prints its assigned `seq`; nothing needs it yet, and adding it later is additive.
+
+---
+
+**[architect]** **Brief — block 4A (`4.3`, `4.8`, `4.10`, `4.11`) → @worker.** Build the write spine:
+`devlog header` and `devlog post`, and everything structural they force. This is the largest block in the
+change so far and deliberately so — the other two section-4 blocks are variations on what you land here.
+
+**Read first, and read them as they now stand rather than as remembered:** `design.md` D5, D10, D11, D13,
+D14 and the `## Record schema` table; `specs/append-only-log/spec.md` (all of it — attribution, the
+header's exemption, the undeclared-role refusal); `specs/external-references/spec.md` (all three
+requirements); `specs/durable-format/spec.md`'s "The change being operated on is named explicitly" and
+"No state exists outside the log file". The six decisions **A1–A6** in the post immediately above this one
+are binding; they are not suggestions and they are not yours to relitigate — if one of them is wrong,
+raise it as a `❓ @architect` and stop, do not route around it.
+
+**Tasks in this block:**
+
+- **`4.10` — `devlog header --change <name> --role <r> (repeatable) --closer <r> (repeatable)`.** Declares
+  the project's role set (D13). Creates the log when it does not exist; appends a new header when the tool
+  version or the declaration differs from the **latest** header; writes nothing at all when neither
+  differs. `src/log.zig`'s `appendHeader` already implements all three outcomes and returns which one
+  happened — wire it, do not reimplement it. The `header` record carries **no `role` of its own**;
+  `HeaderRecord` has no field for one, so this is already true by construction — do not add a check that
+  restates it. `--change` is required. At least one `--role` is required. `--closer` is required and every
+  `--closer` value must also appear in `--role`: declaring a closer that is not a role is incoherent, and
+  refusing it at the point of declaration is cheaper than deriving it later. Prints one line naming
+  `created` / `appended` / `unchanged`. **Takes no body and must never read stdin (A3).**
+- **`4.3` — `devlog post --section <s> --block <b> [--to <r>]`.** General thread traffic: the common
+  fields and a body, nothing else. `--section` and `--block` are optional per the schema table (both are
+  `?[]const u8`), and `--to` is optional. The body comes from stdin via `body.readBody` and is stored
+  byte-for-byte.
+- **`4.8` — `--ref ns:id`, accepted and stored on every write command in this block, repeatable,
+  unvalidated (D10).** Split on the **first** `:`; both sides must be non-empty. A malformed `--ref` is a
+  parse fault under A6, reported like any other. Beyond well-formedness the tool checks **nothing** —
+  `external-references` requires that a reference to something that does not exist is accepted "without
+  error and without warning", and the namespace is free-form, so a new namespace needs no code change.
+- **`4.11` — a write whose `--role` is not in the latest header's declared set is rejected, reporting
+  which roles are declared.** Per **A1**, inside `appendRecord`, under the lock. A non-header write
+  against a log with **no header at all** is also refused, naming `devlog header`. Per **A2**, neither
+  refusal creates or modifies the log file.
+
+**Done-gates for this block — all of them, before you hand off:**
+
+1. `make gates` → `GATES_EXIT:0`. Quote the exit lines; do not characterise the output. Report the test
+   count as a number you counted.
+2. Every existing test in `src/main.zig` still passes **unchanged** (A5, A6). If the rework makes one
+   fail, the rework is wrong — that suite is the specification of the parse-ambiguity ruling.
+3. A test per write command that a refused write leaves the filesystem **byte-for-byte unchanged**, and
+   that a refused write against a missing log leaves **no file behind** (A2, A3).
+4. A test that `header` is the only path that creates the log.
+5. A test that an undeclared role is refused and the message **names the declared roles** (A1, `4.11`).
+6. A test that a `--ref` in a namespace the tool has never seen is stored without complaint, and that
+   several refs on one record all survive a round-trip (`4.8`).
+7. **`C3` (section-3 supervisor nit), close it while you are in `body.zig`:** neither `writeRefusalMessage`
+   test (`body.zig:291–307`) asserts the *absence* of the `devlog: ` prefix — both would still pass if it
+   were re-added. One assertion pins it. A4 renames that function; carry the assertion onto the new one.
+
+**And one gate that is not yours to run — `3.2`.** This block is the first to wire a command to
+`readBody`, so it is where section 3's parked human-in-the-loop check becomes dischargeable. **Do not tick
+`3.2`, and do not claim it verified.** What you owe is the input to it: a built binary and, posted to the
+DEVLOG, the exact copy-pasteable command the Product Owner should run in a real terminal, what they should
+see, and what would count as a failure. I hand that to them and tick `3.2` myself once they confirm.
+
+**Scope discipline:** `4.1`, `4.2`, `4.4`–`4.7` and `4.9`'s enum half are **not** in this block. If your
+work naturally produces the shape those commands will need, that is expected and good — but do not build
+them, and do not tick their boxes. Post to the DEVLOG as you go, and `→ @reviewer` when the gates are
+green.
+
 ## NEXT
 
 **[architect]** **Section 3 is CLOSED** — supervisor `Approve` on the second pass, after one remediation
