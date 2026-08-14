@@ -5036,6 +5036,63 @@ section 3's close said it would.
 
 → @supervisor's scope for this section remains `git diff b59f249..HEAD`.
 
+---
+
+**[architect]** **Brief — block 4B (`4.1`, `4.2`, `4.7`) → @worker.** Three commands: `devlog section`,
+`devlog brief`, `devlog next`. Block 4A built the write spine; this block is the proof that it was built
+at the right shape. **If any of these three needs a new mechanism, 4A got something wrong** — say so in
+the thread rather than adding the mechanism quietly, because that is a finding about 4A, not a cost of 4B.
+
+**Read first:** the block 4A posts above — the six binding decisions **A1–A6**, the reviewer's audit, and
+my landing note. A1–A6 bind this block identically and are not open for relitigation. Then `design.md`
+D8 (why `brief` is a record kind at all) and the `## Record schema` tables **as they now stand** — I
+amended them during 4A, so the "fields common to all kinds" split into three-for-every-kind and
+six-for-the-attributed-kinds is new since you last read it. Then `specs/next-state/spec.md` in full, and
+`specs/append-only-log/spec.md`'s "Records reference the work they concern".
+
+**`4.1` — `devlog section --section <s> --title <t> --base <sha>`.** Opens a section and fixes the
+supervisor's diff range. All three flags required. Body required. `--base` is stored **unvalidated** — the
+tool does not run `git`, does not check the sha exists, and does not care about its length; it is a string
+the log carries so a human or an agent can `git diff` against it later. Same posture as `--ref` (D10): the
+referenced thing lives outside the log.
+
+**`4.2` — `devlog brief --section <s> --block <b> --to <r>`.** The architect's block brief (D8). All three
+required — a brief nobody is addressed to is not a brief, and `resume --role` (6.1) reaches it precisely
+*through* `--to`. Body required. Note `--to`'s value is a role name: it is a **declared** role like any
+other, so it is subject to the same header check `--role` is. Decide and state in the thread whether
+`appendRecord` validates `to` as well as `role`; my inclination is yes and for the same reason D13 gives —
+`--to reviewr` silently addresses a brief to nobody, and `resume --role reviewer` would never surface it —
+but I am naming it as a question rather than a decision because it is the one genuine design call in this
+block. Raise it as `❓ @architect` with your recommendation if you disagree.
+
+**`4.7` — `devlog next`.** Appends the narrative record. Takes a body and `--ref`, and **nothing else** —
+no `--section`, no `--block`, no `--to`. NEXT is change-scoped narrative, not section-scoped, and the
+schema's optional fields being *available* is not a reason to expose flags for them; adding one later is
+additive and cheap, removing one is not. `next-state` requires the most recently appended NEXT be the
+current one — that is a *derivation* (5.3) and not this block's to build. What this block owes is that
+appending works and never rewrites.
+
+**Binding on all three:**
+
+- **`--ref` is required on every one of them** (`4.8`). That box is already ticked, and my landing note
+  flagged it as the one tick in this section whose truth can decay: it says "every write command", and
+  five more write commands arrive in 4B and 4C. If any of these three omits `--ref`, the ticked box
+  becomes false.
+- **A3's ordering holds:** parse → validate → read body → *then* touch the filesystem. Each of the three
+  gets the test that a refused write leaves the log byte-for-byte unchanged, and that a refusal against a
+  missing log leaves no file behind.
+- **A1's role check applies unchanged** — these are non-header writes, so an undeclared `--role` is
+  refused under the lock, and a missing log names `devlog header`.
+- Each command gets its own `--help`, in the shape 4A established for `post` and `header`.
+
+**Done-gates:** `make gates` → `GATES_EXIT:0`, exit lines quoted verbatim, test count counted rather than
+estimated — and say explicitly whether you are counting named `test "…"` blocks or what `--summary all`
+runs, because those two numbers differ by one in this repo and three reports disagreed about it last
+block.
+
+**Scope:** `4.4`, `4.5`, `4.6` and `4.9` are block 4C's and not yours. Do not tick anything, do not
+commit, do not touch `tasks.md` or the `Makefile`. Post to the DEVLOG as you go; `→ @reviewer` when green.
+
 ## NEXT
 
 **[architect]** **Section 3 is CLOSED** — supervisor `Approve` on the second pass, after one remediation
