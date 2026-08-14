@@ -1527,10 +1527,124 @@ backfilled), and the 14 `--help` stubs (the right shape — a data table with on
 
 My round-one notes N1–N9 are already folded in above this heading; nothing in them changed.
 
+---
+
+## 2. Record model and the log file
+
+**[architect]** Base: `0a7d8b0` — the eight record kinds as Zig types, JSON line serialisation and
+parsing, `seq` assignment, locked atomic append, and the `header` record.
+
+---
+
+**[architect]** **Carried finding 2 from section 1 is closed, ahead of its 4.5 deadline.** The Product
+Owner confirmed the standing rule: **`architect` is the only role that may close items**, in this repo
+and in all their projects at present, and the agents know that role as "the orchestrator". So the word
+was never the problem — `worker.md:3`'s "Invoked by the orchestrator" is correct and stays.
+
+What was wrong is that `worker.md:65` told the worker *what to implement*: a check against a fixed role
+name, where 4.5 requires a check against the header's `closers` array. A worker briefed off that line
+could reasonably have hardcoded `architect`, which is precisely the alternative D13 rejected. That
+`closers` will in practice always be `["architect"]` does not change the code path; it only fixes the
+value it reads. Restated as "Only a declared closing role may close an item", naming `architect` as this
+project's declared closer and recording the orchestrator synonym. Landed in `0a7d8b0`.
+
+**Two corrections to the note as the supervisor carried it:** `reviewer.md:96` and `supervisor.md:113`
+do **not** contain the retired rule — neither file mentions `orchestrator` or the close guardrail at
+all. It was one line in one file, not three. The upstream `dmons` scaffold is the Product Owner's, to
+adjust separately.
+
+---
+
+**[architect]** **Section 2 carve — two blocks.** The split is the filesystem boundary: block one is a
+pure in-memory data model and codec with no I/O at all, block two is everything that touches the file.
+
+- **Block 2A — `2.1–2.4`:** the eight record kinds as Zig types, serialisation to one JSON line, parsing
+  a log into records, and `seq` assignment. Testable end to end with in-memory buffers.
+- **Block 2B — `2.5–2.7`:** exclusive locking and atomic append, the `header` record and its re-append
+  rule, and the round-trip test over every record kind.
+
+`2.4` (assign `seq`) and `2.5` (assign it *under the lock*) look like they want to be one block. They
+don't: 2.4 is the ordering rule over a record set — strictly increasing, contiguous, total — and is
+decidable in memory; 2.5 is the concurrency discipline that makes the assignment safe. Separating them
+gets the ordering invariant tested without a filesystem in the way, and leaves 2B free to be about
+locking. The `header` (2.6) sits with 2B rather than 2A because its re-append rule is a property of
+opening a file, not of the schema.
+
+---
+
+**[architect]** **Brief — block 2A (`2.1–2.4`) → @worker.** Define the record model and its JSON codec.
+No filesystem access in this block: no locking, no append, no file creation. Parsing takes bytes;
+serialisation produces bytes. 2B adds the I/O.
+
+**Tasks:**
+
+- **2.1** Define the eight record kinds and their fields as Zig types (`design.md ## Record schema`).
+- **2.2** Serialise a record to one JSON line, with bodies stored verbatim.
+- **2.3** Parse a log file's bytes into records, ignoring unknown *fields* and refusing an unrecognised
+  `format` with a clear message (`durable-format`).
+- **2.4** Assign `seq` — strictly increasing, contiguous, establishing total order (`append-only-log`).
+
+**The schema is `design.md:205–247` and it is authoritative — read it, don't reconstruct it from here.**
+The eight kinds are `header`, `section`, `brief`, `post`, `item`, `close`, `verdict`, `next`. Common
+fields: `kind`, `seq`, `ts`, `role`, `section`, `block`, `to`, `refs`, `body`. Note the two shapes that
+trip people up:
+
+- **`role` is common but `header`-exempt** (D13, `append-only-log` "The header carries no role"). Model
+  that as a property of the schema, not as a validation the caller remembers to skip. The `header`
+  carries `format`, `tool`, `change`, `roles`, `closers` — and no `role` of its own.
+- **`section` is both a common field and a record kind.** Don't let the naming collapse them.
+
+**Binding decisions:**
+
+- **D5 — bodies are verbatim.** Stored exactly as supplied, never parsed, reformatted, or interpreted.
+  Everything the tool reasons about is explicit metadata alongside the body. A body containing text that
+  resembles a command or a status marker is prose and derives no meaning.
+- **D10 — `refs` may appear on every record kind**, `[{"ns":"D","id":"2"}]`, any namespace,
+  **unvalidated**. Store and reproduce; do not check the namespace against a known set.
+- **D9 — item identifiers are the neutral `#n` sequence.** Never kind-prefixed. `refs` namespaces (`D`,
+  `N`, `S`, `F`) are external and must not collide with item numbers.
+- **D2 — no persisted state but the log.** Nothing this block produces may be cached to disk.
+
+**Forward compatibility, `durable-format` — the asymmetry is the requirement.** Unknown *fields* are
+ignored silently, so a newer writer's extra field does not break an older reader. An unrecognised
+*`format` version* is refused with a clear message rather than guessed at. Both halves need a test.
+
+**`seq` (2.4, `append-only-log` "Records have a definite order"):** strictly increasing, contiguous, and
+the total order — "the most recent record of a kind" must be unambiguous, and the order must be
+identical after a rebuild from the file. In this block that means: given a parsed set, the next `seq` is
+derivable, and a log whose `seq` values are non-contiguous or out of order is a fault you report, not
+one you silently repair. **Ask before inventing a repair policy** — the spec says the order survives
+reconstruction; it does not say what to do with a corrupted file, and that is the Product Owner's call.
+
+**Existing code:** `src/main.zig` (514 lines) is dispatch, global flags, `--help`/`--version`, and the
+error convention. This block is new module(s) — don't grow `main.zig` into a record model. Follow the
+established error convention: non-zero exit, message on stderr, **nothing partial written**. Every file
+needs the MPL 2.0 header (D12). The version is single-source at `build.zig.zon:3` — read it through
+`build_options`, never re-declare it.
+
+**Exit codes — settled, as section 1 asked.** Section 1 parked an architect `❓`: 2.3, 4.11 and 6.6 all
+describe failures a caller might want to tell apart, and no spec mandates distinct codes. **Ruling: every
+failure exits `1`.** Distinct codes are a promise to callers, and once a caller branches on `2` it cannot
+be taken back without breaking them — the tool's only consumer today is the `dmons` skill, which reads
+stderr, not codes. The failure is named in the message; that is the interface. If a real caller later
+needs to branch, that is a spec change with a version bump behind it, not a detail settled in a brief.
+Report an unrecognised `format` (2.3) as a clear stderr message and exit `1`, same as every other fault.
+
+**Watch for:** allocator hygiene (every allocation freed or arena-scoped, tests leak-checked), and JSON
+escaping of bodies — newlines, quotes, and control characters must survive a round trip byte-for-byte.
+Zig 0.16's `std.json` API, not a remembered one.
+
+**Done-gates:** `make gates` → `GATES_EXIT:0`, quoting each `LABEL_EXIT:<n>`. Post progress to this
+thread as you go, then hand off `→ @reviewer`. Do not commit and do not tick boxes — those are mine.
+
 ## NEXT
 
-**[architect]** **Section 1 is CLOSED** — supervisor `Approve` after one remediation round. Resume at
-**section 2**, opening it with its own `Base:` post (`git rev-parse --short HEAD`).
+**[architect]** **Section 2 is OPEN** at base `0a7d8b0`, carved into two blocks — **2A (`2.1–2.4`)** the
+record model and JSON codec, in memory only; **2B (`2.5–2.7`)** locking, atomic append, the `header`, and
+the round-trip test. 2A is briefed and with @worker. Supervisor scope at section end is
+`git diff 0a7d8b0..HEAD`.
+
+Section 1 is CLOSED — supervisor `Approve` after one remediation round.
 
 Landed: `eccfabe` (1.1–1.3), `3a32d66` (1.4–1.5), `befbdae` (DEVLOG restoration), `ecb6afc` (remediation).
 All five boxes ticked, gates `GATES_EXIT:0`, **25** tests — counted, not quoted.
@@ -1543,9 +1657,10 @@ discovered:
   edit rather than 25.
 - There is no error-construction mechanism — seven hand-composed `stderr.print` + `return 1` sites today,
   which becomes dozens across different workers if left as a pattern to copy.
-- **Every failure returns exit `1`.** Tasks 2.3, 4.11 and 6.6 all describe failures a caller may want to
-  tell apart. No spec mandates distinct codes, so this is an architect `❓` — and section 2 is where it
-  gets locked in. Settle it in the brief.
+- ~~**Every failure returns exit `1`** — architect `❓`, settle it in section 2's brief.~~ **SETTLED in
+  block 2A's brief: every failure exits `1`.** Distinct codes are an irrevocable promise to callers; the
+  failure is named on stderr, and that is the interface. Revisit only as a spec change with a version
+  bump. Binds 2.3, 4.11 and 6.6.
 
 Also note 1.5's "nothing partial written" currently holds *structurally*, because nothing touches the
 filesystem at all. Section 2 is where that claim gets tested for real, against a lock (D11).
@@ -1556,10 +1671,11 @@ filesystem at all. Section 2 is where that claim gets tested for real, against a
    the specs, tasks, code and a DEVLOG post — but not in `## Decisions`, where the two *rejected*
    alternatives are the valuable part. Hardcoding `architect` is exactly what a future maintainer proposes
    again. One paragraph, or a D14.
-2. **The agent definitions still state the retired rule as binding** — `.claude/agents/worker.md:65` quotes
-   "Only the orchestrator may close an item", with `reviewer.md:96` and `supervisor.md:113` framing it the
-   same way. Three lines. **Before 4.5 is briefed.** Product Owner's call, since these are scaffold-owned
-   and the same drift may exist upstream in `dmons`.
+2. ~~The agent definitions still state the retired rule as binding.~~ **CLOSED in `0a7d8b0`**, ahead of
+   4.5. It was one line in one file, not three — `reviewer.md:96` and `supervisor.md:113` never contained
+   it. Product Owner confirmed `architect` is the sole closer across their projects and that the agents
+   know it as "the orchestrator"; the fix was to stop `worker.md:65` prescribing a hardcoded role check.
+   Upstream `dmons` scaffold is theirs, separately. See the section 2 post.
 3. **`tasks.md:52`'s `--role` overload is concrete, not latent** — the dispatcher rejects a repeat while
    4.10 needs it repeatable. Carry the resolution into 4.10's brief; the dispatcher will need genuine
    command-scoped arity, not a relaxed check. Settle `--change` vs `--log` naming there too.
