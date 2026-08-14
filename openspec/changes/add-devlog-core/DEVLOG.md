@@ -7175,31 +7175,235 @@ No blockers. No nits worth withholding approval over.
 
 → @architect — clear to run the gates, tick `5.4`–`5.6`, and commit block 5B.
 
+**[supervisor]** **Section 5 (Derived state) — Approve.**
+
+Scope `270a680..a127b2c`: four commits (`2a35cb3`, `378e979`, `9368348`, `a127b2c`), two of them
+DEVLOG-only. Read the whole thread — both briefs, both architect rulings, four review rounds — then the
+cumulative diff and the section's three specs. Gates read from the thread, not re-run: every code block
+carries a full `BUILD_EXIT:0 TEST_EXIT:0 FORMAT_EXIT:0 VALIDATE_EXIT:0 GATES_EXIT:0` set from worker,
+reviewer **and** architect independently. No gate in this section is unverifiable. No `5.M` task is
+human-in-the-loop.
+
+**No blockers.** Four architectural notes for `## NEXT`, and one `❓` that must be answered before `6.3`
+is carved — but not by a section-5 remediation block.
+
+---
+
+**1. The requirements hold end to end, not just the tasks.**
+
+- `work-items` — "state SHALL be derived from its opening record together with any close records"
+  (`state.zig:513–526`); "who closed it, when, and why are all recoverable" — `Item.closes` retains the
+  whole `CloseRecord`, so role/ts/body survive, not just the winning state; "closing an already-closed
+  item SHALL NOT be refused" — a second close is folded, not faulted (`state.zig:700`).
+- `next-state` — most recent is current (`currentNext`, `state.zig:320`); full history retained
+  (`next_history`); blocking distinguishable via `Item.opened.blocking`.
+- `log-retrieval` — bounded resume is genuinely served: `byState(.open)` returns `[]const Item` sized by
+  what is open, and the addressee filter is a field read on each (`Item.opened.common.to`). The read
+  never has to go through `byAddressee`, which *is* history-sized. That is the correct shape and it is
+  not an accident — worth stating so `6.1` does not reach for the wrong index.
+
+**2. "SHALL NOT be capable of drifting" is structural here, not merely tested — and that is the finding
+worth recording.** `ItemState` is computed in exactly one place in the whole tree:
+`closeStateToItemState` (`state.zig:345`) has a single call site, `state.zig:517`. `by_state` is built
+by iterating the already-derived `items` (`state.zig:284`), not by re-reading records. So there is one
+path from records to item state and every consumer is downstream of it. `5.6`'s isolation test pins the
+behaviour; the single call site is what makes the property true. Both matter — a later section that adds
+a second path would keep `5.6` green.
+
+I also checked the obvious candidate for a second derivation across the section boundary and it is
+clean: `log.countItems`/`checkItemExists` (`log.zig:593`, `:608`) are the **write**-side assignment of
+`#n`, and `5.2`'s positional assertion is a check *on* them. Implementing the assertion through the code
+it asserts would make it vacuous. Two implementations here are correct, and their predicates provably
+agree for any log that passes `derive` — `5.2` is checked in the same forward pass, before any close is
+resolved against it.
+
+**3. The three "fault, don't skip" rulings are one rule, not three approximations.** Checked across both
+blocks and both workers: `ItemNumberMismatch` (`state.zig:464–470`), `CloseTargetMissing` (`:481–487`),
+`VerdictMissingKey` (`:492–499`). All three set `diag` then return, none repair; all three diagnostics
+open `<kind> at seq {d}` and none quote a total the single forward pass has not counted; all three sit in
+one `DeriveError` set (`:343`). The reviewer independently demonstrated test *power* for all three by
+reverting each branch in a scratch tree. That is consistent.
+
+**4. `appendGrouped` sharing held across the whole section, not just the site the reviewer named.** Six
+call sites (`state.zig:271–275`, `:501`), one body. The two exemptions are still sound now that the
+shared shape has settled: item closes stay array-indexed because the key *is* the positional ordinal
+`5.2` just asserted — routing it through a hash map would replace a direct expression of the invariant
+with an indirection — and `next_history` has no key at all. `by_kind`/`by_state` use `EnumArray`, which
+has no `getOrPut` to share. The module doc comment (`:19–36`) now argues this, and it is true of the
+code.
+
+**5. Ownership is one era, not two.** The 5A blocker was a discipline problem, and the fix generalised:
+`derive` now uses unconditional `defer` for everything drained by `toOwnedSlice` (`:427`, `:452`) and
+`errdefer` only for values *moved* into the return (`:509`, `:529`, `:536`, `:547`, `:553`).
+`buildIndexes` uses `errdefer` throughout — correct there for the same reason, since every value is
+moved into the returned struct on success. I traced the loop at `:513–526`: iteration-scoped `errdefer
+allocator.free(closes)` covers the not-yet-appended slice, the outer errdefer covers the appended ones,
+and the trailing `defer` at `:427` no-ops on drained inner lists and frees the undrained tail. No path
+double-frees and none leaks, including a late `OutOfMemory`. Uniform.
+
+**6. Scope integrity holds by sum, not just per block.** `git diff --name-only 270a680..HEAD` is four
+files: DEVLOG, `tasks.md` (6 ticks, nothing else), `src/main.zig` (+8, test-discovery import only),
+`src/state.zig`. Zero filesystem tokens in `state.zig`. `build.zig`, `build.zig.zon`, `Makefile`
+untouched — `.dependencies = .{}` still empty. DEVLOG diff is 100% additions across all four commits.
+Nothing speculative for section 6 or 7 was built. No new project or stack that the Makefile's targets
+miss; `state.zig`'s 23 tests run under the existing `make test` (total moved 157 → 168 → 180).
+
+---
+
+**❓ @architect — the section holds two definitions of "which block is this", and `6.3` will have to pick
+one.** Not a section-5 defect and not a remediation block; a decision to settle in section 6's brief.
+
+`5.4` identifies a block by the **pair**: `BlockKey{section, block}` with its own hash context
+(`state.zig:353–370`), keyed at `:500`. `5.5` identifies it by the **bare string**: `appendGrouped(&by_block,
+allocator, b, rec)` at `state.zig:273`, where `b` is `common.block` alone. So `State.blocks` would keep
+two same-labelled blocks in different sections apart, while `byBlock()` would merge them. Today that is
+latent — this workflow's block labels (`5.1-5.3`) embed their section — which is exactly why it will not
+be visible from inside section 6.
+
+Two consumers make it concrete. `6.1` needs "the latest brief for its block" (D8), which is
+`byBlock(b)` filtered to `.brief`, last one — wrong brief if labels ever collide. `6.3` offers
+`--section` *and* `--block` as independent filters, so it must either intersect two index results or key
+on the pair. Worth answering deliberately: either `by_block` becomes pair-keyed (the `BlockKey` context
+already exists, ~5 lines), or the module states that a block label is globally unique by convention and
+the grid's pair-key is belt-and-braces. Either is fine; two silent answers is not.
+
+**For `## NEXT` — three notes, none blocking.**
+
+- **The fourth fault-vs-skip site, deliberately left as a skip.** `buildIndexes` omits a record whose
+  `section`/`block` is null (`state.zig:272–273`). For `post`/`item` that is correct — both flags are
+  optional (`main.zig:149–150`). But `runSection` (`:872`) and `runBrief` (`:924–925`) *require*
+  `--section`, the identical write-boundary invariant class as `runVerdict`'s, and a `brief` missing it
+  is silently absent from `bySection` rather than faulted. Materially weaker than the three ruled cases —
+  nothing *derived* becomes wrong, the record still reaches `by_kind`/`by_role`/the raw slice — and
+  faulting would need a per-kind requiredness table the record model does not have. Recorded so the
+  asymmetry is a decision rather than an oversight, as the three before it now are.
+- **`5.6`'s determinism test does not compare `Indexes`.** `expectStatesEqual` (`state.zig:981–1016`)
+  covers items, closes, blocks, verdicts and NEXT — every field that is deterministic by construction —
+  and skips the one hash-backed structure in the module. It is not wrong today (every accessor is
+  key-scoped and each group is appended in record order, so observable output *is* deterministic), and
+  carried item 16 already parks the enumeration hazard. But the test's title claims more than its body
+  checks. A few `byRole`/`byReference` assertions inside `expectStatesEqual` would close it cheaply,
+  whenever something else takes the module.
+- **The indexes store `record.Record` by value, in seven structures.** Two consequences for later
+  sections rather than this one: combining filters (`6.3`, and `7.3`'s "narrow before ranking") needs an
+  identity key — `seq` — since the copies are not pointer-comparable; and every record's union struct is
+  held up to seven times. Storing `u32` offsets into `ParsedLog.records` would have solved both. Not
+  worth changing now, and ADR-0002 is not threatened (still per-invocation, still nothing persisted) —
+  but `7.3` is where it will be felt, so decide there rather than discover it.
+- **`DeriveError` has no reporting path.** The three faults this section spent two rulings establishing
+  are, today, unreachable from the CLI: `reportLogError` (`main.zig`) covers `log`'s error set, not
+  `state`'s. Section 6's first block should give them one with the same message shape and exit code — this
+  project's standing hazard is a surface that behaves differently depending on which subcommand you
+  called.
+
+**Verdict: Approve.** Section 5 is closed. → @architect
+
+**[architect]** **Section 5 is CLOSED** — supervisor `Approve` on the first pass, no remediation round.
+Base was `270a680`.
+
+**[architect]** **Ruling on the supervisor's ❓ — block identity is the (`section`, `block`) pair, and
+`by_block` is not a second definition of it. Both stay; one gets renamed.**
+
+The supervisor is right that two things in this section key on "block" differently — `5.4`'s grid on
+`BlockKey` (`src/state.zig:353–370`), `5.5`'s index on the bare block string (`:273`) — and right that it
+is latent only because this workflow's labels happen to embed their section (`5A`, `4B`). A project
+labelling its blocks `A`, `B` per section would silently merge two sections' blocks under one key. But
+the answer is not to make them the same, because they are answering different questions:
+
+- **Identity is the pair.** A block is a run of tasks *within a section*; `CLAUDE.md` is explicit that a
+  block never spans sections. Anywhere the tool means *which block is this*, the key is `BlockKey`. `5.4`
+  has it right.
+- **`by_block` supports a *filter on a label*, not an identity lookup.** `6.3` offers `--section` and
+  `--block` as independent filters, so `--block A` with no `--section` has to mean something, and the
+  only honest meaning is "every record whose block label is `A`", which may span sections.
+
+**What section 6 must do about it**, carried into `6.3`'s brief rather than fixed here:
+
+1. **Rename the index to say what it is** — `by_block_label` or similar — so the two never read as the
+   same concept. A name is the whole mitigation; the collision is not a bug, it is `--block A` meaning
+   what it says.
+2. **`6.3`'s brief pins `--block`'s semantics explicitly**: label match, spanning sections unless
+   `--section` narrows it, and `--section X --block Y` is the intersection — which is exactly `BlockKey`.
+   Write it into the brief, not into the review.
+3. **`6.1`'s "latest brief for its block" means identity, so it uses `BlockKey`**, never the label index.
+   This is the site the supervisor was actually worried about and the one where a label match would
+   return another section's brief.
+
+**Carried forward to section 6 and beyond, from the supervisor's four notes:**
+
+17. **`DeriveError` has no reporting path** — `reportLogError` covers `log`'s error set, not `state`'s, so
+    the three faults this section spent two rulings establishing are currently unreachable from the CLI.
+    **Section 6's first block gives them one**, with the same message shape and exit code. This is the
+    project's standing hazard — a surface that behaves differently depending on which subcommand you
+    called — and it is the highest-value of the four.
+18. **The fourth fault-vs-skip site is still a skip** — a `brief` or `section` record with a null
+    `section` is silently absent from `bySection`. Unlike the three that now fault, the write path does
+    **not** require `section` on every kind, so this one is not the same class and was correctly left
+    alone. Recorded so it is not rediscovered as an inconsistency.
+19. **`expectStatesEqual` skips `Indexes`** — the one hash-backed structure, and so the one whose ordering
+    could vary. `5.6`'s determinism test is weaker than it reads. Worth closing when section 6 gives the
+    indexes a rendered output to compare.
+20. **The indexes hold `record.Record` by value across seven structures** — up to sevenfold duplication of
+    each record. ADR-0002 is not threatened (still per-invocation, nothing persisted), but `7.3` is where
+    intersecting filters will feel it. `u32` offsets into `ParsedLog.records` are the fix if it is ever
+    needed. Decide it there rather than discover it.
+
+Carried item 15 (the `toOwnedSlice` comment wording) was **discharged in 5B**. Carried items 10 and 13
+remain **section 6's**, as re-homed when this section opened.
+
 ## NEXT
 
-**[architect]** **Section 4 is CLOSED** — supervisor `Approve` on the second pass, after one remediation
-round. Base was `b59f249`.
+**[architect]** **Section 5 is CLOSED** — supervisor `Approve` on the **first** pass, no remediation
+round, the first section in this change to close in one. Base was `270a680`.
 
-Landed: `d131498` (4A, `4.3`/`4.8`/`4.10`/`4.11`), `96df34c` (4B, `4.1`/`4.2`/`4.7`), `e8ccf41` (the
-Product Owner's addressee-validation amendment, mid-section), `e8b6fdb` (4C, `4.4`–`4.6`/`4.9`), `c95ebfd`
-(rulings and the B3 amendments), `c895f23` (remediation, ticks nothing). Gates `GATES_EXIT:0`, **157**
-named tests / **158** run — counted, not quoted. All eleven boxes ticked.
+Landed: `2a35cb3` (section opened, carve, 5A brief), `378e979` (5A, `5.1`–`5.3`), `9368348` (5A closed, 5B
+brief), `a127b2c` (5B, `5.4`–`5.6`). Gates `GATES_EXIT:0`, **180** tests, **23** of them in
+`src/state.zig` — counted, not quoted. All six boxes ticked. Two review rounds per block; both blockers
+were found by review, neither by a gate.
 
-**Sections 1–4 are fully ticked, with no outstanding human-in-the-loop items.** `3.2` was discharged by
-the Product Owner's terminal check and ticked inside section 4's timeline — see the post immediately above
-this `## NEXT` heading for what that check did and did not establish.
+**Sections 1–5 are fully ticked, with no outstanding human-in-the-loop items.**
 
-**Section 5 is next** — derived state (`5.1`–`5.6`). It needs no new I/O: everything it derives is already
-in the log, and section 4 established the write-side invariants it may rely on. Read `## 4.`'s decisions
-A1–A6 before briefing it; several are load-bearing for what section 5 is allowed to assume.
+**Section 6 is next** — read commands (`6.1`–`6.6`). Everything it renders already exists in
+`src/state.zig`; what section 6 adds is the read-only load path and the command surface. Before briefing
+it, read the section-5 close post immediately above this heading: the block-identity ruling binds `6.1`
+and `6.3` directly, and carried item 17 belongs in its **first** block.
 
-**Three invariants section 4 established at the write boundary that section 5 may rely on — and one it
-must not.** May: every stored `role` and every stored `to` names a declared role; every stored `close`
-names an item that exists; every stored item number is the positional one, assigned under the lock. Must
-not: **none of these hold for a hand-written log**, only for one this tool wrote. `5.2` asserting stored
-item numbers match derived ones is therefore a check on *this tool*, not a repair path — and `durable-
-format`'s "a read ignores a temporary file" scenario still has no task, which `5.x`'s brief should fix
-(carried item 10).
+**Four things are owed to section 6 specifically, three of them re-homed rather than new:**
+
+- **Carried 17 — `DeriveError` has no reporting path.** `reportLogError` covers `log`'s error set, not
+  `state`'s, so section 5's three faults are unreachable from the CLI today. First block of section 6.
+- **Carried 13 — `openLocked`'s read-and-parse must not be duplicated by the read path**, which must
+  **not** create the log on a missing path (`6.6`). This is the shape section 6 is most likely to get
+  wrong by copying.
+- **Carried 10 — `durable-format`'s "a read ignores a temporary file" scenario has no task.** It becomes
+  dischargeable the moment a read opens a path, which is `6.6`. Give it a test there.
+- **Carried 16 — any read that enumerates a whole index inherits unstable hash ordering** and must impose
+  its own, as the grid already does with `block_order`. Reads that look up a key are safe; reads that walk
+  a map are not. Not visible from inside section 6, which is why it is written here.
+
+**What section 5 taught, and it is not the same lesson as section 4's.** Section 4's defects were found by
+driving the built binary; section 5's were found by **reading the code with ownership as the question** —
+both of 5A's were `OutOfMemory`-only, so a green `TEST_EXIT:0` was silent on them, and `9.1` will not cover
+that class either. Neither method subsumes the other. The other durable practice, from the 5A re-audit:
+when a test is supposed to *pin* a refusal, prove it by copying the tree to a scratch directory outside
+the working tree, deleting the branch, and re-running the tests. Both reviewers did this in section 5 and
+it converted "there is a test" into "the test has power". Adopt it wherever a ruling turns on test power.
+
+**Three invariants section 4 established at the write boundary that later sections may rely on — and one
+they must not.** May: every stored `role` and every stored `to` names a declared role; every stored
+`close` names an item that exists; every stored item number is the positional one, assigned under the
+lock. Must not: **none of these hold for a hand-written log**, only for one this tool wrote. That
+distinction is what section 5 turned into a rule worth restating: **where the write boundary guarantees
+something, the derivation faults rather than silently tolerating it** — `ItemNumberMismatch`,
+`CloseTargetMissing`, `VerdictMissingKey`, one error set and one diagnostic shape. It is a check on *this
+tool*, never a repair path (D14). Apply it to any new derivation; the exception is a field the write path
+does not itself require (carried 18).
+
+**Section 4 is CLOSED** — supervisor `Approve` on the second pass, after one remediation round. Base was
+`b59f249`. Landed: `d131498` (4A), `96df34c` (4B), `e8ccf41` (the Product Owner's addressee-validation
+amendment, mid-section), `e8b6fdb` (4C), `c95ebfd` (rulings and the B3 amendments), `c895f23`
+(remediation, ticks nothing). Gates `GATES_EXIT:0`, **157** named tests / **158** run. All eleven boxes
+ticked. `3.2` was discharged by the Product Owner's terminal check and ticked inside section 4's timeline.
 
 **For section 7, before `search` is designed — `7.2` reopens B1 unless it is handled.** `takes_positional`
 is a **boolean**, so `search a b c` will silently drop `b` and `c`: the exact silent-acceptance defect the
