@@ -62,8 +62,10 @@ If a task seems to require breaking one of these, **stop and surface it** — do
   interpreted. Refuse immediately when stdin is a terminal or empty — **never block**.
 - **Writes are locked and atomic** (D11). `seq` is assigned under the lock; a write appends a complete
   line or nothing.
-- **Only the orchestrator may close an item** (`work-items`), and it is a **self-declared guardrail, not
-  enforcement**. Implement the refusal; never implement or describe it as a security boundary.
+- **Only a declared closing role may close an item** (`work-items`) — the `closers` array on the
+  `header`, which for this project is `architect` (the role the agents know as "the orchestrator").
+  Check the header's declared closers; never hardcode a role name. It is a **self-declared guardrail,
+  not enforcement** — implement the refusal, never describe it as a security boundary.
 - **Item identifiers are the neutral `#n` sequence** (D9). Never kind-prefixed — `D`, `N`, `S` and `F`
   belong to external reference namespaces and must not collide.
 - **Lexical search only** (D3). No embeddings, no vector index, no model download.
