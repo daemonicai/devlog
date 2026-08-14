@@ -7,3 +7,6 @@ zig-out/
 # directory, so an abandoned one is otherwise a `git add -A` away from being
 # committed. Pattern matches src/log.zig's `.<basename>.tmp-<hex>`.
 .*.tmp-*
+
+# The boundary tripwire records HEAD and tick counts around each agent call.
+.claude/.dmons-tripwire/

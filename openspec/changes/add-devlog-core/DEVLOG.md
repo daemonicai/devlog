@@ -3569,6 +3569,45 @@ brief), and items 8–13. Nothing else in section 2 is deferred without a home.
 
 → @architect — section 2 is **closed**. Clear to open section 3.
 
+---
+
+**[architect]** **The workflow itself moved under this change: `dmons` 0.4.0 → 0.5.0, applied between
+sections 2 and 3.** Nothing about how a block is built has changed — same two loops, same roster, same
+Makefile, same gates. What changed is that three rules stopped being prose.
+
+Since 0.3.1 every agent's prompt has said: don't tick `tasks.md`, don't commit, never invoke another
+agent. All three were advisory. They are now enforced by a `PreToolUse` guard
+(`.claude/hooks/dmons-guard.sh`) wired into each agent's own frontmatter — blocking git writes, edits to
+`tasks.md`/`Makefile`/`CLAUDE.md`/`.claude/`, and agent spawning, across Bash *and* the `ctx_*` tools —
+plus `disallowedTools: Agent, Task`, which removes the Agent tool outright. The auditors run as role
+`auditor`, further confined to writing `DEVLOG.md`. A detection half
+(`.claude/hooks/dmons-tripwire.sh`) records `HEAD` and tick counts around every agent call I make and
+reports movement back into my context.
+
+**What this means for the rest of this change:** nothing for sections 3 onward, beyond agents now failing
+fast where they previously could only be asked not to stray. Every commit in sections 1 and 2 went
+through me — but by convention, not by enforcement, and that distinction is the whole point of the
+release. Per the migration note, earlier sections are left exactly as they are: the DEVLOG is
+append-only and the record is what it is.
+
+**A correction to my own post above, which the migration's sweep caught.** When I closed carried finding
+2, I told the Product Owner that `reviewer.md` and `supervisor.md` "never contained" the retired
+orchestrator-close rule, and that the supervisor's finding was overstated — one line in one file, not
+three. **That was wrong.** My grep was case-sensitive and the text is capitalised:
+
+- `reviewer.md:105` — *"**Orchestrator-only close is a guardrail, not enforcement**"*
+- `supervisor.md:121` — *"**Orchestrator-only close remains a documented guardrail**"*
+
+The supervisor's original count of three was right and my correction to it was the error. Both are now
+amended to the D13 form — the check is against the latest `header`'s `closers`, never a hardcoded role
+name. This matters beyond bookkeeping: `4.5` is briefed against these files, and both auditors would
+have been holding a worker to a rule the format no longer has.
+
+**Third time today a too-narrow grep produced a false all-clear** — the `worker.md:145` miss the reviewer
+caught, the seven-restatement sweep, and now this. The standing rule in `## NEXT` already says to use a
+term list broader than the phrasing you remember; it now also says **case-insensitive**, and that
+overturning an audit's finding needs better evidence than one grep.
+
 ## NEXT
 
 **[architect]** **Section 2 is CLOSED** — supervisor `Approve` on the second pass, no findings, after one
@@ -3604,8 +3643,14 @@ invariant.** One `durable-format` amendment left **seven** restatements of the r
 `reviewer.md` twice. Three separate audits each missed some, and none of them could have caught them all —
 block review sees a diff, section review sees a commit range, and `.claude/agents/` sits outside both.
 Before posting an amendment, grep the **whole repo** for every restatement of the invariant, with a term
-list broader than the phrasing you remember writing. Both times an agent definition has drifted from a
-decision this session, it was invisible to the audit that should logically have owned it.
+list broader than the phrasing you remember writing, and **case-insensitively** — a capitalised
+restatement hid two instances behind a clean-looking `grep -n`. Every time an agent definition has drifted
+from a decision this session, it was invisible to the audit that should logically have owned it.
+
+**And do not overturn an audit's finding on the strength of one grep.** A count from an agent that read
+the files is evidence; disagreeing with it needs better evidence than a single search that came back
+empty. This session produced three false all-clears from too-narrow greps, one of which briefly
+"corrected" a supervisor finding that had been right all along.
 
 **Carried, none blocking:**
 

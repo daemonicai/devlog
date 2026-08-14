@@ -1,4 +1,4 @@
-# dmons-scaffold: 0.4.0
+# dmons-scaffold: 0.5.0
 # devlog — gate targets.
 #
 # Every gate prints its own exit code as `LABEL_EXIT:<n>` and exits with it, so a
