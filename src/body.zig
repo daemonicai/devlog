@@ -4,11 +4,20 @@
 
 //! Reads a record's body from stdin (design.md D5, `append-only-log`).
 //!
-//! A body is bytes, never parsed, reformatted, or interpreted here or
-//! anywhere else in this tool — **no trailing-newline trim, no CRLF
-//! translation, no BOM strip, no UTF-8 validation.** If the bytes happen
-//! to be invalid UTF-8, that is the caller's business, not this module's;
-//! do not "fix" that by adding validation later.
+//! A body is bytes here: this module never parses, reformats, or
+//! interprets one — no trailing-newline trim, no CRLF translation, no BOM
+//! strip. **It does not validate UTF-8 either, but that is no longer the
+//! absolute claim it once was (D14, added on a supervisor finding during
+//! this section's remediation).** The tool as a whole never writes a
+//! record it cannot read back: `std.json.Stringify` cannot round-trip an
+//! invalid-UTF-8 string, silently re-encoding one as a JSON array of byte
+//! numbers instead of raising an error, and the reader requires a string —
+//! so an invalid body would otherwise corrupt the log permanently, in a
+//! format with no repair path. `record.write` is where that is caught,
+//! once, for every string field a record carries, not just `body` — see
+//! D14. The bytes `readBody` returns are read and passed on verbatim;
+//! validating them here as well would duplicate the one enforcement point
+//! D14 deliberately keeps singular.
 //!
 //! This module decides two things and nothing more: *whether to read at
 //! all* (refusing a terminal, so the process never blocks waiting on
@@ -27,11 +36,18 @@ const Io = std.Io;
 const record = @import("record.zig");
 const log = @import("log.zig");
 
-/// `StreamTooLong` and `Allocator.Error` come from the underlying
-/// `Io.Reader.allocRemaining` call (via `.unlimited` — see `readBody`);
-/// `Io.Cancelable` from `isTty`. `ReadFailed` is `Io.Reader`'s own opaque
-/// I/O-failure error — the concrete cause isn't threaded through by the
-/// standard library's `Io.Reader` interface, only exposed generically.
+/// `Allocator.Error` comes from the underlying `Io.Reader.allocRemaining`
+/// call (via `.unlimited` — see `readBody`); `Io.Cancelable` from
+/// `isTty`. `ReadFailed` is `Io.Reader`'s own opaque I/O-failure error —
+/// the concrete cause isn't threaded through by the standard library's
+/// `Io.Reader` interface, only exposed generically. `allocRemaining` can
+/// also return `error.StreamTooLong`, deliberately **not** included here:
+/// `readBody` converts it to `unreachable` rather than a public error,
+/// because it is structurally impossible under the `.unlimited` limit
+/// passed below, not merely unlikely — see the comment at that
+/// conversion (supervisor finding N-c, section 3 remediation: a public
+/// error a callee proves can never occur is a variant a `switch` at the
+/// call site would have to handle regardless).
 pub const ReadBodyError = error{
     /// Refused before reading a single byte: stdin is a terminal, so
     /// reading it would block waiting on interactive input the caller
@@ -43,7 +59,6 @@ pub const ReadBodyError = error{
     /// record whose body is `"\n"` is noise in a permanent log.
     EmptyBody,
     ReadFailed,
-    StreamTooLong,
 } || Allocator.Error || Io.Cancelable;
 
 /// Reads `stdin` to EOF and returns its bytes verbatim, caller-owned.
@@ -72,12 +87,15 @@ pub fn readBody(allocator: Allocator, io: Io, stdin: Io.File) ReadBodyError![]u8
         // `Io.Limit.subtract` special-cases `.unlimited` to never
         // decrement — so with the `.unlimited` passed above, that branch
         // of the loop can never execute (verified against the pinned
-        // 0.16.0 stdlib source, reviewer finding, block 3). Unlike
-        // `log.zig:449`'s `.header => unreachable`, which is guarded by
-        // this codebase's own runtime check, this one rests on an
-        // external stdlib contract — re-verify it against `Io.Reader`'s
-        // source on any Zig version bump, since nothing in this file
-        // would fail to compile if that contract changed.
+        // 0.16.0 stdlib source, reviewer finding, block 3). Unlike the
+        // `.header => unreachable` arm in `log.zig`'s `withSeq`, which is
+        // guarded by this codebase's own runtime check (`appendRecord`
+        // refuses a `.header` record before `withSeq` is ever called),
+        // this one rests on an external stdlib contract — re-verify it
+        // against `Io.Reader`'s source on any Zig version bump, since
+        // nothing in this file would fail to compile if that contract
+        // changed. Not in `ReadBodyError`'s public set either — see that
+        // type's doc comment (N-c, section 3 remediation).
         error.StreamTooLong => unreachable,
     };
     errdefer allocator.free(bytes);
@@ -98,10 +116,15 @@ fn isBlank(bytes: []const u8) bool {
     return true;
 }
 
-/// Writes the user-facing message for a `readBody` refusal to `w`,
-/// without a trailing newline — the caller appends one if it wants one,
-/// the way `main.zig`'s own `stderr.print(...)` calls each write their
-/// own `"...\n"` today. Kept here, next to the errors it explains,
+/// Writes the user-facing message for a `readBody` refusal to `w` — no
+/// `devlog: ` prefix, and no trailing newline. Owning the prefix and the
+/// newline (and the exit code) belongs to one place, `main.zig`'s
+/// `fail()`, not here: before this fix, this function *and* every
+/// `main.zig` call site each carried their own `devlog: `, so a body
+/// refusal printed `devlog: devlog: refusing…` (supervisor finding N-a,
+/// section 3 remediation). A caller composes this message with `fail()`
+/// the same way it would `record.Diagnostics.message`, which has never
+/// carried a prefix either. Kept here, next to the errors it explains,
 /// rather than duplicated in every section 4 command that calls
 /// `readBody`.
 ///
@@ -111,11 +134,11 @@ fn isBlank(bytes: []const u8) bool {
 pub fn writeRefusalMessage(w: *Io.Writer, err: ReadBodyError) void {
     switch (err) {
         error.StdinIsTerminal => w.print(
-            "devlog: refusing to read a body from a terminal — redirect it from a file instead, e.g. `devlog post ... < body.md`",
+            "refusing to read a body from a terminal — redirect it from a file instead, e.g. `devlog post ... < body.md`",
             .{},
         ) catch {},
-        error.EmptyBody => w.print("devlog: refusing an empty body", .{}) catch {},
-        else => w.print("devlog: failed to read body from stdin: {s}", .{@errorName(err)}) catch {},
+        error.EmptyBody => w.print("refusing an empty body", .{}) catch {},
+        else => w.print("failed to read body from stdin: {s}", .{@errorName(err)}) catch {},
     }
 }
 
@@ -339,12 +362,8 @@ test "3.4: a body round-trips unchanged through the full read-then-write-then-re
         try testing.expectEqual(expected_seq, seq);
     }
 
-    var f = try tmp.dir.openFile(testing.io, "DEVLOG.jsonl", .{ .mode = .read_only });
-    defer f.close(testing.io);
-    const len = try f.length(testing.io);
-    const bytes = try allocator.alloc(u8, len);
+    const bytes = try log.readAllLog(allocator, tmp.dir, testing.io);
     defer allocator.free(bytes);
-    if (len != 0) _ = try f.readPositionalAll(testing.io, bytes, 0);
 
     var parsed = try record.parseLog(allocator, bytes, &diag);
     defer parsed.deinit();
@@ -353,4 +372,110 @@ test "3.4: a body round-trips unchanged through the full read-then-write-then-re
     for (cases, parsed.records[1..]) |expected, rec| {
         try testing.expectEqualStrings(expected, rec.post.common.body);
     }
+}
+
+test "D14: an invalid-UTF-8 body read by readBody is refused when written, and the log is byte-identical afterwards" {
+    // readBody is byte-level only (module doc comment above) — it reads
+    // and returns these bytes verbatim, exactly as it would any other
+    // input. D14's enforcement point is record.write, reached here via
+    // log.appendRecord: this proves the two halves compose correctly,
+    // and that the refusal leaves nothing behind — no partial record, no
+    // stray temporary file (2B's atomic replace means encodeLine's error
+    // is returned before atomicReplace, and therefore any temp file, is
+    // ever reached).
+    const allocator = testing.allocator;
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    var diag: record.Diagnostics = .init(allocator);
+    defer diag.deinit();
+
+    _ = try log.appendHeader(
+        allocator,
+        testing.io,
+        tmp.dir,
+        "DEVLOG.jsonl",
+        "t0",
+        "devlog 0.1.0",
+        .{ .change = "add-devlog-core", .roles = &.{"architect"}, .closers = &.{"architect"} },
+        &diag,
+    );
+
+    const before = try log.readAllLog(allocator, tmp.dir, testing.io);
+    defer allocator.free(before);
+
+    // 0xff and 0xfe are not valid UTF-8 in any position, and neither is
+    // ASCII whitespace, so readBody's isBlank check does not reject this
+    // first — the write-boundary refusal is what this test is pinning.
+    const invalid = "before \xff\xfe after";
+    var stdin_file = try openAsStdin(tmp.dir, testing.io, "invalid-in", invalid);
+    defer stdin_file.close(testing.io);
+
+    const body = try readBody(allocator, testing.io, stdin_file);
+    defer allocator.free(body);
+    try testing.expectEqualStrings(invalid, body);
+
+    const post = record.Record{ .post = .{
+        .common = .{ .seq = 0, .ts = "t1", .role = "architect", .body = body },
+    } };
+    const result = log.appendRecord(allocator, testing.io, tmp.dir, "DEVLOG.jsonl", post, &diag);
+    try testing.expectError(error.InvalidUtf8, result);
+
+    const after = try log.readAllLog(allocator, tmp.dir, testing.io);
+    defer allocator.free(after);
+    try testing.expectEqualStrings(before, after);
+
+    // No temporary file left behind either (`invalid-in` is this test's
+    // own stdin fixture, not something appendRecord created) — record.write
+    // fails before log.zig's atomicReplace, and therefore any temp file,
+    // is ever reached.
+    var it = tmp.dir.iterate();
+    while (try it.next(testing.io)) |entry| {
+        try testing.expect(std.mem.indexOf(u8, entry.name, ".tmp-") == null);
+    }
+}
+
+test "a valid non-ASCII body — accented letters, CJK characters, and emoji — survives the full read-then-write-then-read path" {
+    // Section 3's original round-trip suite (the test above this one) is
+    // entirely ASCII (supervisor finding, D14) — the one property
+    // record.write now inspects needs a positive case through the full
+    // path too, not only the refusal.
+    const allocator = testing.allocator;
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    var diag: record.Diagnostics = .init(allocator);
+    defer diag.deinit();
+
+    _ = try log.appendHeader(
+        allocator,
+        testing.io,
+        tmp.dir,
+        "DEVLOG.jsonl",
+        "t0",
+        "devlog 0.1.0",
+        .{ .change = "add-devlog-core", .roles = &.{"architect"}, .closers = &.{"architect"} },
+        &diag,
+    );
+
+    const contents = "Café review — 日本語のプロジェクト — 🎉🚀 done.";
+    var stdin_file = try openAsStdin(tmp.dir, testing.io, "nonascii-in", contents);
+    defer stdin_file.close(testing.io);
+
+    const body = try readBody(allocator, testing.io, stdin_file);
+    defer allocator.free(body);
+    try testing.expectEqualStrings(contents, body);
+
+    const post = record.Record{ .post = .{
+        .common = .{ .seq = 0, .ts = "t1", .role = "architect", .body = body },
+    } };
+    _ = try log.appendRecord(allocator, testing.io, tmp.dir, "DEVLOG.jsonl", post, &diag);
+
+    const bytes = try log.readAllLog(allocator, tmp.dir, testing.io);
+    defer allocator.free(bytes);
+    var parsed = try record.parseLog(allocator, bytes, &diag);
+    defer parsed.deinit();
+
+    try testing.expectEqual(@as(usize, 2), parsed.records.len);
+    try testing.expectEqualStrings(contents, parsed.records[1].post.common.body);
 }

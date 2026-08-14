@@ -66,10 +66,6 @@ pub const HeaderResult = struct {
     seq: ?u64 = null,
 };
 
-/// `appendRecord` refuses a `.header` — the header has its own re-append
-/// rule (`appendHeader`) and is exempt from ordinary attributed appends.
-pub const AppendRecordError = error{RecordMustNotBeHeader};
-
 /// Bound on how many times `openLocked` retries after finding a stale
 /// lock (see the module doc comment). Generous rather than tight: each
 /// retry costs one open/lock/stat cycle, and the only way to exhaust it
@@ -373,6 +369,27 @@ fn latestHeader(records: []const record.Record) ?record.HeaderRecord {
     return null;
 }
 
+// `appendHeader` and `appendRecord` below both return a bare `!`
+// (inferred error set) rather than a named one, deliberately — unlike
+// `record.zig`'s `ParseError`/`SeqError`/`WriteError`, all three named
+// (reviewer, section 3 remediation). The rule the difference follows: a
+// **named** error set fits a surface that is self-contained — `record.
+// zig`'s parsing and serialisation never call outside the file, so the
+// set they can raise is fixed and worth writing down. `appendHeader` and
+// `appendRecord` are the opposite: each composes `openLocked`, `record.
+// parseLog`/`SeqError`, `replaceWith` -> `encodeLine` ->
+// `record.write`/`WriteError`, and `atomicReplace`'s several IO failure
+// modes — a surface stitched together across modules whose own error
+// sets already change independently (this very block added
+// `record.WriteError`, which an explicit set here would have had to be
+// updated to include, or gone stale — exactly the drift the previously
+// declared, unused `AppendRecordError` had already fallen into, with
+// only one variant to track). Zig's inferred set is computed exactly
+// from the body, at compile time, and updates itself when a callee's
+// errors change — it is not `anyerror`; the earlier declared-but-unused
+// type was the actual staleness hazard here, not the inferred `!`
+// (N-b, section 3 remediation).
+
 /// Declares (or re-declares) the project's role set — the mechanism task
 /// 4.10's `devlog header` calls. Locks, reads, and decides against the
 /// **latest** header in the file, not the first (design.md D13): a header
@@ -462,7 +479,12 @@ const testing = std.testing;
 /// `dir.readFile` needs a caller-sized buffer and returns a sub-slice of
 /// it, which `allocator.free` cannot accept — this always returns exactly
 /// what it allocated.
-fn readAllLog(allocator: Allocator, dir: Io.Dir, io: Io) ![]u8 {
+///
+/// Test-only helper, `pub` so `body.zig`'s tests can reuse it rather than
+/// keeping a second copy (supervisor finding N-f, section 3 remediation).
+/// Always reads `"DEVLOG.jsonl"`, matching every test in this file and in
+/// `body.zig`'s full-path tests.
+pub fn readAllLog(allocator: Allocator, dir: Io.Dir, io: Io) ![]u8 {
     var file = try dir.openFile(io, "DEVLOG.jsonl", .{ .mode = .read_only });
     defer file.close(io);
     const len = try file.length(io);

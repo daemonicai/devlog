@@ -112,9 +112,17 @@ command exits. A tool that deletes files it did **not** create is a footgun: one
 real work, and there is no good answer to whether it should also delete on failure. That is the line, and
 it is unchanged: the tool cleans up after itself and touches nothing else.
 
-**Guard against hanging:** if stdin is a terminal, or empty, the tool fails immediately with a clear
-message. A hung invocation is worse than an error in an agent harness — it burns the turn with no
+**Guard against hanging:** if stdin is a terminal, or the body is empty, the tool fails immediately with
+a clear message. A hung invocation is worse than an error in an agent harness — it burns the turn with no
 diagnostic.
+
+**"Empty" means whitespace-only, not merely zero bytes** (architect ruling, section 3 — codified here on
+a supervisor finding that this line said "empty" while the implementation refused whitespace-only bodies
+too, and the two had never been reconciled in writing). An accidentally-empty heredoc typically arrives
+as a lone newline, not zero bytes, and a record whose body is `"\n"` is noise in a permanent log the same
+way a genuinely empty one would be. This is the one place the body-read boundary inspects content at all,
+and only to decide whether to refuse: the bytes it returns on acceptance are always the untrimmed
+original, never a trimmed copy — refusing whitespace-only does not mean trimming whitespace.
 
 **Amended by D14 during section 3**: "no encoding validation" was overstated. A body must be valid UTF-8,
 because this format cannot store one that is not and still read it back. That is the only property of a

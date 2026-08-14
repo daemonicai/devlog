@@ -4168,6 +4168,270 @@ implemented and correct; its verification is the Product Owner's and is schedule
 **Done-gates:** `make gates` → `GATES_EXIT:0`, quoting each `LABEL_EXIT:<n>`. Post to this thread as you
 go, then `→ @reviewer`. No commits, no ticks.
 
+---
+
+**[worker]** **Remediation block landed — B1, N-a through N-g, all closed.**
+
+**B1 (D14).** `record.write` now validates every string field for UTF-8 before writing a single byte:
+`validateStrings` (new, `record.zig`) walks `Attributed`'s six string-bearing fields (`ts`, `role`,
+`section`, `block`, `to`, each `refs[].ns`/`.id`, `body`) plus every kind-specific string field
+(`header.tool`/`.change`/`.roles`/`.closers`, `section.title`/`.base`, `verdict.commit`), returning
+`error.InvalidUtf8` before `s.beginObject()` is ever called — so a caller building content in memory
+before touching disk (`log.zig`'s `encodeLine`) never has a partial write to reason about. `write`'s
+signature is now `pub fn write(w: *Io.Writer, record: Record) WriteError!void`, `WriteError =
+Io.Writer.Error || error{InvalidUtf8}` — a named error set, matching `record.zig`'s existing style.
+Because `log.appendRecord`'s `replaceWith` calls `encodeLine` (which calls `record.write`) *before*
+`atomicReplace`, the refusal happens before any temp file exists — confirmed by test, not asserted:
+`body.zig`'s new D14 test reads the log before and after a refused write and asserts byte-for-byte
+equality, then walks the directory confirming no `.tmp-` file was left behind.
+
+`body.zig:7-11` rewritten: no longer claims "no UTF-8 validation" as an absolute. States D14, the
+`std.json.Stringify` mechanism (array-of-bytes on invalid input, no error, unparseable on read), and
+that `readBody` stays byte-level — validation lives once, at `record.write`, not duplicated here.
+
+Tests: `record.zig` gets a unit test that `write` returns `error.InvalidUtf8` and writes **nothing** to
+the given writer (`out.written().len == 0`) for an invalid body, a second pinning that a non-body field
+(`to`) is checked too (not body-only), and a third for the positive case — accented/CJK/emoji round-
+tripping through `write`→`parseLine`. `body.zig` gets the full-path pair the brief asked for: an
+invalid-UTF-8 body read via `readBody` (byte-level, succeeds) then refused by `log.appendRecord`
+(`error.InvalidUtf8`), log byte-identical before/after; and a valid non-ASCII body (`"Café review —
+日本語のプロジェクト — 🎉🚀 done."`) through the full `readBody`→`appendRecord`→`parseLog` path.
+
+**N-a.** New `fail(stderr, comptime fmt, args) u8` in `main.zig` owns the `devlog: ` prefix, the
+trailing newline, and the `1` exit code. All eight inline `stderr.print("devlog: …")` + `return 1`
+sites in `run()` now call `fail(...)` instead. `body.writeRefusalMessage` no longer writes its own
+`devlog: ` prefix — its three branches are unchanged otherwise (still no trailing newline; the two
+existing tests asserting substrings like `"redirect"` and `"empty"` needed no changes since the prefix
+wasn't part of what they checked). This is N3 from section 1's `## NEXT`, closed.
+
+**N-b.** Deleted `log.zig`'s unused `AppendRecordError`. Chose delete over "use it": the type contained
+only `RecordMustNotBeHeader`, but `appendHeader`/`appendRecord`'s real error surface spans `openLocked`,
+`record.parseLog`/`SeqError`, `atomicReplace`'s several IO failure modes, and now `record.WriteError` —
+hand-declaring an explicit set that stays accurate as those internals change is exactly the kind of
+by-hand bookkeeping explicit error sets are meant to avoid, not the anyerror escape hatch the inferred
+`!` return actually is (Zig computes it precisely at comptime; it's unnamed, not untyped).
+`error.RecordMustNotBeHeader` still propagates correctly and is still documented on `appendRecord`'s own
+doc comment and asserted by its existing test.
+
+**N-c.** `StreamTooLong` removed from `ReadBodyError`'s public set. The `unreachable` conversion in
+`readBody` is untouched — it doesn't return that error, so removing it from the public set changes
+nothing at runtime, only what a caller's `switch` has to handle.
+
+**N-d.** Amended `design.md`'s D5 — "empty" now reads "the body is empty" with a new paragraph stating
+whitespace-only counts as empty too, why (accidentally-empty heredoc → lone newline, same noise as zero
+bytes), and that the boundary never trims — it only decides refuse-or-don't. **Artefact changed:
+`design.md`** (not the spec — D5 is design rationale; the spec's own scenario for this refusal is
+section 4's to add once a command exists to exercise it end-to-end).
+
+**N-e — judgment call, want the reviewer's eyes on this one specifically.** Did not force
+`Attributed.body`'s default and `readBody`'s refusal to agree. Added a comment on the field arguing
+they're answering different questions: the default (`""`) and `parseLine`'s acceptance of an empty
+`body` string are about whether the *record model* can parse whatever a legal historical write already
+produced — which it must, unconditionally, in an append-only format with no repair path (same reasoning
+D14 uses for encoding). `readBody`'s refusal is a *write-side policy* — no agent may originate an empty
+body — enforced once, at the only place a body is ever sourced from an agent. I did not tighten
+`requireString` to reject `""` for `body`, because that would make the parser reject syntactically valid
+data on the strength of a policy that postdates it, which is the exact failure mode D14 exists to
+prevent for a different field. If this reasoning is wrong, it's a one-line revert (drop the comment,
+add a `body.len != 0` check to the relevant parse path) — flagging it as a judgment call, not asserting
+it's settled.
+
+**N-f.** `log.zig`'s `readAllLog` is now `pub`, doc comment updated to say it's a test-only helper kept
+public for cross-module reuse. `body.zig`'s two full-path tests (the original 3.4 one and both new D14
+ones) all call `log.readAllLog` instead of hand-rolling open/length/alloc/read.
+
+**N-g.** The `unreachable` comment in `body.zig` now cites `withSeq` by name instead of `log.zig:449`.
+
+**Out of scope, respected:** no commands, no dispatch wiring, `3.2` untouched. `git diff --stat`:
+`design.md`, `src/body.zig`, `src/log.zig`, `src/main.zig`, `src/record.zig` — no `Makefile`,
+`build.zig`, `build.zig.zon`, or `tasks.md` touched.
+
+**Gates:** `BUILD_EXIT:0 TEST_EXIT:0 FORMAT_EXIT:0 VALIDATE_EXIT:0 GATES_EXIT:0`. 77 named tests
+(`grep -c '^test "'` across `record.zig`/`body.zig`/`log.zig`/`main.zig`) plus `main.zig`'s one
+anonymous test-discovery block — up from 72 before this block, all new ones exercising the eight
+findings above, none of the existing 72 weakened or removed.
+
+No commits, no ticks, per the brief.
+
+→ @reviewer
+
+---
+
+**[reviewer]** **Section 3 remediation block (B1, N-a through N-g) — Approve with nits.**
+
+Read D14 (`design.md:248-274`, immediately after D13) and the amended `specs/append-only-log/spec.md`
+first, as the brief asked — both were already committed at `8094e32` and untouched by this diff
+(`git diff HEAD` confirms `specs/` has zero changes here). Then read the full working-tree diff:
+`src/record.zig`, `src/body.zig`, `src/log.zig`, `src/main.zig`, `design.md`, `DEVLOG.md`. No
+`Makefile`, `build.zig`, `build.zig.zon`, or `tasks.md` touched; `DEVLOG.md`'s diff is purely additive
+(no `^-` lines besides the diff header) and adds no bare `##` heading, respecting the process note two
+posts up.
+
+**Gates — reran independently, not taken on report:**
+```
+BUILD_EXIT:0
+TEST_EXIT:0
+FORMAT_EXIT:0
+Change 'add-devlog-core' is valid
+VALIDATE_EXIT:0
+GATES_EXIT:0
+```
+`zig build test --summary all`: **78/78 tests passed** (77 named + `main.zig`'s one anonymous
+test-discovery block). Named-test count by file, counted myself (`grep -c '^test "'`):
+`record.zig` 22 (base 19, +3), `body.zig` 12 (base 10, +2), `log.zig` 18 (+0), `main.zig` 25 (+0) — 77
+total, up from 72 at `HEAD`, exactly matching the worker's report and the reviewer-approved base count
+from block 3's own review.
+
+**B1 — verified as an enforcement, not merely a check that exists.**
+
+- **Boundary and coverage.** `validateStrings` (`record.zig:286-316`) switches exhaustively over all
+  eight `Kind` variants (compiler-enforced — no `else`), and covers every string field each kind
+  carries: `header`'s `ts`/`tool`/`change`/`roles[]`/`closers[]`; `section`'s `title`/`base` plus
+  `Attributed`; `item`/`close`/`brief`/`post`/`next` via `Attributed` alone; `verdict`'s `commit` plus
+  `Attributed`. `validateAttributed` (`:263-276`) covers `ts`, `role`, `section`, `block`, `to`, every
+  `refs[].ns`/`.id`, and `body`. I cross-checked this against `write`'s own serialisation switch
+  (`:343-...`) and `writeAttributedHead`/`writeAttributedTail`/`writeRefsAndBody` (`:414-447`) field by
+  field — every string field that ever reaches `s.write(...)` is validated first. Not `body`-only, as
+  asked.
+- **Boundary placement.** `write` (`record.zig:333-334`) calls `validateStrings(record)` as its literal
+  first statement, before `s.beginObject()`. The new test at `record.zig:1013-1029` proves this, not
+  merely asserts an error: `out.written().len == 0` after `expectError(error.InvalidUtf8, write(...))`.
+- **Byte-identical refusal path, verified through the real atomic-replace mechanism, not assumed.**
+  `log.zig:310-316`'s `encodeLine` calls `record.write` into an in-memory `Io.Writer.Allocating` and
+  only returns the built buffer on success; `replaceWith` (`:337-344`) calls `encodeLine` before
+  `atomicReplace`, so a refusal here means `atomicReplace` — and therefore the temp file — is never
+  reached, not merely that its rename is skipped. The new `body.zig` D14 test
+  (`"an invalid-UTF-8 body read by readBody is refused when written..."`) exercises the **real** locked,
+  atomic-replace path — a real `tmp.dir`, real `appendHeader` then real `appendRecord` — and asserts
+  `expectEqualStrings(before, after)` on the log bytes (not just `expectError`), then iterates the
+  directory asserting no entry contains `.tmp-`. This is the strongest form of the claim and it holds.
+- **Mechanism, verified against the pinned 0.16.0 stdlib source myself**, not taken on the DEVLOG's word:
+  `Stringify.zig:506` (`if (!self.options.emit_strings_as_arrays and
+  std.unicode.utf8ValidateSlice(slice)) return self.stringValue(slice);`, falling through to
+  `beginArray()` otherwise) — `record.write` passes no options, so this is the live path pre-fix, exactly
+  as D14 states. `std.unicode.utf8ValidateSlice` (`unicode.zig:231`) is the real 0.16.0 signature
+  `validateAttributed`/`validateUtf8` call.
+- **Non-ASCII coverage through the full path.** `body.zig`'s new positive test carries
+  `"Café review — 日本語のプロジェクト — 🎉🚀 done."` (accented Latin, CJK, emoji together) through
+  `readBody` → `log.appendRecord` (real file) → `log.readAllLog` → `record.parseLog`, asserting the body
+  on `parsed.records[1]` equals the original. `record.zig` adds the same case at the `write`/`parseLine`
+  altitude too (`record.zig:1032-1048`). This is exactly the gap the supervisor named — section 3's
+  original eight round-trip cases were pure ASCII — and it's closed at both altitudes, not one.
+- **`body.zig`'s module comment (`:4-19`) no longer overclaims.** It no longer states "no UTF-8
+  validation" as an absolute; it now says this module stays byte-level and cites D14 and the mechanism
+  for where validation actually happens. Checked it against the code: accurate.
+
+**On the two judgment calls, as asked:**
+
+**N-e — the worker's position is principled, and I agree with it as it stands; I'd tighten the comment,
+not the code.** The read/write split is real, not invented after the fact: `readBody` refusing an empty
+body is CLI-acquisition policy — a guard on how an agent's stdin content is allowed to arrive — while
+`Attributed.body`'s `""` default and `requireString`'s acceptance of `""` are about the record model's
+obligation to parse whatever a legal historical write already produced, unconditionally. Notably, D14
+itself doesn't contradict this split — D14 is enforced at `record.write`, the write *boundary*, not
+inside `readBody`, precisely because UTF-8 validity is a universal structural invariant that must hold
+for every string field of every kind regardless of caller (a `header` record has no `body` and never
+goes near `readBody` at all, yet still needs the check). Emptiness has no such universal claim: a
+`header` record legitimately has no body to be empty, and a body-bearing kind is never produced except
+through `readBody` today. Centralising "body must be non-blank" in `record.write` the way UTF-8 validity
+is centralised would require the codec to know which kinds "have" a meaningful body and which don't —
+exactly the kind of per-kind special-casing the codec currently avoids. So "permissive reader, strict
+writer" is applied consistently once you separate *what must always be true of any write* (D14) from
+*what is only ever true of one caller's inputs* (emptiness) — and the `Attributed.body` comment states
+this distinction explicitly enough that a future reader of `record.zig` alone would not be misled; it
+surfaces the disagreement rather than hiding it. The one thing I'd add, as a nit below: the comment
+argues its own side well but doesn't anticipate "why isn't this handled the same way D14 is" — one
+sentence stating the universal-invariant-vs-CLI-policy distinction above would close that gap for the
+next reader who has just finished reading D14.
+
+**N-b — also principled, and consistent with the module's own precedent, including the very `WriteError`
+just added.** `AppendRecordError` before this diff declared exactly one variant
+(`RecordMustNotBeHeader`) while `appendHeader`/`appendRecord`'s real surface was always far wider —
+composed through `openLocked` (locking, `record.parseLog`, `Allocator.Error`), `replaceWith`
+(`encodeLine` → now `record.WriteError`, `atomicReplace`'s several IO failure modes). It was already
+misleading, unused, and never the real return type. `WriteError`'s addition doesn't create two rules —
+it confirms one: `record.zig`'s three named sets (`ParseError`, `SeqError`, `WriteError`) each belong to
+a function whose error surface is *owned* by that module — self-contained, or a small closed union with
+one external stdlib error — and `log.zig`'s functions leave `!` inferred because their surface is
+*composed* across several other modules whose own surfaces evolve independently (this block is the
+demonstration: `record.WriteError` itself just grew by one variant, and hand-declaring
+`AppendRecordError` accurately would have meant touching it here too, replicating per-command
+bookkeeping at the type level — the exact anti-pattern D14 rejected at the call-site level). I'd have
+made the same call.
+
+**N-c, N-f, N-g — closed as described, checked directly:**
+- N-c: `StreamTooLong` is gone from `ReadBodyError`'s public set (`body.zig:46-60`); the `unreachable`
+  conversion at `body.zig:99` is untouched, so nothing about the runtime behaviour changed, only what a
+  future `switch` has to handle.
+- N-f: `log.zig:465`'s `readAllLog` is `pub` now, doc comment says why; `body.zig`'s three full-path
+  tests (the original 3.4 one and both new D14 ones) all call it instead of hand-rolling
+  open/length/alloc/read. No third copy introduced.
+- N-g: the `unreachable` comment in `body.zig:88-98` cites `withSeq` by name, not `log.zig:449`.
+
+**N-d — wording matches the code.** `design.md`'s new paragraph says "empty" means whitespace-only, not
+merely zero bytes, and that acceptance always returns the untrimmed original. `isBlank`
+(`body.zig:112-117`) is a byte-level `std.ascii.isWhitespace` scan with no early return that modifies
+anything, and `readBody` (`body.zig:87-105`) returns `bytes` unmodified on the accept path — the design
+doc's claim and the code agree.
+
+**Nits (non-blocking):**
+- `record.zig:97` — the `Attributed.body` doc comment cites "(D6)" for "this log is append-only with no
+  repair path." D6 (`design.md:136`) is about one append-only stream / an item being a record kind, not
+  specifically the no-repair-path property — that text is D14's own (`design.md:255-256`). Small, but
+  this section has already had to fix one citation-rot nit (N-g); worth pointing at D14 instead, or
+  dropping the parenthetical.
+- `log.zig:378-395`, `421-427` — `appendHeader`/`appendRecord` gained no comment explaining why they
+  leave their error set inferred while `record.zig`/`body.zig` declare named ones. The reasoning is
+  sound (see N-b above) but currently lives only in this DEVLOG thread; a one-line note on either
+  function would stop this from being re-litigated as a "drift" finding by a future supervisor pass the
+  way N-b was.
+- N-a's structural fix is real and verified (`writeRefusalMessage` no longer prints its own `devlog: `
+  — `body.zig:135, 140` — and all eight of `main.zig`'s former inline `stderr.print("devlog: …")` +
+  `return 1` sites now route through `fail()`, confirmed by reading `main.zig:65-67` and every call
+  site), so the `devlog: devlog: refusing…` defect is gone. But "Diagnostics messages now compose
+  correctly through the same path" is only half-true today: `Diagnostics.message` is a plain
+  `[]const u8`, so `fail(stderr, "{s}", .{diag.message})` composes trivially — but
+  `writeRefusalMessage(w, err)` is writer-based, not string-based; it writes directly to an `Io.Writer`
+  rather than returning one. No call site exists yet (correctly — that's section 4's), so nothing
+  demonstrates how these two different shapes actually combine under `fail()`; the likely answer is
+  buffering `writeRefusalMessage`'s output before handing it to `fail()` as `"{s}"`, but that's not
+  written down anywhere yet. Worth naming explicitly as a done-gate or a line in section 4's first brief
+  that wires a command to `readBody`, so it's decided once rather than reinvented per command.
+
+**Architectural note:** none beyond the two nits above and the N-a note, which is for section 4's brief
+rather than this block — this remediation stays inside section 3's diff and doesn't reach into section
+4's territory (no commands, no dispatch wiring beyond `fail()` itself, `3.2` untouched, confirmed by
+`grep -n "body\." src/main.zig` showing only the pre-existing import and this comment's own prose
+mentions).
+
+→ @architect
+
+---
+
+**[worker]** **Both nits closed.**
+
+- **Nit 1** — `record.zig`'s `Attributed.body` comment now cites **D14** for "append-only with no
+  repair path", not D6. D6 doesn't mention repair paths at all; D14's own text does
+  ("...in a file that is append-only by design and has no repair path"), which is what the comment was
+  actually drawing on.
+- **Nit 2** — added a comment in `log.zig`, directly above `appendHeader`, recording why it and
+  `appendRecord` keep inferred `!` rather than a named error set, using the rule the reviewer named:
+  named sets fit self-contained surfaces (`record.zig`'s `ParseError`/`SeqError`/`WriteError` never call
+  outside the file); inferred sets fit surfaces composed across modules whose own error sets change
+  independently — `appendHeader`/`appendRecord` compose `openLocked`, `record.parseLog`, `SeqError`,
+  `record.write`/`WriteError`, and `atomicReplace`'s IO failures, and this very block adding
+  `record.WriteError` is the concrete case that would have put a hand-declared set out of date again.
+  Plain `//`, not `///` — it's a floating design note spanning two functions, not one declaration's doc
+  comment, and I originally mis-attached it as `///` with a blank line before `appendHeader`'s own doc
+  comment, which would have been a stray/misattached doc comment; caught and fixed before running gates.
+
+Noted, not mine to act on: N-a's third nit (`Diagnostics.message` vs. `writeRefusalMessage`'s
+writer-based shape — how the two combine through `fail()`) goes in section 4's brief.
+
+**Gates:** `BUILD_EXIT:0 TEST_EXIT:0 FORMAT_EXIT:0 VALIDATE_EXIT:0 GATES_EXIT:0`. No commits, no ticks.
+
+→ @architect
+
 ## NEXT
 
 **[architect]** **Section 3 is OPEN** at base `5d2e805`, as a single block `3.1–3.4` — the stdin read

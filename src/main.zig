@@ -50,6 +50,23 @@ const commands = [_]CommandSpec{
     .{ .name = "search", .summary = "Search record bodies, ranked by relevance.", .section = "7" },
 };
 
+/// The one place that owns the `devlog: ` prefix, the trailing newline,
+/// and the exit code for a failure message — every call site passes only
+/// the message itself. Before this existed, `main.zig` hand-composed the
+/// prefix at each of its own call sites, `body.zig`'s
+/// `writeRefusalMessage` composed it again independently, and the two
+/// disagreed the moment a body refusal reached both: a body refusal
+/// printed `devlog: devlog: refusing…` (supervisor finding N-a, section 3
+/// remediation — section 1's `## NEXT` had already flagged the missing
+/// mechanism as N3, before either shape existed). `record.Diagnostics`'s
+/// own messages already carry no prefix, so this is what every one of
+/// them — `Diagnostics.message`, a `writeRefusalMessage` result, or a
+/// plain literal — should be printed through, uniformly.
+fn fail(stderr: *Io.Writer, comptime fmt: []const u8, args: anytype) u8 {
+    stderr.print("devlog: " ++ fmt ++ "\n", args) catch {};
+    return 1;
+}
+
 fn findCommand(name: []const u8) ?CommandSpec {
     for (commands) |c| {
         if (std.mem.eql(u8, c.name, name)) return c;
@@ -197,23 +214,19 @@ fn run(args: []const [:0]const u8, stdout: *Io.Writer, stderr: *Io.Writer) u8 {
     // real write and exiting 0 with nothing done — is the one outcome this
     // tool must never produce.
     if (p.unknown_flag) |flag| {
-        stderr.print("devlog: unknown flag '{s}' — see --help\n", .{flag}) catch {};
-        return 1;
+        return fail(stderr, "unknown flag '{s}' — see --help", .{flag});
     }
 
     if (p.missing_value_for) |flag| {
-        stderr.print("devlog: {s} requires a value\n", .{flag}) catch {};
-        return 1;
+        return fail(stderr, "{s} requires a value", .{flag});
     }
 
     if (p.role_empty) {
-        stderr.print("devlog: --role requires a non-empty value\n", .{}) catch {};
-        return 1;
+        return fail(stderr, "--role requires a non-empty value", .{});
     }
 
     if (p.role_repeated) {
-        stderr.print("devlog: --role given more than once — see --help\n", .{}) catch {};
-        return 1;
+        return fail(stderr, "--role given more than once — see --help", .{});
     }
 
     // Past this point the line is coherent, if possibly incomplete (no
@@ -236,21 +249,18 @@ fn run(args: []const [:0]const u8, stdout: *Io.Writer, stderr: *Io.Writer) u8 {
     }
 
     const command_name = p.command orelse {
-        stderr.print("devlog: no command given — see --help\n", .{}) catch {};
-        return 1;
+        return fail(stderr, "no command given — see --help", .{});
     };
 
     const spec = findCommand(command_name) orelse {
-        stderr.print("devlog: unknown command '{s}' — see --help\n", .{command_name}) catch {};
-        return 1;
+        return fail(stderr, "unknown command '{s}' — see --help", .{command_name});
     };
 
     // `--log` is required, with no default and no guessing
     // (durable-format/spec.md:56): a command that needs the log and wasn't
     // given `--log` is an error, before anything else is attempted.
     if (p.log_path == null) {
-        stderr.print("devlog: '{s}' requires --log <path>\n", .{spec.name}) catch {};
-        return 1;
+        return fail(stderr, "'{s}' requires --log <path>", .{spec.name});
     }
 
     // `--role` is carried for task 4.9's future enforcement; nothing reads
@@ -258,8 +268,7 @@ fn run(args: []const [:0]const u8, stdout: *Io.Writer, stderr: *Io.Writer) u8 {
 
     // No subcommand has a body yet (sections 4, 6, 7). Fail honestly rather
     // than silently succeed, and touch nothing on the way out (D5).
-    stderr.print("devlog: '{s}' is not implemented yet\n", .{spec.name}) catch {};
-    return 1;
+    return fail(stderr, "'{s}' is not implemented yet", .{spec.name});
 }
 
 pub fn main(init: std.process.Init) !void {

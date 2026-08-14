@@ -83,6 +83,28 @@ pub const Attributed = struct {
     block: ?[]const u8 = null,
     to: ?[]const u8 = null,
     refs: []const Ref = &.{},
+    /// Defaulting to `""` is a construction convenience for this type —
+    /// most of this file's own test literals build an `Attributed` without
+    /// naming every field — and is **not** a claim that an empty body is
+    /// a legal `devlog`-authored record (supervisor finding N-e, section 3
+    /// remediation: `body.readBody` refuses an empty or whitespace-only
+    /// body, while this default and `parseLine`'s `requireString` both
+    /// accept `""` without complaint — two disagreeing answers to "is an
+    /// empty body legal?").
+    ///
+    /// Deliberately not reconciled by tightening the parser: the *policy*
+    /// that a body must be non-blank belongs to the one place a body is
+    /// ever sourced from an agent — `readBody`, at the point of writing —
+    /// not to the record model, which must stay able to parse whatever a
+    /// legal historical write already produced. This log is append-only
+    /// with no repair path (D14); a parser that starts rejecting
+    /// syntactically valid data because a *later* write-side policy
+    /// tightened is exactly the kind of drift that breaks every
+    /// subsequent invocation on old data, the same failure mode D14 exists
+    /// to prevent for encoding. So: `readBody` is authoritative for "is an
+    /// empty body accepted from an agent" (no); the record model and
+    /// parser are authoritative for "is `body: ""` syntactically valid"
+    /// (yes) — different questions, correctly answered differently.
     body: []const u8 = "",
 
     fn dupe(self: Attributed, allocator: Allocator) Allocator.Error!Attributed {
@@ -235,12 +257,82 @@ pub const Record = union(Kind) {
 
 // --- Serialisation ---------------------------------------------------------
 
+fn validateUtf8(s: []const u8) error{InvalidUtf8}!void {
+    if (!std.unicode.utf8ValidateSlice(s)) return error.InvalidUtf8;
+}
+
+/// Every string field `Attributed` carries — `body` is the one section 3
+/// named, but `role`, `section`, `block`, `to`, and each `refs[].ns`/`.id`
+/// arrive from `argv` just as unvalidated (D14).
+fn validateAttributed(common: Attributed) error{InvalidUtf8}!void {
+    try validateUtf8(common.ts);
+    try validateUtf8(common.role);
+    if (common.section) |v| try validateUtf8(v);
+    if (common.block) |v| try validateUtf8(v);
+    if (common.to) |v| try validateUtf8(v);
+    for (common.refs) |r| {
+        try validateUtf8(r.ns);
+        try validateUtf8(r.id);
+    }
+    try validateUtf8(common.body);
+}
+
+/// D14: the tool never writes a record it cannot read back. Every string
+/// field a record carries is checked here, once, before `write` puts a
+/// single byte on `w` — `std.json.Stringify` would otherwise silently
+/// re-encode an invalid-UTF-8 string as a JSON array of byte numbers
+/// instead of raising an error, which `requireString` can never parse
+/// back. Enforced at this one boundary rather than per command, since
+/// every string field carries the same hazard and every command would
+/// otherwise have to remember the check itself.
+fn validateStrings(rec: Record) error{InvalidUtf8}!void {
+    switch (rec) {
+        .header => |r| {
+            try validateUtf8(r.ts);
+            try validateUtf8(r.tool);
+            try validateUtf8(r.change);
+            for (r.roles) |v| try validateUtf8(v);
+            for (r.closers) |v| try validateUtf8(v);
+        },
+        .section => |r| {
+            try validateAttributed(r.common);
+            try validateUtf8(r.title);
+            try validateUtf8(r.base);
+        },
+        .brief, .post, .next => {
+            const common = switch (rec) {
+                inline .brief, .post, .next => |r| r.common,
+                else => unreachable,
+            };
+            try validateAttributed(common);
+        },
+        .item => |r| try validateAttributed(r.common),
+        .close => |r| try validateAttributed(r.common),
+        .verdict => |r| {
+            try validateAttributed(r.common);
+            try validateUtf8(r.commit);
+        },
+    }
+}
+
+/// `Io.Writer.Error` from the underlying writer, plus `error.InvalidUtf8`
+/// from `validateStrings` (D14).
+pub const WriteError = Io.Writer.Error || error{InvalidUtf8};
+
 /// Writes one record as a single JSON object (no trailing newline — the
 /// caller decides how records are joined; block 2B's append writes one
 /// per line). Field order matches `design.md`'s example, for a `git diff`
 /// that reads in a stable order; optional common fields absent on the
 /// record are omitted rather than written as `null`.
-pub fn write(w: *Io.Writer, record: Record) Io.Writer.Error!void {
+///
+/// Validates every string field for UTF-8 validity before writing
+/// anything (D14) — a record that fails this check reaches `w` not at
+/// all, not partially, so a caller building content in memory before it
+/// ever touches disk (as `log.zig`'s `encodeLine` does) never ends up
+/// with a half-written buffer to reason about.
+pub fn write(w: *Io.Writer, record: Record) WriteError!void {
+    try validateStrings(record);
+
     var s: std.json.Stringify = .{ .writer = w };
     try s.beginObject();
     try s.objectField("kind");
@@ -916,6 +1008,61 @@ test "close, verdict and next round-trip their kind-specific fields" {
     var parsed_next = try parseLine(allocator, next_line, &diag);
     defer parsed_next.deinit(allocator);
     try testing.expectEqualStrings("Resume at 4.1.", parsed_next.next.common.body);
+}
+
+test "write refuses a body that is not valid UTF-8, and touches the writer not at all (D14)" {
+    // The mechanism D14 guards against: std.json.Stringify would otherwise
+    // silently re-encode this as a JSON array of byte numbers, which
+    // requireString can never parse back. write catches it before a
+    // single byte reaches w, not partway through — verified here by
+    // checking the writer received nothing at all, not just that the
+    // call failed.
+    const allocator = testing.allocator;
+    const rec = Record{ .post = .{
+        .common = .{ .seq = 1, .ts = "t", .role = "worker", .body = "before \xff\xfe after" },
+    } };
+
+    var out: Io.Writer.Allocating = .init(allocator);
+    defer out.deinit();
+    try testing.expectError(error.InvalidUtf8, write(&out.writer, rec));
+    try testing.expectEqual(@as(usize, 0), out.written().len);
+}
+
+test "write refuses invalid UTF-8 in any string field, not only body (D14)" {
+    // role, section, block, to, ts, refs[].ns/.id, title, base, commit,
+    // tool, change, roles[], closers[] all arrive from argv and carry the
+    // same hazard as body — this pins one non-body field so the check
+    // isn't accidentally body-only.
+    const allocator = testing.allocator;
+    const rec = Record{ .post = .{
+        .common = .{ .seq = 1, .ts = "t", .role = "worker", .to = "arch\xffitect", .body = "fine" },
+    } };
+
+    var out: Io.Writer.Allocating = .init(allocator);
+    defer out.deinit();
+    try testing.expectError(error.InvalidUtf8, write(&out.writer, rec));
+    try testing.expectEqual(@as(usize, 0), out.written().len);
+}
+
+test "a body of accented letters, CJK characters, and emoji round-trips through write and parseLine (D14)" {
+    // D14's positive case: valid non-ASCII text is the common real one and
+    // must keep working, not merely be rejected less strictly than
+    // invalid bytes.
+    const allocator = testing.allocator;
+    const body = "Café review — 日本語のプロジェクト — 🎉🚀 done.";
+    const rec = Record{ .post = .{
+        .common = .{ .seq = 1, .ts = "t", .role = "worker", .body = body },
+    } };
+
+    const line = try encodeAlloc(allocator, rec);
+    defer allocator.free(line);
+
+    var diag: Diagnostics = .init(allocator);
+    defer diag.deinit();
+    var parsed = try parseLine(allocator, line, &diag);
+    defer parsed.deinit(allocator);
+
+    try testing.expectEqualStrings(body, parsed.post.common.body);
 }
 
 test "body survives a round trip byte-for-byte through newlines, quotes, and control characters" {
