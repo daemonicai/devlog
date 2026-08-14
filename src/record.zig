@@ -234,6 +234,19 @@ pub const Record = union(Kind) {
         };
     }
 
+    /// The addressee, if any (`null` for `header` — no `Attributed` to
+    /// carry one — and `null` for any attributed kind whose `to` was left
+    /// unset, since it is always optional at the schema level). Mirrors
+    /// `role()` so `log.zig`'s `checkRoleAllowed` can validate an
+    /// addressee against the declared role set the same way it validates
+    /// the writer (block 4B).
+    pub fn to(self: Record) ?[]const u8 {
+        return switch (self) {
+            .header => null,
+            inline .section, .brief, .post, .item, .close, .verdict, .next => |r| r.common.to,
+        };
+    }
+
     pub fn deinit(self: Record, allocator: Allocator) void {
         switch (self) {
             .header => |r| r.free(allocator),

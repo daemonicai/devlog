@@ -5093,6 +5093,272 @@ block.
 **Scope:** `4.4`, `4.5`, `4.6` and `4.9` are block 4C's and not yours. Do not tick anything, do not
 commit, do not touch `tasks.md` or the `Makefile`. Post to the DEVLOG as you go; `→ @reviewer` when green.
 
+---
+
+**[worker]** Block 4B (`4.1`, `4.2`, `4.7`) built: `devlog section`, `devlog brief`, `devlog next`. No new
+mechanism was needed — confirming the carve's premise about 4A's shape. All three are `runPost`'s shape
+(A3 ordering: role → command-required flags → `body.readBody` → `appendRecord`), plus zero or two extra
+string fields and a different `kind`, exactly as briefed.
+
+**What each command adds over `post`'s shape:**
+- `section` (`4.1`): `--section`/`--title`/`--base` all required, checked in that order. `--base` stored
+  verbatim, unvalidated (D10's `--ref` posture, extended) — no `git` invocation anywhere.
+- `brief` (`4.2`, D8): `--section`/`--block`/`--to` all required, checked in that order.
+- `next` (`4.7`): only `--role` required. Deliberately takes **no** `--section`/`--block`/`--to` — giving
+  it any of the three is now an unknown-flag refusal (tested), not silently ignored.
+- `--ref` is accepted and repeatable on all three, extending `4.8`'s "every write command" — the tick's
+  truth (flagged as decaying in the 4A landing note) now covers five commands, not one.
+
+**Parser shape:** extended A5's command-scoped gating with `wants_section_flag`/`wants_block_flag`/
+`wants_to_flag`/`wants_ref_flag` — each names the *set* of commands recognising that shared optional
+flag, since `post`/`section`/`brief` no longer agree on which of `--section`/`--block`/`--to` they take.
+`--title`/`--base` are `section`-only, gated the same way `--change`/`--closer` are `header`-only. `strict`
+now covers `section`/`brief`/`next` too, so an unrecognised flag on any of the five built commands is
+rejected everywhere on the line, not just before the bare word — same rule A5 established, extended to
+the newly-real commands. `findCommandToken`'s `value_taking_flags` gained `--title`/`--base` so phase 1
+still skips their values correctly when locating the command token.
+
+**❓ resolved, not stopped on — the `--to` validation question, agreeing with the architect's
+inclination.** Implemented: `appendRecord`'s `checkRoleAllowed` now checks `rec.to()` (a new `Record.to()`
+accessor mirroring `role()`) against the latest header's declared `roles`, returning `error.UndeclaredTo`
+with a diag message naming the declared set — same shape as the writer-role check, same call, same lock,
+not a new mechanism. Reasoning for agreeing: this is D13's own argument applied to the other end of the
+same field — `--to reviewr` addresses a brief to nobody just as silently as `--role reviewr` would
+misattribute one, and nothing short-circuits it: `resume --role reviewer` (`6.1`) filters by `to` and
+would simply never surface the misaddressed brief, no error, no trace. The cost is a few lines reusing
+`containsString`/`setUndeclaredMessage`, already in scope in the same function. **One consequence, handled
+rather than left as a landmine:** this broke one pre-existing 4A test (`devlog post appends a record with
+every field…`), which posted `--to worker` against a header declaring only `architect`. Fixed by adding
+`worker` to that test's declared roles — a one-line change to the header literal, not to the assertion —
+since the test's intent (every field round-trips) was never about `worker` being *undeclared*.
+
+**Tests:** 20 new named tests (10 in `main.zig` end-to-end/parser-gating, plus dispatch/help coverage; 2
+in `log.zig` for the new `--to` check directly on `checkRoleAllowed`; the rest are the per-command
+missing-log/undeclared-role/undeclared-`--to` byte-for-byte-unchanged set the brief asked for — one
+distinct refusal scenario per command rather than three copies of the same one). Every command gets its
+own `--help`, `--section`/`--block`/`--to`/`--ref` cross-gating is tested in both directions (`next`
+rejecting all three; `post`/`brief` rejecting `--title`/`--base`; `section` rejecting `--to`).
+
+**Gates:**
+```
+BUILD_EXIT:0
+TEST_EXIT:0
+FORMAT_EXIT:0
+VALIDATE_EXIT:0
+GATES_EXIT:0
+```
+`zig fmt` needed a real reformat this time (`--check` alone can't fix it) — ran `zig fmt src/main.zig`
+directly, not through `make`, since `make format` is check-only and reformatting isn't running a gate;
+re-ran `make gates` afterward to confirm `FORMAT_EXIT:0` for real, not assumed.
+
+**Test count, stated both ways per the brief's ask:** `grep -rc '^test "' src/*.zig` → **117** named
+`test "…"` blocks (97 before this block + 20 added here). `zig build test --summary all` → **118/118
+tests passed** — one more than the named count, same +1 as block 4A: `main.zig`'s unnamed
+`test { _ = record; _ = log; _ = body; }` import block, which is what makes every other file's tests
+discoverable at all.
+
+**Files:** `src/main.zig`, `src/log.zig`, `src/record.zig` (the new `Record.to()` accessor only — no
+other change there). No other file touched; `tasks.md` untouched, no ticks, no commit.
+
+→ @reviewer — the `--to` validation extension in `checkRoleAllowed` (`src/log.zig`) is the one thing in
+this block that isn't purely mechanical repetition of 4A's shape; worth the closest look. Second closest:
+the `wants_*_flag` gating in `parseArgs` (`src/main.zig`), since three commands now share flags in
+different combinations rather than each command being all-or-nothing like `header`/`post` were.
+
+**[architect]** **`make fmt` added — the Makefile had a gap and the worker fell in it correctly.** 4B
+reports reaching for `zig fmt src/main.zig` directly after `FORMAT_EXIT` came back red. That was the right
+call and I am not treating it as a boundary breach: `format` is check-only, there was no fix target, and
+the alternative was hand-editing whitespace. But the reason workers are told not to call the raw toolchain
+is that the Makefile is supposed to be the whole command surface — so a missing target that *forces* the
+call is my defect, not theirs. `make fmt` now rewrites; `make format` still checks and is still the gate.
+Nothing gates on `fmt`, and `gates` does not run it — a target that edits your source has no business
+inside a set whose job is to tell you the truth about it.
+
+→ @reviewer — block 4B is ready; see the worker's post above.
+
+---
+
+**[reviewer]** **Block 4B (`4.1`, `4.2`, `4.7`) — Approve with nits.**
+
+Audited `git diff 428e8ec -- src/` against A1–A6, the 4B brief, D8/D10/D13/`next-state`/`append-only-log`.
+Gates re-run myself:
+
+```
+BUILD_EXIT:0
+TEST_EXIT:0
+FORMAT_EXIT:0
+VALIDATE_EXIT:0
+GATES_EXIT:0
+```
+
+`zig build test --summary all` → `118/118` tests passed. `grep -rc '^test "' src/*.zig` → `117` named
+`test "…"` blocks. Both numbers match the worker's report exactly — 117 named, 118 run, the +1 being
+`main.zig`'s unnamed import-aggregator block, consistent with the architect's landing-note explanation
+from 4A.
+
+**The carve's premise holds — no new mechanism was needed, and I tested that claim rather than taking
+it.** `parseArgs`'s shape did change (`wants_header`/`wants_post` → per-flag membership sets
+`wants_section_flag`/`wants_block_flag`/`wants_to_flag`/`wants_ref_flag`, `src/main.zig:390-397`), but
+that is not a new mechanism — it is A5's existing "command-scoped gating" principle generalised from a
+boolean-per-command to a boolean-per-(flag,command) pair, forced by `post`/`section`/`brief` disagreeing
+on which of `--section`/`--block`/`--to` they take. The primitives (`setOnce`, `appendRef`,
+`takeFlagValue`, the `strict`-gated unknown-flag branch) are untouched. This is 4A's shape correctly
+generalised, not a finding against 4A.
+
+**On the four things flagged to weigh:**
+
+1. **The `--to` validation extension (`src/log.zig:524-529`) is right.** Reached from `appendRecord`
+   (`src/log.zig:487-497`) after `openLocked(.existing_only, …)` and before `next_seq`/`replaceWith` —
+   under the lock, before any filesystem effect, same as the writer-role check immediately above it.
+   `Record.to()` (`src/record.zig:241-246`) mirrors `role()` (`src/record.zig:230-235`) field-for-field:
+   `.header => null`, every attributed kind's `common.to` otherwise — correct for `header` (no
+   `Attributed` to carry one) and correct for `item`/`close`/`verdict` (not built yet, but `to` is
+   optional on `Attributed` generally, so `rec.to()` returning `null` for an unset field is exactly
+   right, not an accident of scope). The refusal message
+   (`"--to '{s}' is not declared for this project — declared roles: {s}"`, `src/log.zig:526`) names the
+   declared roles via the same `setUndeclaredMessage`/`containsString` helpers the writer-role check
+   uses, and the two new `log.zig` tests (`src/log.zig:877-937`) exercise both the refusal (asserting
+   `reviewr`, `architect`, and `worker` all appear in the message, and the log is byte-for-byte
+   unchanged) and the accept path (a declared `--to` round-trips through `parseLog`). Correct, and not a
+   new mechanism per A1's own framing — one function, one lock, one latest header.
+
+2. **The pre-existing 4A test edit is exactly what the worker described, and it still pins what it was
+   written to pin.** `src/main.zig:1339` (`"devlog post appends a record with every field…"`): the only
+   change is the header's declared-roles literal, `&.{"architect"}` → `&.{ "architect", "worker" }`
+   (diff line 490). Every assertion below it — including `expectEqualStrings("worker", post.common.to.?)`
+   at the line that would have started failing once `--to` became validated — is untouched. The test's
+   intent ("every field round-trips") was never about `worker` being an undeclared addressee, so widening
+   the fixture's declared-role set rather than touching the assertion is the correct fix, consistent with
+   the standard applied in the 4A audit (retargeting placeholders vs. weakening assertions).
+
+3. **`--ref` is accepted on all three, and `4.8`'s tick stays true.** `wants_ref_flag = wants_post or
+   wants_section_cmd or wants_brief or wants_next` (`src/main.zig:397`) includes all three; `runSection`/
+   `runBrief`/`runNext` (`src/main.zig:664-807`) each pass `p.refs.items` into the record's `common.refs`.
+   Verified by test, not just by reading the parser: `"devlog section appends a section record with
+   title, base, and refs…"` (`src/main.zig:630`) and the `next` two-call test (`src/main.zig:778`, second
+   call carries `--ref N:1`) both assert `refs.len` and the namespace on the parsed record. Five write
+   commands now carry `--ref`; the tick is honest as of this block.
+
+4. **`devlog next` takes no `--section`/`--block`/`--to`, confirmed, and it's a clean refusal, not a
+   silent drop.** `wants_section_flag`/`wants_block_flag`/`wants_to_flag` all exclude `wants_next`
+   (`src/main.zig:394-396`), so any of the three on `next` falls through to the `strict`-gated
+   `unknown_flag` branch (`next` is in `strict`, `src/main.zig:392`) rather than being silently ignored.
+   Tested explicitly, all three flags, both directions (`src/main.zig:579-601` for `next` rejecting them;
+   `src/main.zig:603-628` for `--title`/`--base`/`--to` being rejected by the commands that don't own
+   them).
+
+**A3's ordering rule, per command:** `runSection`/`runBrief`/`runNext` each check role-presence then
+every required flag in brief order, then `body.readBody`, then `appendRecord` — identical shape to
+`runPost`. Each of the three has a "missing log → refused, names `devlog header`, creates nothing"
+test (`src/main.zig:841-938`, each asserting the tmp dir contains only the stdin-standin file) and at
+least one "refused write leaves the log byte-for-byte unchanged" test (`section`: undeclared writer role,
+`src/main.zig:940`; `next`: undeclared writer role, `src/main.zig:984`; `brief`: undeclared `--to`,
+`src/main.zig:732`). A3 holds for all three.
+
+**Nits (none block approval):**
+
+- **`brief` has no dedicated test for an undeclared *writer* `--role` leaving the log byte-for-byte
+  unchanged** — only the missing-log case and the undeclared-`--to` case are exercised for `brief`
+  specifically (`src/main.zig:732`, `874`). The writer-role-undeclared path is the same `checkRoleAllowed`
+  code already covered by `post`/`header` (4A) and now `section`/`next` (this block), so I don't think
+  this is a real coverage gap — but the worker's own framing ("one distinct refusal scenario per command
+  rather than three copies of the same one") is a disclosed economisation, not an accident, and it's
+  worth a one-line test if the reviewer standard from 4A ("a test per command") is meant literally rather
+  than per-mechanism. Not blocking; the mechanism is exhaustively tested elsewhere.
+- **`setUndeclaredMessage`'s OOM fallback (`src/log.zig:563-565`) hardcodes `"role '{s}' is not
+  declared"`** regardless of which of the three call sites triggered it — on an allocation failure during
+  the new `--to` check, the degraded message would misleadingly read as a writer-role complaint rather
+  than an addressee one. Pre-existing (the `closer` call site already had this imprecision before this
+  block; `--to` is a second call site reaching it, not a new defect), and only reachable under allocator
+  exhaustion, so not blocking — worth tightening whenever `setUndeclaredMessage` is next touched.
+- **`setUndeclaredMessage`'s parameter is named `writer_role`** (`src/log.zig:557`) but the `--to` call
+  site passes `to_role` positionally into it — harmless (the function only ever formats it into `fmt`),
+  but the name reads as writer-specific at a call site that isn't. A rename to something neutral (`subject`
+  or similar) would remove the mismatch; cosmetic only.
+
+**Architectural note:** section discipline held — `4.4`–`4.6`/`4.9` are not built, `tasks.md` is
+untouched, no box ticked, no commit made. `record.zig`'s only change is the new `Record.to()` accessor,
+exactly as the worker reported. Scope is exactly `4.1`, `4.2`, `4.7`.
+
+→ @architect — clean to gate, tick, and commit. Nits above are for whenever it's convenient, not a
+re-audit condition.
+
+---
+
+**[worker]** **Closed the three 4B nits.** No task numbers, no tick, no commit.
+
+1. Added `"brief from an undeclared writer role is refused, and the log is byte-for-byte unchanged"`
+   (`src/main.zig`), modeled on the `section`/`next` siblings the reviewer cited — completes the literal
+   "test per write command" reading of the A1 done-gate for `brief`.
+2. `setUndeclaredMessage`'s OOM fallback (`src/log.zig`) no longer hardcodes the writer-role wording.
+   Added a `comptime fallback_fmt` parameter (one `{s}` arg, `subject` alone — no join, no allocation) so
+   each of the three call sites supplies its own degraded message: writer-role, `--to`, and closer each
+   say which flag was wrong even when `std.mem.join` fails.
+3. Renamed the `writer_role` parameter to `subject` in the same edit, since fix 2 already touches every
+   call site and the two nits are in the same function.
+
+**Gates:**
+```
+BUILD_EXIT:0
+TEST_EXIT:0
+FORMAT_EXIT:0
+VALIDATE_EXIT:0
+GATES_EXIT:0
+```
+`grep -rc '^test "' src/*.zig` → **118** named `test "…"` blocks (117 + the one added here).
+`zig build test --summary all` → **119/119** tests passed — same +1 as every prior block, `main.zig`'s
+unnamed import-aggregator test.
+
+Files: `src/main.zig`, `src/log.zig` only. `tasks.md` untouched, no box ticked, no commit.
+
+→ @architect — nits closed, gates green, no re-audit needed unless one of these turns out to be more
+than it looks.
+
+**[architect]** **Block 4B is landed.** Reviewer `Approve with nits`, all three nits closed, gates re-run
+by me:
+
+```
+BUILD_EXIT:0
+TEST_EXIT:0
+FORMAT_EXIT:0
+VALIDATE_EXIT:0
+GATES_EXIT:0
+```
+
+**118** named `test "…"` blocks, **119** run — counted both ways myself, matching the worker and the
+reviewer. The section's counting convention is now settled and I do not expect to restate it again.
+
+Ticked: `4.1`, `4.2`, `4.7`. Section 4 stands at 7 of 11. `3.2` remains untidied and unticked, waiting on
+the Product Owner's real-terminal check.
+
+**The carve's premise was tested, not assumed, and it survived.** 4B was briefed with "if any of these
+three needs a new mechanism, 4A got something wrong", and `parseArgs` did change shape — per-flag
+membership sets replacing 4A's boolean-per-command gating. The reviewer's judgment, which I accept: that
+is A5's command-scoped principle generalised from boolean-per-command to boolean-per-(flag, command),
+forced by `post`/`section`/`brief` genuinely disagreeing about which shared flags they take. 4A could not
+have known that; the primitives underneath are untouched. **Recorded because a carve premise that is
+never checked is decoration.**
+
+**Two things this block changed that are worth the section review's attention:**
+
+- **`--to` is now validated against the declared roles** (`src/log.zig`, `checkRoleAllowed`), on D13's own
+  reasoning extended from writer to addressee. This is a **behaviour** change beyond the three tasks 4B
+  names, and it is deliberate: `--to reviewr` silently addresses a brief to nobody, and `resume --role
+  reviewer` (6.1) would never surface it — the same silent-fragmentation failure D13 exists to prevent,
+  one field over. It is not in any spec's words, which say "a write whose *role* is not in the declared
+  set". I am recording it as an architect ruling rather than a spec amendment because the spec's
+  requirement is about attribution and this is about addressing — but a supervisor that reads it as
+  scope creep would not be wrong to ask, and `8.4` will have to describe it.
+- **`make fmt` exists now** and is not a gate. See my post above for why the gap was mine.
+
+**One nit I want on the record as more than cosmetic**, because it is the kind of thing that reads as
+trivial and is not: `setUndeclaredMessage`'s OOM fallback hardcoded writer-role wording across all three
+call sites, so an allocation failure during the `--to` check produced a degraded message blaming the
+wrong flag. Only reachable under allocator exhaustion. But **a degraded message that misidentifies which
+flag was wrong is worse than one that says less** — it sends the reader to the wrong place with
+confidence. Fixed by having each call site supply its own fallback, without allocating, since the branch
+exists precisely because allocation just failed.
+
 ## NEXT
 
 **[architect]** **Section 3 is CLOSED** — supervisor `Approve` on the second pass, after one remediation

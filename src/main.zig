@@ -67,7 +67,8 @@ const post_usage =
     \\FLAGS
     \\    --section <s>   The tasks.md section this post concerns. Optional.
     \\    --block <b>     The task range this post concerns. Optional.
-    \\    --to <role>     The addressed role. Optional.
+    \\    --to <role>     The addressed role. Optional. When given, must be
+    \\                    one of the roles declared by 'devlog header'.
     \\    --ref <ns:id>   A structured external reference. Repeatable,
     \\                    unvalidated — any namespace is accepted.
     \\
@@ -75,18 +76,80 @@ const post_usage =
     \\heredoc. Redirect it from a file: `devlog ... post < body.md`.
 ;
 
+const section_usage =
+    \\USAGE
+    \\    devlog --log <path> --role <role> section --section <s> --title <t>
+    \\        --base <sha> [--ref <ns:id> ...] < body.md
+    \\
+    \\Opens a tasks.md section and records its base commit — the range a
+    \\supervisor review diffs against later. All three flags required.
+    \\
+    \\FLAGS
+    \\    --section <s>   The tasks.md section this record opens, e.g. "4".
+    \\    --title <t>     One line: what this section delivers.
+    \\    --base <sha>    The commit this section starts from. Stored
+    \\                    verbatim and unvalidated — the tool never runs
+    \\                    git, never checks the sha exists or its length.
+    \\    --ref <ns:id>   A structured external reference. Repeatable,
+    \\                    unvalidated — any namespace is accepted.
+    \\
+    \\The body is read verbatim from stdin — never a flag, never a
+    \\heredoc. Redirect it from a file: `devlog ... section < body.md`.
+;
+
+const brief_usage =
+    \\USAGE
+    \\    devlog --log <path> --role <role> brief --section <s> --block <b>
+    \\        --to <role> [--ref <ns:id> ...] < body.md
+    \\
+    \\Posts the architect's block brief, addressed to a worker (D8). All
+    \\three flags required — a brief addressed to nobody is not a brief,
+    \\and 'devlog resume --role <r>' reaches it precisely through --to.
+    \\
+    \\FLAGS
+    \\    --section <s>   The tasks.md section this brief concerns.
+    \\    --block <b>     The task range this brief concerns, e.g. "4.1-4.3".
+    \\    --to <role>     The addressed role. Required, and must be one of
+    \\                    the roles declared by 'devlog header'.
+    \\    --ref <ns:id>   A structured external reference. Repeatable,
+    \\                    unvalidated — any namespace is accepted.
+    \\
+    \\The body is read verbatim from stdin — never a flag, never a
+    \\heredoc. Redirect it from a file: `devlog ... brief < body.md`.
+;
+
+const next_usage =
+    \\USAGE
+    \\    devlog --log <path> --role <role> next [--ref <ns:id> ...] < body.md
+    \\
+    \\Appends the current NEXT narrative (next-state). The most recently
+    \\appended NEXT becomes the current one; earlier ones remain as
+    \\history and are never rewritten.
+    \\
+    \\FLAGS
+    \\    --ref <ns:id>   A structured external reference. Repeatable,
+    \\                    unvalidated — any namespace is accepted.
+    \\
+    \\Takes no --section, --block, or --to: NEXT is change-scoped
+    \\narrative, not addressed to anyone or bound to one section.
+    \\
+    \\The body is read verbatim from stdin — never a flag, never a
+    \\heredoc. Redirect it from a file: `devlog ... next < body.md`.
+;
+
 /// Names only, from sections 4, 6 and 7 of the change's `tasks.md`. This
 /// block dispatches to them and gives each a `--help`; their behaviour is
-/// those sections' to build. `header` and `post` are real as of block 4A.
+/// those sections' to build. `header`, `post`, `section`, `brief`, and
+/// `next` are real as of blocks 4A/4B.
 const commands = [_]CommandSpec{
     .{ .name = "header", .summary = "Declare the project's role set, creating the log or appending a new header.", .section = "4", .usage = header_usage },
-    .{ .name = "section", .summary = "Open a section and record its base commit.", .section = "4" },
-    .{ .name = "brief", .summary = "Post the architect's block brief to a worker.", .section = "4" },
+    .{ .name = "section", .summary = "Open a section and record its base commit.", .section = "4", .usage = section_usage },
+    .{ .name = "brief", .summary = "Post the architect's block brief to a worker.", .section = "4", .usage = brief_usage },
     .{ .name = "post", .summary = "Post general working-channel traffic.", .section = "4", .usage = post_usage },
     .{ .name = "item", .summary = "Raise a work item and print its identifier.", .section = "4" },
     .{ .name = "close", .summary = "Close a work item with a reason (declared closers only).", .section = "4" },
     .{ .name = "verdict", .summary = "Record a typed review verdict for a block.", .section = "4" },
-    .{ .name = "next", .summary = "Append the current NEXT narrative.", .section = "4" },
+    .{ .name = "next", .summary = "Append the current NEXT narrative.", .section = "4", .usage = next_usage },
     .{ .name = "resume", .summary = "Show the current NEXT, open items for a role, and its latest brief.", .section = "6" },
     .{ .name = "show", .summary = "Show one item or one record by its identifier.", .section = "6" },
     .{ .name = "list", .summary = "List records, filtered by section, block, role, kind, state, or addressee.", .section = "6" },
@@ -141,7 +204,8 @@ fn startsWithDoubleDash(s: []const u8) bool {
 /// validate a flag itself. A command a later block adds is that block's
 /// problem, not this pre-scan's.
 const value_taking_flags = [_][]const u8{
-    "--log", "--role", "--change", "--closer", "--section", "--block", "--to", "--ref",
+    "--log",   "--role", "--change", "--closer", "--section",
+    "--block", "--to",   "--ref",    "--title",  "--base",
 };
 
 fn isValueTakingFlag(name: []const u8) bool {
@@ -215,11 +279,16 @@ const Parsed = struct {
     /// `header`-only, repeatable.
     closers: std.ArrayList([]const u8) = .empty,
 
-    /// `post`-only, each optional and exactly-once.
+    /// Shared by a subset of `post`/`section`/`brief`, each optional at
+    /// the parser level and exactly-once — which commands recognise which
+    /// of these three is decided per command in `parseArgs` (block 4B).
     section: ?[]const u8 = null,
     block: ?[]const u8 = null,
     to: ?[]const u8 = null,
-    /// `post`-only, repeatable (4.8).
+    /// `section`-only, exactly-once, required (4.1).
+    title: ?[]const u8 = null,
+    base: ?[]const u8 = null,
+    /// Repeatable (4.8); recognised by `post`, `section`, `brief`, `next`.
     refs: std.ArrayList(record.Ref) = .empty,
 
     fn deinit(self: *Parsed, allocator: Allocator) void {
@@ -296,25 +365,41 @@ fn appendRef(p: *Parsed, allocator: Allocator, list: *std.ArrayList(record.Ref),
 }
 
 /// Phase 2 (A5): the real scan, now that `findCommandToken` has already
-/// determined which command's flag spec applies — `wants_header`/
-/// `wants_post` decide `--role`'s arity and whether `--change`/`--closer`
-/// (`header`) or `--section`/`--block`/`--to`/`--ref` (`post`) are
-/// recognised at all. `--help`, `--version`, `--log`, and `--role` are
-/// always recognised regardless of position relative to the command
-/// token (the "any position" behaviour this dispatcher has always had).
-/// An unrecognised flag is a fault when it appears before the command
-/// token is found (unconditionally — there is no command yet to defer
-/// to) *or* when the command is `header`/`post` (built in this block, so
-/// their grammars are enforced everywhere on the line, not just before
-/// the bare word); an unrecognised flag after any other command's bare
-/// token is left alone, for that command's own section to validate once
-/// it exists (unchanged pre-4A behaviour).
+/// determined which command's flag spec applies — `wants_header`
+/// decides `--role`'s arity; every `wants_*` below decides which of the
+/// shared optional flags (`--section`/`--block`/`--to`/`--ref`) and
+/// which command-only flags (`--change`/`--closer` for `header`,
+/// `--title`/`--base` for `section`) that command recognises at all.
+/// `--help`, `--version`, `--log`, and `--role` are always recognised
+/// regardless of position relative to the command token (the "any
+/// position" behaviour this dispatcher has always had). An unrecognised
+/// flag is a fault when it appears before the command token is found
+/// (unconditionally — there is no command yet to defer to) *or* when the
+/// command is one this dispatcher already builds (`header`, `post`,
+/// `section`, `brief`, `next` as of blocks 4A/4B — their grammars are
+/// enforced everywhere on the line, not just before the bare word); an
+/// unrecognised flag after any other command's bare token is left alone,
+/// for that command's own section to validate once it exists (unchanged
+/// pre-4A behaviour).
 fn parseArgs(allocator: Allocator, args: []const [:0]const u8) Allocator.Error!Parsed {
     var p: Parsed = .{};
     const command_hint = findCommandToken(args);
     const wants_header = command_hint != null and std.mem.eql(u8, command_hint.?, "header");
     const wants_post = command_hint != null and std.mem.eql(u8, command_hint.?, "post");
-    const strict = wants_header or wants_post;
+    const wants_section_cmd = command_hint != null and std.mem.eql(u8, command_hint.?, "section");
+    const wants_brief = command_hint != null and std.mem.eql(u8, command_hint.?, "brief");
+    const wants_next = command_hint != null and std.mem.eql(u8, command_hint.?, "next");
+    const strict = wants_header or wants_post or wants_section_cmd or wants_brief or wants_next;
+
+    // Which commands recognise each shared optional flag — `section`'s
+    // own `--section` (the tasks.md section it opens) and `post`'s/
+    // `brief`'s `--section` (the section a record concerns) share a name
+    // but not a command set, hence three separate memberships rather
+    // than one.
+    const wants_section_flag = wants_post or wants_section_cmd or wants_brief;
+    const wants_block_flag = wants_post or wants_brief;
+    const wants_to_flag = wants_post or wants_brief;
+    const wants_ref_flag = wants_post or wants_section_cmd or wants_brief or wants_next;
 
     var i: usize = 0;
     while (i < args.len) : (i += 1) {
@@ -336,13 +421,17 @@ fn parseArgs(allocator: Allocator, args: []const [:0]const u8) Allocator.Error!P
             if (takeFlagValue(&p, args, &i, "--change")) |v| setOnce(&p, &p.change, "--change", v);
         } else if (wants_header and std.mem.eql(u8, arg, "--closer")) {
             if (takeFlagValue(&p, args, &i, "--closer")) |v| try appendValue(&p, allocator, &p.closers, "--closer", v);
-        } else if (wants_post and std.mem.eql(u8, arg, "--section")) {
+        } else if (wants_section_cmd and std.mem.eql(u8, arg, "--title")) {
+            if (takeFlagValue(&p, args, &i, "--title")) |v| setOnce(&p, &p.title, "--title", v);
+        } else if (wants_section_cmd and std.mem.eql(u8, arg, "--base")) {
+            if (takeFlagValue(&p, args, &i, "--base")) |v| setOnce(&p, &p.base, "--base", v);
+        } else if (wants_section_flag and std.mem.eql(u8, arg, "--section")) {
             if (takeFlagValue(&p, args, &i, "--section")) |v| setOnce(&p, &p.section, "--section", v);
-        } else if (wants_post and std.mem.eql(u8, arg, "--block")) {
+        } else if (wants_block_flag and std.mem.eql(u8, arg, "--block")) {
             if (takeFlagValue(&p, args, &i, "--block")) |v| setOnce(&p, &p.block, "--block", v);
-        } else if (wants_post and std.mem.eql(u8, arg, "--to")) {
+        } else if (wants_to_flag and std.mem.eql(u8, arg, "--to")) {
             if (takeFlagValue(&p, args, &i, "--to")) |v| setOnce(&p, &p.to, "--to", v);
-        } else if (wants_post and std.mem.eql(u8, arg, "--ref")) {
+        } else if (wants_ref_flag and std.mem.eql(u8, arg, "--ref")) {
             if (takeFlagValue(&p, args, &i, "--ref")) |v| try appendRef(&p, allocator, &p.refs, v);
         } else if (p.command == null and !startsWithDash(arg)) {
             p.command = arg;
@@ -563,6 +652,151 @@ fn runPost(
     return 0;
 }
 
+/// `devlog section` (4.1): opens a `tasks.md` section and fixes the
+/// range a supervisor review diffs against. All three of `--section`/
+/// `--title`/`--base` are required; `--base` is stored verbatim and
+/// unvalidated, same posture as `--ref` (D10) — the tool never runs
+/// `git`, never checks the sha exists or its length. Same A3 ordering as
+/// `runPost`: every required flag is checked, then the body is read,
+/// and only then does anything reach the filesystem.
+fn runSection(
+    allocator: Allocator,
+    io: Io,
+    dir: Io.Dir,
+    stdin: Io.File,
+    ts: []const u8,
+    log_path: []const u8,
+    p: *const Parsed,
+    stdout: *Io.Writer,
+    stderr: *Io.Writer,
+) u8 {
+    _ = stdout;
+    const role = p.role orelse return fail(stderr, "'section' requires --role <role>", .{});
+    const section = p.section orelse return fail(stderr, "'section' requires --section <s>", .{});
+    const title = p.title orelse return fail(stderr, "'section' requires --title <t>", .{});
+    const base = p.base orelse return fail(stderr, "'section' requires --base <sha>", .{});
+
+    const body_bytes = body.readBody(allocator, io, stdin) catch |err| {
+        return fail(stderr, "{s}", .{body.refusalMessage(err)});
+    };
+    defer allocator.free(body_bytes);
+
+    const rec = record.Record{ .section = .{
+        .common = .{
+            .seq = 0,
+            .ts = ts,
+            .role = role,
+            .section = section,
+            .refs = p.refs.items,
+            .body = body_bytes,
+        },
+        .title = title,
+        .base = base,
+    } };
+
+    var diag: record.Diagnostics = .init(allocator);
+    defer diag.deinit();
+
+    _ = log.appendRecord(allocator, io, dir, log_path, rec, &diag) catch |err| {
+        return reportLogError(stderr, err, &diag);
+    };
+
+    return 0;
+}
+
+/// `devlog brief` (4.2, D8): the architect's block brief, addressed to a
+/// worker. All three of `--section`/`--block`/`--to` are required — a
+/// brief nobody is addressed to is not a brief, and `resume --role`
+/// (6.1) reaches it precisely through `--to`. `--to`'s value is itself
+/// checked against the declared role set, inside `appendRecord`, the
+/// same way `--role` is (block 4B decision, on D13's own reasoning — see
+/// `log.zig`'s `checkRoleAllowed`).
+fn runBrief(
+    allocator: Allocator,
+    io: Io,
+    dir: Io.Dir,
+    stdin: Io.File,
+    ts: []const u8,
+    log_path: []const u8,
+    p: *const Parsed,
+    stdout: *Io.Writer,
+    stderr: *Io.Writer,
+) u8 {
+    _ = stdout;
+    const role = p.role orelse return fail(stderr, "'brief' requires --role <role>", .{});
+    const section = p.section orelse return fail(stderr, "'brief' requires --section <s>", .{});
+    const block = p.block orelse return fail(stderr, "'brief' requires --block <b>", .{});
+    const to = p.to orelse return fail(stderr, "'brief' requires --to <role>", .{});
+
+    const body_bytes = body.readBody(allocator, io, stdin) catch |err| {
+        return fail(stderr, "{s}", .{body.refusalMessage(err)});
+    };
+    defer allocator.free(body_bytes);
+
+    const rec = record.Record{ .brief = .{ .common = .{
+        .seq = 0,
+        .ts = ts,
+        .role = role,
+        .section = section,
+        .block = block,
+        .to = to,
+        .refs = p.refs.items,
+        .body = body_bytes,
+    } } };
+
+    var diag: record.Diagnostics = .init(allocator);
+    defer diag.deinit();
+
+    _ = log.appendRecord(allocator, io, dir, log_path, rec, &diag) catch |err| {
+        return reportLogError(stderr, err, &diag);
+    };
+
+    return 0;
+}
+
+/// `devlog next` (4.7, next-state): appends the current NEXT narrative.
+/// Takes a body and `--ref`, and nothing else — no `--section`,
+/// `--block`, or `--to`: NEXT is change-scoped narrative, not addressed
+/// to anyone or bound to one section. Which appended NEXT counts as
+/// "current" is a read-side derivation (5.3), not this command's
+/// concern — appending, and never rewriting, is all it owes.
+fn runNext(
+    allocator: Allocator,
+    io: Io,
+    dir: Io.Dir,
+    stdin: Io.File,
+    ts: []const u8,
+    log_path: []const u8,
+    p: *const Parsed,
+    stdout: *Io.Writer,
+    stderr: *Io.Writer,
+) u8 {
+    _ = stdout;
+    const role = p.role orelse return fail(stderr, "'next' requires --role <role>", .{});
+
+    const body_bytes = body.readBody(allocator, io, stdin) catch |err| {
+        return fail(stderr, "{s}", .{body.refusalMessage(err)});
+    };
+    defer allocator.free(body_bytes);
+
+    const rec = record.Record{ .next = .{ .common = .{
+        .seq = 0,
+        .ts = ts,
+        .role = role,
+        .refs = p.refs.items,
+        .body = body_bytes,
+    } } };
+
+    var diag: record.Diagnostics = .init(allocator);
+    defer diag.deinit();
+
+    _ = log.appendRecord(allocator, io, dir, log_path, rec, &diag) catch |err| {
+        return reportLogError(stderr, err, &diag);
+    };
+
+    return 0;
+}
+
 /// Dispatches one invocation and returns the process exit code.
 fn run(
     allocator: Allocator,
@@ -627,10 +861,18 @@ fn run(
     if (std.mem.eql(u8, spec.name, "post")) {
         return runPost(allocator, io, dir, stdin, ts, log_path, &p, stdout, stderr);
     }
+    if (std.mem.eql(u8, spec.name, "section")) {
+        return runSection(allocator, io, dir, stdin, ts, log_path, &p, stdout, stderr);
+    }
+    if (std.mem.eql(u8, spec.name, "brief")) {
+        return runBrief(allocator, io, dir, stdin, ts, log_path, &p, stdout, stderr);
+    }
+    if (std.mem.eql(u8, spec.name, "next")) {
+        return runNext(allocator, io, dir, stdin, ts, log_path, &p, stdout, stderr);
+    }
 
-    // No other subcommand is wired yet (sections 4B, 4C, 6, 7). Fail
-    // honestly rather than silently succeed, and touch nothing on the way
-    // out (D5).
+    // No other subcommand is wired yet (sections 4C, 6, 7). Fail honestly
+    // rather than silently succeed, and touch nothing on the way out (D5).
     return fail(stderr, "'{s}' is not implemented yet", .{spec.name});
 }
 
@@ -1097,7 +1339,7 @@ test "devlog post appends a record with every field, refs included, and prints n
         "DEVLOG.jsonl",
         "t0",
         "devlog 0.1.0",
-        .{ .change = "add-devlog-core", .roles = &.{"architect"}, .closers = &.{"architect"} },
+        .{ .change = "add-devlog-core", .roles = &.{ "architect", "worker" }, .closers = &.{"architect"} },
         &diag,
     );
 
@@ -1353,6 +1595,579 @@ test "a refused header write leaves an already-existing log byte-for-byte unchan
         &err_out.writer,
     );
     try std.testing.expectEqual(@as(u8, 1), code);
+
+    const after = try log.readAllLog(std.testing.allocator, tmp.dir, std.testing.io);
+    defer std.testing.allocator.free(after);
+    try std.testing.expectEqualStrings(before, after);
+}
+
+// --- New in block 4B: section, brief, next (4.1, 4.2, 4.7) ----------------
+// The write spine (block 4A) built command-scoped flag arity, --ref, the
+// injected clock, and role validation inside appendRecord under the lock.
+// These three commands are that spine plus zero or two extra string
+// fields and a different kind — no new mechanism, per the block-4B brief.
+
+test "section (4.1) is a known command with its own --help" {
+    try expectRun(std.testing.allocator, &.{ "section", "--help" }, 0, "devlog section", null);
+    try expectRun(std.testing.allocator, &.{ "section", "--help" }, 0, "--title <t>", null);
+    try expectRun(std.testing.allocator, &.{ "section", "--help" }, 0, "--base <sha>", null);
+}
+
+test "brief (4.2) is a known command with its own --help" {
+    try expectRun(std.testing.allocator, &.{ "brief", "--help" }, 0, "devlog brief", null);
+    try expectRun(std.testing.allocator, &.{ "brief", "--help" }, 0, "--to <role>", null);
+}
+
+test "next (4.7) is a known command with its own --help" {
+    try expectRun(std.testing.allocator, &.{ "next", "--help" }, 0, "devlog next", null);
+    try expectRun(std.testing.allocator, &.{ "next", "--help" }, 0, "--ref <ns:id>", null);
+}
+
+test "section requires --section, --title, and --base, in that order, before any filesystem access" {
+    try expectRun(
+        std.testing.allocator,
+        &.{ "--log", "DEVLOG.jsonl", "--role", "architect", "section" },
+        1,
+        null,
+        "requires --section",
+    );
+    try expectRun(
+        std.testing.allocator,
+        &.{ "--log", "DEVLOG.jsonl", "--role", "architect", "section", "--section", "4" },
+        1,
+        null,
+        "requires --title",
+    );
+    try expectRun(
+        std.testing.allocator,
+        &.{ "--log", "DEVLOG.jsonl", "--role", "architect", "section", "--section", "4", "--title", "Write commands" },
+        1,
+        null,
+        "requires --base",
+    );
+}
+
+test "brief requires --section, --block, and --to, in that order, before any filesystem access" {
+    try expectRun(
+        std.testing.allocator,
+        &.{ "--log", "DEVLOG.jsonl", "--role", "architect", "brief" },
+        1,
+        null,
+        "requires --section",
+    );
+    try expectRun(
+        std.testing.allocator,
+        &.{ "--log", "DEVLOG.jsonl", "--role", "architect", "brief", "--section", "4" },
+        1,
+        null,
+        "requires --block",
+    );
+    try expectRun(
+        std.testing.allocator,
+        &.{ "--log", "DEVLOG.jsonl", "--role", "architect", "brief", "--section", "4", "--block", "4.1-4.3" },
+        1,
+        null,
+        "requires --to",
+    );
+}
+
+test "next requires only --role, unlike post/section/brief" {
+    try expectRun(
+        std.testing.allocator,
+        &.{ "--log", "DEVLOG.jsonl", "next" },
+        1,
+        null,
+        "requires --role",
+    );
+}
+
+test "next takes no --section, --block, or --to: all three are unknown flags (4.7)" {
+    try expectRun(
+        std.testing.allocator,
+        &.{ "--log", "DEVLOG.jsonl", "--role", "architect", "next", "--section", "4" },
+        1,
+        null,
+        "unknown flag '--section'",
+    );
+    try expectRun(
+        std.testing.allocator,
+        &.{ "--log", "DEVLOG.jsonl", "--role", "architect", "next", "--block", "4.7" },
+        1,
+        null,
+        "unknown flag '--block'",
+    );
+    try expectRun(
+        std.testing.allocator,
+        &.{ "--log", "DEVLOG.jsonl", "--role", "architect", "next", "--to", "worker" },
+        1,
+        null,
+        "unknown flag '--to'",
+    );
+}
+
+test "--title and --base are section-only: post and brief reject them as unknown flags" {
+    try expectRun(
+        std.testing.allocator,
+        &.{ "--log", "DEVLOG.jsonl", "--role", "architect", "post", "--title", "x" },
+        1,
+        null,
+        "unknown flag '--title'",
+    );
+    try expectRun(
+        std.testing.allocator,
+        &.{ "--log", "DEVLOG.jsonl", "--role", "architect", "brief", "--base", "x" },
+        1,
+        null,
+        "unknown flag '--base'",
+    );
+}
+
+test "--to is not recognised by section (post/brief only)" {
+    try expectRun(
+        std.testing.allocator,
+        &.{ "--log", "DEVLOG.jsonl", "--role", "architect", "section", "--to", "worker" },
+        1,
+        null,
+        "unknown flag '--to'",
+    );
+}
+
+test "devlog section appends a section record with title, base, and refs, printing nothing on success" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    var diag: record.Diagnostics = .init(std.testing.allocator);
+    defer diag.deinit();
+    _ = try log.appendHeader(
+        std.testing.allocator,
+        std.testing.io,
+        tmp.dir,
+        "DEVLOG.jsonl",
+        "t0",
+        "devlog 0.1.0",
+        .{ .change = "add-devlog-core", .roles = &.{"architect"}, .closers = &.{"architect"} },
+        &diag,
+    );
+
+    var stdin_file = try openStdinStandin(tmp.dir, std.testing.io, "What section 4 delivers.");
+    defer stdin_file.close(std.testing.io);
+    var out: Io.Writer.Allocating = .init(std.testing.allocator);
+    defer out.deinit();
+    var err_out: Io.Writer.Allocating = .init(std.testing.allocator);
+    defer err_out.deinit();
+
+    const code = run(
+        std.testing.allocator,
+        std.testing.io,
+        tmp.dir,
+        stdin_file,
+        test_ts,
+        &.{ "--log", "DEVLOG.jsonl", "--role", "architect", "section", "--section", "4", "--title", "Write commands", "--base", "b59f249", "--ref", "D:9" },
+        &out.writer,
+        &err_out.writer,
+    );
+    try std.testing.expectEqual(@as(u8, 0), code);
+    try std.testing.expectEqualStrings("", out.written());
+    try std.testing.expectEqualStrings("", err_out.written());
+
+    const bytes = try log.readAllLog(std.testing.allocator, tmp.dir, std.testing.io);
+    defer std.testing.allocator.free(bytes);
+    var parsed = try record.parseLog(std.testing.allocator, bytes, &diag);
+    defer parsed.deinit();
+
+    try std.testing.expectEqual(@as(usize, 2), parsed.records.len);
+    const section_rec = parsed.records[1].section;
+    try std.testing.expectEqualStrings("4", section_rec.common.section.?);
+    try std.testing.expectEqualStrings("Write commands", section_rec.title);
+    try std.testing.expectEqualStrings("b59f249", section_rec.base);
+    try std.testing.expectEqualStrings("What section 4 delivers.", section_rec.common.body);
+    try std.testing.expectEqual(@as(usize, 1), section_rec.common.refs.len);
+    try std.testing.expectEqualStrings("D", section_rec.common.refs[0].ns);
+}
+
+test "devlog brief appends a brief record addressed to a declared role" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    var diag: record.Diagnostics = .init(std.testing.allocator);
+    defer diag.deinit();
+    _ = try log.appendHeader(
+        std.testing.allocator,
+        std.testing.io,
+        tmp.dir,
+        "DEVLOG.jsonl",
+        "t0",
+        "devlog 0.1.0",
+        .{ .change = "add-devlog-core", .roles = &.{ "architect", "worker" }, .closers = &.{"architect"} },
+        &diag,
+    );
+
+    var stdin_file = try openStdinStandin(tmp.dir, std.testing.io, "Build the write spine.");
+    defer stdin_file.close(std.testing.io);
+    var out: Io.Writer.Allocating = .init(std.testing.allocator);
+    defer out.deinit();
+    var err_out: Io.Writer.Allocating = .init(std.testing.allocator);
+    defer err_out.deinit();
+
+    const code = run(
+        std.testing.allocator,
+        std.testing.io,
+        tmp.dir,
+        stdin_file,
+        test_ts,
+        &.{ "--log", "DEVLOG.jsonl", "--role", "architect", "brief", "--section", "4", "--block", "4.3", "--to", "worker", "--ref", "S:4" },
+        &out.writer,
+        &err_out.writer,
+    );
+    try std.testing.expectEqual(@as(u8, 0), code);
+    try std.testing.expectEqualStrings("", out.written());
+
+    const bytes = try log.readAllLog(std.testing.allocator, tmp.dir, std.testing.io);
+    defer std.testing.allocator.free(bytes);
+    var parsed = try record.parseLog(std.testing.allocator, bytes, &diag);
+    defer parsed.deinit();
+
+    try std.testing.expectEqual(@as(usize, 2), parsed.records.len);
+    const brief_rec = parsed.records[1].brief;
+    try std.testing.expectEqualStrings("worker", brief_rec.common.to.?);
+    try std.testing.expectEqualStrings("4.3", brief_rec.common.block.?);
+    try std.testing.expectEqualStrings("Build the write spine.", brief_rec.common.body);
+}
+
+test "devlog brief refuses --to naming an undeclared role, reports the declared roles, and touches nothing (block 4B decision)" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    var diag: record.Diagnostics = .init(std.testing.allocator);
+    defer diag.deinit();
+    _ = try log.appendHeader(
+        std.testing.allocator,
+        std.testing.io,
+        tmp.dir,
+        "DEVLOG.jsonl",
+        "t0",
+        "devlog 0.1.0",
+        .{ .change = "x", .roles = &.{ "architect", "worker" }, .closers = &.{"architect"} },
+        &diag,
+    );
+    const before = try log.readAllLog(std.testing.allocator, tmp.dir, std.testing.io);
+    defer std.testing.allocator.free(before);
+
+    var stdin_file = try openStdinStandin(tmp.dir, std.testing.io, "Build it.");
+    defer stdin_file.close(std.testing.io);
+    var out: Io.Writer.Allocating = .init(std.testing.allocator);
+    defer out.deinit();
+    var err_out: Io.Writer.Allocating = .init(std.testing.allocator);
+    defer err_out.deinit();
+
+    const code = run(
+        std.testing.allocator,
+        std.testing.io,
+        tmp.dir,
+        stdin_file,
+        test_ts,
+        &.{ "--log", "DEVLOG.jsonl", "--role", "architect", "brief", "--section", "4", "--block", "4.3", "--to", "reviewr" },
+        &out.writer,
+        &err_out.writer,
+    );
+    try std.testing.expectEqual(@as(u8, 1), code);
+    try std.testing.expect(std.mem.indexOf(u8, err_out.written(), "reviewr") != null);
+    try std.testing.expect(std.mem.indexOf(u8, err_out.written(), "architect") != null);
+    try std.testing.expect(std.mem.indexOf(u8, err_out.written(), "worker") != null);
+
+    const after = try log.readAllLog(std.testing.allocator, tmp.dir, std.testing.io);
+    defer std.testing.allocator.free(after);
+    try std.testing.expectEqualStrings(before, after);
+}
+
+test "brief from an undeclared writer role is refused, and the log is byte-for-byte unchanged" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    var diag: record.Diagnostics = .init(std.testing.allocator);
+    defer diag.deinit();
+    _ = try log.appendHeader(
+        std.testing.allocator,
+        std.testing.io,
+        tmp.dir,
+        "DEVLOG.jsonl",
+        "t0",
+        "devlog 0.1.0",
+        .{ .change = "x", .roles = &.{ "architect", "worker" }, .closers = &.{"architect"} },
+        &diag,
+    );
+    const before = try log.readAllLog(std.testing.allocator, tmp.dir, std.testing.io);
+    defer std.testing.allocator.free(before);
+
+    var stdin_file = try openStdinStandin(tmp.dir, std.testing.io, "Build it.");
+    defer stdin_file.close(std.testing.io);
+    var out: Io.Writer.Allocating = .init(std.testing.allocator);
+    defer out.deinit();
+    var err_out: Io.Writer.Allocating = .init(std.testing.allocator);
+    defer err_out.deinit();
+
+    const code = run(
+        std.testing.allocator,
+        std.testing.io,
+        tmp.dir,
+        stdin_file,
+        test_ts,
+        &.{ "--log", "DEVLOG.jsonl", "--role", "reviewr", "brief", "--section", "4", "--block", "4.3", "--to", "worker" },
+        &out.writer,
+        &err_out.writer,
+    );
+    try std.testing.expectEqual(@as(u8, 1), code);
+    try std.testing.expect(std.mem.indexOf(u8, err_out.written(), "reviewr") != null);
+
+    const after = try log.readAllLog(std.testing.allocator, tmp.dir, std.testing.io);
+    defer std.testing.allocator.free(after);
+    try std.testing.expectEqualStrings(before, after);
+}
+
+test "devlog next appends without rewriting: two calls produce two next records, in order" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    var diag: record.Diagnostics = .init(std.testing.allocator);
+    defer diag.deinit();
+    _ = try log.appendHeader(
+        std.testing.allocator,
+        std.testing.io,
+        tmp.dir,
+        "DEVLOG.jsonl",
+        "t0",
+        "devlog 0.1.0",
+        .{ .change = "x", .roles = &.{"architect"}, .closers = &.{"architect"} },
+        &diag,
+    );
+
+    var out: Io.Writer.Allocating = .init(std.testing.allocator);
+    defer out.deinit();
+    var err_out: Io.Writer.Allocating = .init(std.testing.allocator);
+    defer err_out.deinit();
+
+    var stdin1 = try openStdinStandin(tmp.dir, std.testing.io, "Resume at 4.1.");
+    defer stdin1.close(std.testing.io);
+    const code1 = run(
+        std.testing.allocator,
+        std.testing.io,
+        tmp.dir,
+        stdin1,
+        test_ts,
+        &.{ "--log", "DEVLOG.jsonl", "--role", "architect", "next" },
+        &out.writer,
+        &err_out.writer,
+    );
+    try std.testing.expectEqual(@as(u8, 0), code1);
+
+    var stdin2 = try openStdinStandin(tmp.dir, std.testing.io, "Resume at 4.4, block 4C.");
+    defer stdin2.close(std.testing.io);
+    const code2 = run(
+        std.testing.allocator,
+        std.testing.io,
+        tmp.dir,
+        stdin2,
+        test_ts,
+        &.{ "--log", "DEVLOG.jsonl", "--role", "architect", "next", "--ref", "N:1" },
+        &out.writer,
+        &err_out.writer,
+    );
+    try std.testing.expectEqual(@as(u8, 0), code2);
+
+    const bytes = try log.readAllLog(std.testing.allocator, tmp.dir, std.testing.io);
+    defer std.testing.allocator.free(bytes);
+    var parsed = try record.parseLog(std.testing.allocator, bytes, &diag);
+    defer parsed.deinit();
+
+    try std.testing.expectEqual(@as(usize, 3), parsed.records.len);
+    try std.testing.expectEqual(record.Kind.next, std.meta.activeTag(parsed.records[1]));
+    try std.testing.expectEqual(record.Kind.next, std.meta.activeTag(parsed.records[2]));
+    try std.testing.expectEqualStrings("Resume at 4.1.", parsed.records[1].next.common.body);
+    try std.testing.expectEqualStrings("Resume at 4.4, block 4C.", parsed.records[2].next.common.body);
+    try std.testing.expectEqual(@as(usize, 1), parsed.records[2].next.common.refs.len);
+}
+
+test "section against a log that does not exist yet is refused, names devlog header, and creates nothing" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var stdin_file = try openStdinStandin(tmp.dir, std.testing.io, "hi");
+    defer stdin_file.close(std.testing.io);
+
+    var out: Io.Writer.Allocating = .init(std.testing.allocator);
+    defer out.deinit();
+    var err_out: Io.Writer.Allocating = .init(std.testing.allocator);
+    defer err_out.deinit();
+
+    const code = run(
+        std.testing.allocator,
+        std.testing.io,
+        tmp.dir,
+        stdin_file,
+        test_ts,
+        &.{ "--log", "DEVLOG.jsonl", "--role", "architect", "section", "--section", "4", "--title", "x", "--base", "abc" },
+        &out.writer,
+        &err_out.writer,
+    );
+    try std.testing.expectEqual(@as(u8, 1), code);
+    try std.testing.expect(std.mem.indexOf(u8, err_out.written(), "devlog header") != null);
+
+    var count: usize = 0;
+    var it = tmp.dir.iterate();
+    while (try it.next(std.testing.io)) |entry| {
+        try std.testing.expectEqualStrings("stdin-standin", entry.name);
+        count += 1;
+    }
+    try std.testing.expectEqual(@as(usize, 1), count);
+}
+
+test "brief against a log that does not exist yet is refused, names devlog header, and creates nothing" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var stdin_file = try openStdinStandin(tmp.dir, std.testing.io, "hi");
+    defer stdin_file.close(std.testing.io);
+
+    var out: Io.Writer.Allocating = .init(std.testing.allocator);
+    defer out.deinit();
+    var err_out: Io.Writer.Allocating = .init(std.testing.allocator);
+    defer err_out.deinit();
+
+    const code = run(
+        std.testing.allocator,
+        std.testing.io,
+        tmp.dir,
+        stdin_file,
+        test_ts,
+        &.{ "--log", "DEVLOG.jsonl", "--role", "architect", "brief", "--section", "4", "--block", "4.1-4.3", "--to", "worker" },
+        &out.writer,
+        &err_out.writer,
+    );
+    try std.testing.expectEqual(@as(u8, 1), code);
+    try std.testing.expect(std.mem.indexOf(u8, err_out.written(), "devlog header") != null);
+
+    var count: usize = 0;
+    var it = tmp.dir.iterate();
+    while (try it.next(std.testing.io)) |entry| {
+        try std.testing.expectEqualStrings("stdin-standin", entry.name);
+        count += 1;
+    }
+    try std.testing.expectEqual(@as(usize, 1), count);
+}
+
+test "next against a log that does not exist yet is refused, names devlog header, and creates nothing" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var stdin_file = try openStdinStandin(tmp.dir, std.testing.io, "hi");
+    defer stdin_file.close(std.testing.io);
+
+    var out: Io.Writer.Allocating = .init(std.testing.allocator);
+    defer out.deinit();
+    var err_out: Io.Writer.Allocating = .init(std.testing.allocator);
+    defer err_out.deinit();
+
+    const code = run(
+        std.testing.allocator,
+        std.testing.io,
+        tmp.dir,
+        stdin_file,
+        test_ts,
+        &.{ "--log", "DEVLOG.jsonl", "--role", "architect", "next" },
+        &out.writer,
+        &err_out.writer,
+    );
+    try std.testing.expectEqual(@as(u8, 1), code);
+    try std.testing.expect(std.mem.indexOf(u8, err_out.written(), "devlog header") != null);
+
+    var count: usize = 0;
+    var it = tmp.dir.iterate();
+    while (try it.next(std.testing.io)) |entry| {
+        try std.testing.expectEqualStrings("stdin-standin", entry.name);
+        count += 1;
+    }
+    try std.testing.expectEqual(@as(usize, 1), count);
+}
+
+test "section from an undeclared role is refused, and the log is byte-for-byte unchanged" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    var diag: record.Diagnostics = .init(std.testing.allocator);
+    defer diag.deinit();
+    _ = try log.appendHeader(
+        std.testing.allocator,
+        std.testing.io,
+        tmp.dir,
+        "DEVLOG.jsonl",
+        "t0",
+        "devlog 0.1.0",
+        .{ .change = "x", .roles = &.{"architect"}, .closers = &.{"architect"} },
+        &diag,
+    );
+    const before = try log.readAllLog(std.testing.allocator, tmp.dir, std.testing.io);
+    defer std.testing.allocator.free(before);
+
+    var stdin_file = try openStdinStandin(tmp.dir, std.testing.io, "hi");
+    defer stdin_file.close(std.testing.io);
+    var out: Io.Writer.Allocating = .init(std.testing.allocator);
+    defer out.deinit();
+    var err_out: Io.Writer.Allocating = .init(std.testing.allocator);
+    defer err_out.deinit();
+
+    const code = run(
+        std.testing.allocator,
+        std.testing.io,
+        tmp.dir,
+        stdin_file,
+        test_ts,
+        &.{ "--log", "DEVLOG.jsonl", "--role", "reviewr", "section", "--section", "4", "--title", "x", "--base", "abc" },
+        &out.writer,
+        &err_out.writer,
+    );
+    try std.testing.expectEqual(@as(u8, 1), code);
+    try std.testing.expect(std.mem.indexOf(u8, err_out.written(), "reviewr") != null);
+
+    const after = try log.readAllLog(std.testing.allocator, tmp.dir, std.testing.io);
+    defer std.testing.allocator.free(after);
+    try std.testing.expectEqualStrings(before, after);
+}
+
+test "next from an undeclared role is refused, and the log is byte-for-byte unchanged" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    var diag: record.Diagnostics = .init(std.testing.allocator);
+    defer diag.deinit();
+    _ = try log.appendHeader(
+        std.testing.allocator,
+        std.testing.io,
+        tmp.dir,
+        "DEVLOG.jsonl",
+        "t0",
+        "devlog 0.1.0",
+        .{ .change = "x", .roles = &.{"architect"}, .closers = &.{"architect"} },
+        &diag,
+    );
+    const before = try log.readAllLog(std.testing.allocator, tmp.dir, std.testing.io);
+    defer std.testing.allocator.free(before);
+
+    var stdin_file = try openStdinStandin(tmp.dir, std.testing.io, "hi");
+    defer stdin_file.close(std.testing.io);
+    var out: Io.Writer.Allocating = .init(std.testing.allocator);
+    defer out.deinit();
+    var err_out: Io.Writer.Allocating = .init(std.testing.allocator);
+    defer err_out.deinit();
+
+    const code = run(
+        std.testing.allocator,
+        std.testing.io,
+        tmp.dir,
+        stdin_file,
+        test_ts,
+        &.{ "--log", "DEVLOG.jsonl", "--role", "reviewr", "next" },
+        &out.writer,
+        &err_out.writer,
+    );
+    try std.testing.expectEqual(@as(u8, 1), code);
+    try std.testing.expect(std.mem.indexOf(u8, err_out.written(), "reviewr") != null);
 
     const after = try log.readAllLog(std.testing.allocator, tmp.dir, std.testing.io);
     defer std.testing.allocator.free(after);

@@ -17,7 +17,7 @@ SHELL := /bin/bash
 
 CHANGES := $(notdir $(patsubst %/,%,$(filter-out %/archive/,$(wildcard openspec/changes/*/))))
 
-.PHONY: build test format validate changes gates clean
+.PHONY: build test format fmt validate changes gates clean
 
 # --- zig -----------------------------------------------------------------------
 
@@ -29,6 +29,15 @@ test:
 
 format:
 	@zig fmt --check .; code=$$?; echo "FORMAT_EXIT:$$code"; exit $$code
+
+# The fixer, not a gate — `format` above checks and reports, this one rewrites.
+# It exists so that a worker whose diff fails FORMAT_EXIT has a target to reach
+# for: without it the only way to fix formatting is `zig fmt` directly, which is
+# exactly the raw-toolchain call the boundary tells workers not to make. Added
+# during block 4B, when a worker hit that gap and (correctly) reported it.
+# Prints its own exit code like every other target, but nothing gates on it.
+fmt:
+	@zig fmt .; code=$$?; echo "FMT_EXIT:$$code"; exit $$code
 
 # --- spec ----------------------------------------------------------------------
 

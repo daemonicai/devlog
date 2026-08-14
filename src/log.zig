@@ -508,6 +508,14 @@ pub fn appendRecord(
 /// 4C) inherits this rather than re-implementing it. Called only from
 /// `appendRecord`, after `rec == .header` has already been excluded
 /// there, so `rec.role()` is never `null`.
+///
+/// **Extended in block 4B, on D13's own reasoning:** when `rec` carries
+/// a `to`, that addressee must also be a declared role. `--to reviewr`
+/// would otherwise silently address a brief to nobody, and
+/// `devlog resume --role reviewer` (6.1) would never surface it — the
+/// same typo hazard D13 already rejects for the writer, applied to the
+/// addressee. Checked against the same latest header, in the same
+/// lock-held call; not a new mechanism.
 fn checkRoleAllowed(records: []const record.Record, rec: record.Record, diag: ?*record.Diagnostics) !void {
     const latest = latestHeader(records) orelse {
         if (diag) |d| d.set("no header declared for this log yet — run 'devlog header' first", .{});
@@ -517,12 +525,19 @@ fn checkRoleAllowed(records: []const record.Record, rec: record.Record, diag: ?*
     const writer_role = rec.role().?;
 
     if (!containsString(latest.roles, writer_role)) {
-        setUndeclaredMessage(diag, "role '{s}' is not declared for this project — declared roles: {s}", writer_role, latest.roles);
+        setUndeclaredMessage(diag, "role '{s}' is not declared for this project — declared roles: {s}", "role '{s}' is not declared", writer_role, latest.roles);
         return error.UndeclaredRole;
     }
 
+    if (rec.to()) |to_role| {
+        if (!containsString(latest.roles, to_role)) {
+            setUndeclaredMessage(diag, "--to '{s}' is not declared for this project — declared roles: {s}", "--to '{s}' is not declared", to_role, latest.roles);
+            return error.UndeclaredTo;
+        }
+    }
+
     if (rec == .close and !containsString(latest.closers, writer_role)) {
-        setUndeclaredMessage(diag, "role '{s}' is not a declared closer — declared closers: {s}", writer_role, latest.closers);
+        setUndeclaredMessage(diag, "role '{s}' is not a declared closer — declared closers: {s}", "role '{s}' is not a declared closer", writer_role, latest.closers);
         return error.RoleNotCloser;
     }
 }
@@ -536,22 +551,28 @@ fn containsString(haystack: []const []const u8, needle: []const u8) bool {
 
 /// Joins `declared` with `, ` for the diag message so a refusal names the
 /// actual roles rather than merely counting them — the point of `4.11`.
-/// `comptime fmt` takes exactly two `{s}` args: the writer's role, then
-/// the joined list. Falls back to a shorter message on allocation failure
-/// rather than losing the refusal itself.
+/// `comptime fmt` takes exactly two `{s}` args: `subject`, then the joined
+/// list. `comptime fallback_fmt` takes exactly one `{s}` arg (`subject`
+/// alone) and is used instead on allocation failure — it must not allocate,
+/// since the whole point of the fallback path is that allocation just
+/// failed. Each of the three call sites passes its own `fallback_fmt` so a
+/// degraded message still names which of "role", "--to", or "closer" was
+/// wrong rather than defaulting to the writer-role wording regardless of
+/// which check triggered it.
 fn setUndeclaredMessage(
     diag: ?*record.Diagnostics,
     comptime fmt: []const u8,
-    writer_role: []const u8,
+    comptime fallback_fmt: []const u8,
+    subject: []const u8,
     declared: []const []const u8,
 ) void {
     const d = diag orelse return;
     const joined = std.mem.join(d.allocator, ", ", declared) catch {
-        d.set("role '{s}' is not declared", .{writer_role});
+        d.set(fallback_fmt, .{subject});
         return;
     };
     defer d.allocator.free(joined);
-    d.set(fmt, .{ writer_role, joined });
+    d.set(fmt, .{ subject, joined });
 }
 
 fn withSeq(rec: record.Record, new_seq: u64) record.Record {
@@ -858,6 +879,70 @@ test "appendRecord refuses a role the latest header did not declare, naming the 
     const after = try readAllLog(allocator, tmp.dir, testing.io);
     defer allocator.free(after);
     try testing.expectEqualStrings(before, after);
+}
+
+test "appendRecord refuses an addressee (--to) the latest header did not declare, naming the declared roles (block 4B decision)" {
+    const allocator = testing.allocator;
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    var diag: record.Diagnostics = .init(allocator);
+    defer diag.deinit();
+    _ = try appendHeader(
+        allocator,
+        testing.io,
+        tmp.dir,
+        "DEVLOG.jsonl",
+        "t1",
+        "devlog 0.1.0",
+        .{ .change = "x", .roles = &.{ "architect", "worker" }, .closers = &.{"architect"} },
+        &diag,
+    );
+    const before = try readAllLog(allocator, tmp.dir, testing.io);
+    defer allocator.free(before);
+
+    const brief = record.Record{ .brief = .{
+        .common = .{ .seq = 0, .ts = "t2", .role = "architect", .to = "reviewr", .body = "typo'd addressee" },
+    } };
+    const result = appendRecord(allocator, testing.io, tmp.dir, "DEVLOG.jsonl", brief, &diag);
+    try testing.expectError(error.UndeclaredTo, result);
+    try testing.expect(std.mem.indexOf(u8, diag.message, "reviewr") != null);
+    try testing.expect(std.mem.indexOf(u8, diag.message, "architect") != null);
+    try testing.expect(std.mem.indexOf(u8, diag.message, "worker") != null);
+
+    const after = try readAllLog(allocator, tmp.dir, testing.io);
+    defer allocator.free(after);
+    try testing.expectEqualStrings(before, after);
+}
+
+test "appendRecord accepts a --to naming a declared role, unlike the undeclared-role refusal" {
+    const allocator = testing.allocator;
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    var diag: record.Diagnostics = .init(allocator);
+    defer diag.deinit();
+    _ = try appendHeader(
+        allocator,
+        testing.io,
+        tmp.dir,
+        "DEVLOG.jsonl",
+        "t1",
+        "devlog 0.1.0",
+        .{ .change = "x", .roles = &.{ "architect", "worker" }, .closers = &.{"architect"} },
+        &diag,
+    );
+
+    const brief = record.Record{ .brief = .{
+        .common = .{ .seq = 0, .ts = "t2", .role = "architect", .to = "worker", .body = "fine" },
+    } };
+    _ = try appendRecord(allocator, testing.io, tmp.dir, "DEVLOG.jsonl", brief, &diag);
+
+    const bytes = try readAllLog(allocator, tmp.dir, testing.io);
+    defer allocator.free(bytes);
+    var parsed = try record.parseLog(allocator, bytes, &diag);
+    defer parsed.deinit();
+    try testing.expectEqualStrings("worker", parsed.records[1].brief.common.to.?);
 }
 
 test "appendRecord refuses a close from a role not among the declared closers (A1, forward-looking for 4C)" {
