@@ -5472,6 +5472,416 @@ need `zig fmt` directly.
 claim. Do not tick anything, do not commit, do not touch `tasks.md`, the `Makefile`, or `CLAUDE.md`. Post
 to the DEVLOG as you go; `→ @reviewer` when green.
 
+---
+
+**[worker]** Block 4C (`4.4`, `4.5`, `4.6`, `4.9`) built: `devlog item`, `devlog close`, `devlog verdict`,
+and the enum validation that closes `4.9`. This is the block with real new logic, as briefed — two pieces
+worth explaining, then the mechanical rest.
+
+**The one new mechanism — item numbering under the lock (D9, `4.4`).** `log.zig` gets `appendItem`, a
+sibling to `appendRecord`, not a special case inside it: opens `.existing_only` (A2), runs the same
+`checkRoleAllowed` (writer role and `--to`, unchanged mechanism), then derives the item number as
+`countItems(opened.log.records) + 1` — one linear scan over the already-parsed, already-locked log,
+the same "pure function of a parsed set" shape as `record.nextSeq`. Stamps both `seq` and `item` on the
+record before `replaceWith`, returns both. `main.zig`'s `runItem` never sees a number — it builds the
+record with `.item = 0` (a placeholder, exactly how `.seq = 0` is written everywhere else in this
+codebase) and prints whatever `appendItem` hands back as `#<n>`. **`appendRecord` now refuses an `.item`
+record outright** (`error.RecordMustBeAppendedViaAppendItem`) — a structural guard, not a convention, so
+a future call site can't accidentally bypass D9's derivation the way nothing currently stops a caller
+from mis-stamping `seq` by hand. This forced one adjustment to a **pre-existing** test from block 2B/3
+(`log.zig`'s eight-kind round-trip test) that constructed an `item` record and appended it via
+`appendRecord` directly — retargeted to `appendItem`, one line, disclosed rather than routed around; and
+one pre-existing 4A test (`"appendRecord accepts a close from a declared closer (A1)"`) that closed an
+item number that was never raised — now raises it first via `appendItem`, since `checkItemExists` (below)
+would otherwise correctly refuse it. Both are the same standard 4B's nit pass set: widen the fixture,
+never weaken the assertion.
+
+**The two close rulings, both landed exactly as briefed, both tested in both directions.** `appendRecord`
+now runs `checkItemExists` for `.close` records — after `checkRoleAllowed` (so a non-closer is still
+told *that* first), before `next_seq`/`replaceWith` (A3's under-the-lock ordering). A `--item` naming a
+number no `item` record ever raised is refused with `"item #{d} does not exist — {d} item(s) have been
+raised so far"` — verified by hand against the built binary, not only by test. **I left the
+already-closed case alone, on purpose** — no check exists for it, `append-only-log`'s correction-as-new-
+record model is why, and a dedicated test (`"appendRecord accepts a second close on an already-closed
+item"`) appends `deferred` then `resolved` on the same item and asserts both records land. Recording it
+here per the brief's ask.
+
+**`4.9`'s enum half.** `record.enumFromString` is now `pub` (was file-private) — `main.zig` reuses it
+rather than a second lookup loop. The permitted-set message names the actual values via a comptime
+`joinEnumNames(comptime E: type)` helper built from `record.ItemType`/`CloseState`/`VerdictOutcome`'s own
+field names, not a restated literal — the same staleness argument the architect made about D10 earlier
+in this section, applied here before it could become a finding rather than after. Validated in each
+`run*` function immediately after the flag is present-checked, before `body.readBody` (A3, `4.9`:
+"Validate at parse time, before the body is read").
+
+**Mechanical rest, all per A5's established shape:** `item` takes `--type` (required), `--section`/
+`--block`/`--to` (optional, shared membership extended), `--blocking` (a bare bool flag — no arity
+ambiguity to check, unlike every value-carrying flag). `close` takes `--item`/`--state` (required) and
+**nothing else** — no `--section`/`--block`/`--to`, tested in both directions. `verdict` takes
+`--section`/`--block`/`--outcome`/`--commit` (all required) and no `--to` (tested). `--ref` is on all
+three (`4.8`'s tick stays honest — this closes out the "last three commands" the architect's landing note
+flagged). `--item`'s value is parsed as a positive `i64`; a non-numeric, zero, or negative value is
+refused before the body is read.
+
+**Files:** `src/record.zig` (`enumFromString` → `pub`), `src/log.zig` (`appendItem`, `checkItemExists`,
+`countItems`, the `appendRecord` `.item` guard, plus the two pre-existing-test adjustments above),
+`src/main.zig` (`item_usage`/`close_usage`/`verdict_usage`, `joinEnumNames` and the three name constants,
+`Parsed` fields, parser wiring, `runItem`/`runClose`/`runVerdict`, dispatch, plus one retargeted 4A
+placeholder test — `"flags after the subcommand are left for its own section"` pointed at `item`, now
+real, retargeted to `show`, still a placeholder). No other file touched; `tasks.md` untouched, no ticks,
+no commit.
+
+**Verified by hand against the built binary**, not only by test: `header` → `created`; `item` (with
+`--section`/`--block`/`--to`/`--blocking`/`--ref`) → prints `#1`; a second `item` → `#2`; `close --item 1
+--state resolved` → silent, exit 0; `close --item 99` (never raised) → `item #99 does not exist — 1
+item(s) have been raised so far`, exit 1, log untouched; `close` by a non-declared-closer role →
+`role 'worker' is not a declared closer — declared closers: architect`, exit 1, log untouched (confirmed
+`wc -l` stayed at 2 after both refusals); `verdict` with a real outcome → silent, exit 0; `verdict
+--outcome aprove` → names the three legal values, exit 1.
+
+**Test count, both ways:** `grep -rc '^test "' src/*.zig` → **150** named `test "…"` blocks (118 before
+this block + 32 added). `zig build test --summary all` → **151/151** — the same +1 as every prior block,
+`main.zig`'s unnamed import-aggregator test.
+
+**Gates:**
+```
+BUILD_EXIT:0
+TEST_EXIT:0
+FORMAT_EXIT:0
+VALIDATE_EXIT:0
+GATES_EXIT:0
+```
+`make fmt` was needed once (same gap 4B found — `FORMAT_EXIT` came back red after the first pass, `make
+fmt` rewrote, `make format` confirmed clean afterward).
+
+→ @reviewer — closest look at `appendItem`/`checkItemExists` in `log.zig` (the block's one new
+mechanism and its two close rulings), and at the two pre-existing-test adjustments the `.item` guard on
+`appendRecord` forced. Second closest: `joinEnumNames`'s comptime construction in `main.zig`.
+
+---
+
+**[reviewer]** **Block 4C (`4.4`, `4.5`, `4.6`, `4.9`) — Approve with nits.**
+
+Audited `git diff d116392 -- src/` against A1–A6, D6/D7/D9/D10/D11/D13/D14, `specs/work-items/spec.md`
+(all four requirements), and the 4C brief. Gates re-run myself:
+
+```
+BUILD_EXIT:0
+TEST_EXIT:0
+FORMAT_EXIT:0
+VALIDATE_EXIT:0
+GATES_EXIT:0
+```
+
+`zig build test --summary all` → `151/151` tests passed. `grep -rc '^test "' src/*.zig` → `150` named
+`test "…"` blocks (`body.zig` 12, `log.zig` 30, `record.zig` 22, `main.zig` 86). Both numbers match the
+worker's report exactly — 150 named, 151 run, the +1 being `main.zig`'s unnamed import-aggregator test,
+consistent with every prior block. `tasks.md` and the `Makefile` are both untouched (`git status`
+confirms only `src/*.zig` and this DEVLOG changed).
+
+**On the six things flagged to weigh, in order:**
+
+1. **The `appendRecord`/`appendItem` split is right, and it is a narrower split than the framing in the
+   brief suggests — worth stating precisely rather than waved through.** The two functions share
+   *exactly* one thing that matters for correctness: both call the same `checkRoleAllowed`
+   (`src/log.zig:460-482`) — writer-role and `--to` are not two implementations that could drift, they
+   are one function called from two call sites, so a future third check added there is inherited by both
+   for free. I confirmed this by tracing, not assuming: `appendItem` (`src/log.zig:515-536`) calls
+   `checkRoleAllowed(opened.log.records, rec, diag)` at the identical position in its own
+   open→check→derive→stamp→replace sequence that `appendRecord` uses, and `Record.to()`/`role()`
+   (`src/record.zig:230-247`) both cover `.item` in their `inline` switch, so `item`'s optional `--to` is
+   validated on the same path `post`/`brief` use — verified this isn't merely structural by the dedicated
+   test at `src/main.zig:919-963` (`item` with an undeclared `--to`, refused, log untouched). What *is*
+   duplicated is the boilerplate around that shared check — `openLocked(.existing_only, …)`,
+   `record.nextSeq`, `withSeq`, `replaceWith` — five lines of glue repeated verbatim
+   (`src/log.zig:475-509` vs. `515-536`). A single `appendRecord` that special-cased `.item` (deriving
+   `next_item` via `countItems` and stamping it the way `withSeq` stamps `seq` for every kind) would
+   remove that duplication and the `error.RecordMustBeAppendedViaAppendItem` guard along with it, at the
+   cost of a return type that has to carry an optional item number for every caller instead of only
+   `item`'s. I don't think this is a blocker — the load-bearing invariant (item number under the lock,
+   both checks running on both paths) holds and is well tested — but I'd put it to the architect as a
+   real simplification opportunity rather than let it read as settled by the diff landing clean.
+2. **Item numbering is race-free and provably redundant against `5.2`, as briefed.** `next_item =
+   countItems(opened.log.records) + 1` (`src/log.zig:528`) runs after `openLocked` has parsed the log and
+   while the lock is held, before `replaceWith` — same position as `next_seq`. `countItems`
+   (`src/log.zig:543-549`) is a pure linear scan over the already-parsed slice, the same shape as
+   `record.nextSeq`. `main.zig`'s `runItem` (`src/main.zig:251-299`) builds the record with
+   `.item = 0` — a placeholder never read — and reports only what `log.appendItem` hands back
+   (`result.item`, `src/main.zig:297`); nothing in `main.zig` computes or second-guesses the number.
+   Confirmed by test that the number really is positional and unaffected by intervening non-item writes:
+   `"devlog item assigns increasing numbers across calls, unaffected by other record kinds appended in
+   between (D9)"` (`src/main.zig:746-830`) interleaves a `post` between two `item` calls and asserts `#1`
+   then `#2`.
+3. **Both close rulings landed exactly as briefed, and the second is genuinely absent, not merely
+   untested.** The refusal: `checkItemExists` (`src/log.zig:551-559`) runs from `appendRecord` for
+   `rec == .close` (`src/log.zig:498-500`), after `checkRoleAllowed` and before `next_seq`/`replaceWith`
+   — so a non-closer is told that first, matching the brief. Message names both the missing number and
+   the count (`"item #{d} does not exist — {d} item(s) have been raised so far"`), tested at
+   `src/log.zig:1145-1177` and again end-to-end at `src/main.zig:1019-1062`, both asserting the log is
+   byte-for-byte unchanged. The allow: I read every branch in `checkRoleAllowed` and `checkItemExists`
+   looking for a state check on the item's existing closes and found none — `checkItemExists` only asks
+   whether the number was ever *raised*, never whether it was already *closed*. Backed by a positive test
+   at both layers (`src/log.zig:1179-1211`, `src/main.zig:1116-1186`) that appends `deferred` then
+   `resolved` on the same item and asserts both records land, in order, un-refused. Correctly absent.
+4. **`--ref` is on all three, and the `4.8` tick — flagged in two successive landing notes as the one box
+   whose truth could decay — is honest as of this block.** `wants_ref_flag`
+   (`src/main.zig:401-402`) includes `wants_item`/`wants_close`/`wants_verdict`; each of `runItem`/
+   `runClose`/`runVerdict` passes `p.refs.items` into `common.refs`. Round-tripped by test on every
+   command, not just accepted by the parser: `item` at `src/main.zig:723` (`--ref S:4`, asserted
+   `refs.len == 1`), `close` at `src/main.zig:1000` (`--ref D:2`), `verdict` at `src/main.zig:1221`
+   (`--ref D:9`, asserted `refs.len == 1`).
+5. **The two pre-existing-test adjustments are exactly what the worker described, and both still pin
+   what they were written to pin.** `"appendRecord accepts a close from a declared closer (A1)"`
+   (`src/log.zig:1077-1120`, block 4A): the only change is inserting an `appendItem` call to raise item
+   `#1` before the pre-existing close targets it, and the expected `seq` shifting from `2` to `3` to
+   account for it — the assertion the test exists for (a declared closer's close is accepted) is
+   untouched. The eight-kind round-trip test (`src/log.zig:1571-1682`, block 2B/3): `item`'s construction
+   moved from `appendRecord` to `appendItem` (forced — `appendRecord` now refuses `.item` outright) and
+   gained one new assertion (`item_result.item == 1`, `src/log.zig:1602-1603`), a strengthening, not a
+   weakening; every other kind's construction and the full-log invariant checks below it
+   (`validateSeqOrder`, etc.) are byte-for-byte the diff's context, unchanged. Neither test's original
+   intent was ever about `.item`'s entry point — both are correctly widened, nothing quietly dropped.
+6. **`4.9`'s enum validation holds for all three, names the permitted set, and runs before the body is
+   read.** `joinEnumNames` (`src/main.zig:115-123`) is built once at compile time off
+   `record.ItemType`/`CloseState`/`VerdictOutcome`'s own field names via `@typeInfo(E).@"enum".fields` —
+   traced it: there is no restated literal anywhere for these three sets, so the staleness class the
+   architect flagged for D10 earlier in this section cannot recur here by construction. Verified the
+   message actually surfaces the live set with a deliberately wrong value in each of three tests
+   (`src/main.zig:558-590`: `bug`/`done`/`aprove`, each asserting the exact permitted-set string). Ordering:
+   `runItem`/`runClose`/`runVerdict` (`src/main.zig:251-416`) all validate the enum flag immediately after
+   checking it's present and strictly before `body.readBody` is called — confirmed structurally by reading
+   the functions and behaviourally by the "…before any filesystem access" tests
+   (`src/main.zig:479-556`), none of which set up a stdin standin at all, so a body-read-before-validate
+   bug would have hung or errored differently rather than passed.
+
+**Standing hazards, checked:**
+
+- **A3's ordering, per command, both halves** (refused write leaves the log byte-for-byte unchanged;
+  refused write against a missing log leaves no file behind) — present for all three commands
+  individually: `item` at `src/main.zig:1241-1272` (missing-log) and `1344-1386` (undeclared-role,
+  unchanged); `close` at `1274-1305` and `1388-1430`; `verdict` at `1307-1342` and `1432-1478`. Each
+  missing-log test iterates the tmp dir and asserts only the stdin-standin file exists — the literal
+  per-command standard 4B's nit pass set.
+- **Allocator hygiene** — `body_bytes` is freed via `defer` in all three `run*` functions regardless of
+  the `log.append*` outcome; `diag` is constructed once per command and `deinit`'d via `defer`; no path
+  I found calls `Diagnostics.set` twice on one instance before it's read. Same discipline as 4A/4B,
+  extended correctly to the two new call sites (`checkItemExists`, `appendItem`'s share of
+  `checkRoleAllowed`).
+- **Filesystem side effects** — no code path in this diff creates, writes, or deletes anything besides
+  the target log and D11's temp file; confirmed by the missing-log tests above and by hand-verification
+  in the worker's post (`wc -l` staying at 2 across two refusals).
+- **`--item`'s integer parsing** (`parsePositiveItemNumber`, `src/main.zig:236-239`) rejects non-numeric,
+  zero, and negative values before the body is read, tested at `src/main.zig:592-614`. Uses `i64`
+  throughout (`record.CloseRecord.item`, `ItemRecord.item`), consistent with D9's `#n` being unbounded in
+  principle; no truncating cast anywhere in this diff.
+- **`VerdictRecord`** carries no `to` — confirmed `wants_to_flag` excludes `wants_verdict`
+  (`src/main.zig:403`) and tested at `src/main.zig:640-652`.
+
+**Nits (none block approval):**
+
+- The `appendRecord`/`appendItem` boilerplate duplication discussed under point 1 — worth consolidating
+  the next time either function is touched, per the same "third copy earns the module" standard the
+  architect applied to `containsStr`/`containsString` in 4A. Not urgent; the shared check the duplication
+  surrounds is what actually matters and it isn't duplicated.
+- `appendItem`'s doc comment (`src/log.zig:517-519`) has a dropped clause: "derived here, inside the
+  locked read-then-write `appendRecord`'s `seq` already is" reads as missing a "the way" before
+  "`appendRecord`'s `seq`". Comment-only, meaning is still recoverable, but worth a pass.
+- `checkItemExists`'s message (`src/log.zig:557`) and `setUndeclaredMessage`'s messages both flow through
+  `diag.set`, but `checkItemExists` builds its string with `d.set(...)` directly rather than via
+  `setUndeclaredMessage` — reasonable, since it isn't a declared-set-membership message, just noting the
+  asymmetry is deliberate rather than an inconsistency worth chasing.
+
+**Architectural note:** no scope creep — `4.4`–`4.6` and `4.9`'s enum half are exactly what's built,
+nothing from `4.1`/`4.2`/`4.7` or later sections touched, no box ticked, no commit made. This is the last
+block of section 4; the `appendItem` duplication (point 1 / first nit) and the `--to`-validation
+behaviour-beyond-spec-words the architect already flagged after 4B are the two things I'd want the
+section-4 supervisor to weigh across the whole section rather than per block.
+
+→ @architect — clean to gate, tick, and commit. Nits above are for whenever it's convenient, not a
+re-audit condition.
+
+---
+
+**[worker]** **Closed the reviewer's two 4C nits.** No task numbers, no tick, no commit.
+
+**Nit 1 — consolidated the `appendRecord`/`appendItem` glue.** Architect overruled "leave it, it's not a
+third copy" and asked for one locked write path. Added a private `appendLocked` (`src/log.zig:469-521`)
+that does the whole open→`checkRoleAllowed`→`checkItemExists`(for `.close`)→`nextSeq`/stamp→(item number,
+for `.item`)→`replaceWith` sequence exactly once. `appendRecord` and `appendItem` are now both thin
+callers of it, each keeping its own public signature and its own guard at the top (`appendRecord` still
+refuses `.header` and `.item` before calling in; `appendItem` still refuses non-`.item`) — so
+`error.RecordMustBeAppendedViaAppendItem` is still a structural guard on `appendRecord`, not weakened by
+the merge. Item-number derivation didn't move: still `countItems(opened.log.records) + 1`, still
+computed inside `appendLocked` after `openLocked` has returned the parsed log and while the lock is held,
+still after `next_seq` is computed, same order as before. `5.2`'s later assertion stays provably
+redundant against the same code path, just one call deeper.
+
+**Behaviour change: none that I can find, and I looked for one specifically.** Same lock acquisition,
+same `checkRoleAllowed` call (same position, same arguments), same `checkItemExists` gating on
+`rec == .close`, same `next_seq`/`withSeq` stamp, same `replaceWith`. The only structural difference is
+that `appendRecord`'s guard clauses and `appendItem`'s guard clause now run *before* handing off to
+`appendLocked` rather than being interleaved with the glue itself — since both guards were already the
+first thing each function did, this doesn't reorder anything observable. Ran the full suite unchanged
+(no test edited) and it's still 151/151 green, which is the check I'd trust over my own reading if the
+two disagreed.
+
+**Nit 2 — fixed the dropped clause**, and folded it into the doc comment on `appendLocked` since that's
+where the item-derivation explanation now belongs (`appendItem`'s own comment still repeats the same
+line, since a caller reading only `appendItem` shouldn't have to go find `appendLocked` to learn where
+the number comes from). Now reads "...must be derived here, inside the locked read-then-write — the way
+`appendRecord`'s `seq` already is — never by the caller outside the lock..." in both places.
+
+**Nit 3 — no action**, per the architect's note; `checkItemExists` building its message via `d.set`
+directly rather than `setUndeclaredMessage` stays as is.
+
+**Gates:**
+```
+BUILD_EXIT:0
+TEST_EXIT:0
+FORMAT_EXIT:0
+VALIDATE_EXIT:0
+GATES_EXIT:0
+```
+`make format` was clean first try, no `make fmt` needed this time. Test count both ways, unchanged from
+the reviewer's numbers: `grep -rc '^test "' src/*.zig` → **150** named `test "…"` blocks (`body.zig` 12,
+`record.zig` 22, `log.zig` 30, `main.zig` 86 — same per-file counts as before, since no test was added,
+removed, or retargeted). `zig build test --summary all` → **151/151**. Nothing went redundant: the merge
+touched only the internal call structure of two functions that already shared every check; no test was
+asserting on the *shape* of that duplication (only on the outcomes — role/`--to`/`--item` refusals, item
+numbering, `--ref`, enum validation), so nothing needed to move or drop.
+
+**Files:** `src/log.zig` only — the private `appendLocked` plus the two now-thin `appendRecord`/
+`appendItem`, and the doc-comment fix. `main.zig` and `record.zig` untouched by this pass (their diffs in
+the tree are block 4C's own, not mine). `tasks.md`, `Makefile`, `CLAUDE.md` untouched. No ticks, no
+commit.
+
+→ @architect — since this touches the write path rather than a comment, flagging for a short re-audit
+if you want one before gate/tick/commit, rather than assuming the nit-close is self-evidently safe.
+
+**[reviewer]** **Re-audit of the `appendLocked` consolidation (`src/log.zig`, block 4C's write-path nit) —
+Approve.** Scope: this pass only, per the architect's narrowing — not a re-review of block 4C. Gates
+re-run myself, not taken on the worker's word:
+
+```
+BUILD_EXIT:0
+TEST_EXIT:0
+FORMAT_EXIT:0
+VALIDATE_EXIT:0
+GATES_EXIT:0
+```
+
+`zig build test --summary all` → `151 pass (151 total)`. `grep -rc '^test "' src/*.zig` → `body.zig` 12 +
+`record.zig` 22 + `log.zig` 30 + `main.zig` 86 = `150` named, matching the worker's "unchanged 150/151"
+exactly. `git diff --stat HEAD` confirms only `src/log.zig` and this DEVLOG changed in this pass —
+`main.zig`/`record.zig` carry block 4C's own diff, out of scope here as briefed.
+
+**1. Behaviour-preserving — yes.** `appendLocked` (`src/log.zig:496-525`) runs
+`openLocked(.existing_only)` → `checkRoleAllowed` (`:507`) → `checkItemExists` for `.close` only
+(`:509-511`) → `record.nextSeq`/`withSeq` (`:513-514`) → item-number derivation for `.item` only, from
+`opened.log.records`, after `next_seq` (`:516-520`) → `replaceWith` (`:522`). That is the exact order the
+block-4C review already traced and approved for each function separately (this DEVLOG, block 4C review
+point 1: "identical position in its own open→check→derive→stamp→replace sequence"; point 3: check-before-
+`next_seq`/`replaceWith` for `.close`). No reordering. Error values are untouched — `checkRoleAllowed` and
+`checkItemExists` are the same functions, unmoved and unedited by this diff (confirmed: neither appears
+in `git diff HEAD -- src/log.zig`'s hunks). `AppendedRecord.item` is `?i64`, `null` unless `rec == .item`;
+`appendItem`'s `.item.?` unwrap is safe because that branch is reached only when `rec == .item`, which is
+exactly when `appendLocked` populates it.
+
+**2. Structural guards — intact.** `appendRecord` (`:541-542`) still refuses `.header` and `.item` before
+ever calling `appendLocked` — `error.RecordMustNotBeHeader`/`error.RecordMustBeAppendedViaAppendItem`,
+both ahead of any filesystem effect (A3). `appendItem` (`:574`) still refuses non-`.item` with
+`error.RecordMustBeItem`, same position. Confirmed by two tests in the diff, not merely by reading:
+`"appendRecord refuses an .item record outright…"` and the untouched `"…must be appended via
+appendItem"` semantics still exercised end-to-end at `src/main.zig` (unchanged by this pass). Neither
+guard is unreachable or displaced — both are the first statement of their public function, ahead of the
+shared path.
+
+**3. `checkRoleAllowed` is unavoidable for both of today's public write paths, but not at the file's true
+floor — worth naming plainly, per the ask.** `replaceWith` is private and has exactly two call sites in
+the whole file: `appendHeader` (`:464`, exempt by design — headers don't carry a role to check) and
+`appendLocked` (`:522`). Since `appendRecord` and `appendItem` are now incapable of reaching `replaceWith`
+except through `appendLocked`, neither can skip `checkRoleAllowed` — that is real and is what the
+architect's ruling bought. But the choke point is `appendLocked`, not `replaceWith` itself: nothing in
+the type system stops a future third private function from being added beside `appendLocked` that calls
+`replaceWith` directly, bypassing `checkRoleAllowed` the same way a hand-rolled `.item` special case
+inside `appendRecord` could have before this refactor. That's not a regression — it's exactly as
+avoidable/unavoidable as it was pre-consolidation — but it means "structurally impossible to skip" is true
+of the two callers that exist today, not of the file generically. If the architect wants the stronger
+guarantee, the fix is to move the `checkRoleAllowed` call (and the `.close`→`checkItemExists` call) inside
+`replaceWith` itself, or to make `replaceWith` take `rec` and refuse to run without having validated it —
+pushing the checkpoint to the one function every write path already funnels through, rather than the one
+two callers currently happen to share. Not a blocker; an architectural note for `## NEXT` if the stronger
+form is wanted.
+
+**4. Allocator hygiene — clean.** `appendLocked` opens once (`:504`) and its `defer opened.close(allocator)`
+(`:505`) sits immediately after, covering every path out of the function including the new
+`checkItemExists` early return — `Opened`'s lifetime is scoped entirely within `appendLocked` now, and
+neither thin wrapper (`appendRecord`, `appendItem`) manages a resource of its own, so there's no risk of a
+double-close or a wrapper-level defer racing the helper's. No new allocation was introduced by this pass —
+`AppendedRecord`/`AppendItemResult` are stack value types, not heap-owned. `diag` continues to be a
+borrowed pointer threaded through unchanged, same discipline as before.
+
+**One pre-existing nit, not introduced by this pass but slightly sharpened by it — worth a word-fix,
+not urgent.** `checkRoleAllowed`'s doc comment (`src/log.zig:610-618`, untouched by this diff) still
+reads "Called only from `appendRecord`, after `rec == .header` has already been excluded there, so
+`rec.role()` is never `null`." That was already inaccurate as of block 4C (the function is called from
+`appendItem` too, confirmed by the block-4C review's own trace), and is now one call-frame further from
+true — the direct caller is `appendLocked`, reached from both public functions. The invariant it
+describes still holds (`.header` is excluded before either caller reaches `appendLocked`), so this is
+prose, not a bug; flagging since we're already looking at exactly this call path.
+
+**Verdict: Approve.** The consolidation is behaviour-preserving, both structural guards survived intact
+and un-interleaved, the shared check is now unavoidable for `appendRecord`/`appendItem` specifically (with
+the floor-vs-choke-point distinction above worth a line in `## NEXT` if the architect wants the fuller
+guarantee), and the refactor introduced no allocator or lock-lifetime risk. Clear to gate, tick, and
+commit.
+
+**[architect]** **Block 4C is landed, and section 4's tasks are complete bar `3.2`.** Reviewer `Approve
+with nits`, two nits closed, the write-path consolidation re-audited on its own and approved, gates re-run
+by me:
+
+```
+BUILD_EXIT:0
+TEST_EXIT:0
+FORMAT_EXIT:0
+VALIDATE_EXIT:0
+GATES_EXIT:0
+```
+
+**150** named `test "…"` blocks, **151** run. Ticked: `4.4`, `4.5`, `4.6`, `4.9`. Section 4 is 11 of 11
+tasks, plus `3.2` which is the Product Owner's and still open.
+
+**Why I overruled the reviewer on the `appendRecord`/`appendItem` duplication, since the reviewer was
+applying a standard I set.** In 4A I left `containsStr`/`containsString` duplicated on a "third copy earns
+the module" argument, and the reviewer reached for it here. The standard did not transfer, and that is my
+fault for stating the conclusion more clearly than the reason. What made me leave `containsStr` alone was
+**cross-module coupling**: consolidating meant `log.zig` exporting a generic string helper for `main.zig`'s
+benefit, or a shared module with one occupant. Neither applies to two functions in the same file whose
+duplicated part *is* the locked write path. And the reviewer's own defence was the tell — it confirmed the
+shared check is genuinely shared **today**. Structure that happens to be right is not the same as structure
+that cannot go wrong, and I had named a split write path as the drift hazard in 4C's brief before the block
+was written. Better closed here than raised as a supervisor remediation.
+
+**The re-audit's honest answer to the question I actually asked**, which is worth keeping: `checkRoleAllowed`
+is now unavoidable for the two *public* write paths, because `replaceWith` has exactly two call sites and
+`appendRecord`/`appendItem` both route through `appendLocked`. It is **not** unavoidable at the file's true
+floor — a future private function could call `replaceWith` directly. The reviewer's suggested hardening is to
+push the check into `replaceWith` itself.
+
+**I am not doing that, and the reason is worth recording so it is not proposed again.** `appendHeader` also
+calls `replaceWith`, and a `header` carries no role by construction — so the check inside `replaceWith`
+would need an `if (rec != .header)` exemption, putting a per-kind special case in the lowest-level function
+in the file. That is a worse shape than the one it fixes: D13's exemption is currently expressed by
+`HeaderRecord` simply not having the field, which is unforgeable, and re-expressing it as a runtime
+conditional one layer down is how it becomes forgeable. **Carried** as a known limit rather than solved.
+
+**One comment I fixed myself** (`src/log.zig`, `checkRoleAllowed`'s doc comment): it still said "called only
+from `appendRecord`", stale since 4C and staler after the consolidation. Prose, not feature code — but I
+have spent this section holding everyone else to "the code and the document disagreeing is an amendment",
+and a stale comment I noticed and left would be the same fault with my name on it.
+
+→ @supervisor — section 4 is ready for review. Scope is `git diff b59f249..HEAD`.
+
 ## NEXT
 
 **[architect]** **Section 3 is CLOSED** — supervisor `Approve` on the second pass, after one remediation

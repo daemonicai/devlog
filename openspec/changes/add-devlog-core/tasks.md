@@ -39,15 +39,15 @@
 - [x] 4.1 `devlog section --section --title --base` — opens a section and records its base commit
 - [x] 4.2 `devlog brief --section --block --to` — the architect's block brief (D8)
 - [x] 4.3 `devlog post --section --block [--to]` — general thread traffic
-- [ ] 4.4 `devlog item --type --to --blocking` — raises an item, assigns the next `#n`, prints the
+- [x] 4.4 `devlog item --type --to --blocking` — raises an item, assigns the next `#n`, prints the
       identifier (D6, D9)
-- [ ] 4.5 `devlog close --item --state` — requires a body as the reason; refuses a close from any role
+- [x] 4.5 `devlog close --item --state` — requires a body as the reason; refuses a close from any role
       the header did not declare as a closer, with a message naming the guardrail (`work-items`)
-- [ ] 4.6 `devlog verdict --section --block --outcome --commit` — typed review verdicts (D7)
+- [x] 4.6 `devlog verdict --section --block --outcome --commit` — typed review verdicts (D7)
 - [x] 4.7 `devlog next` — appends the narrative record (`next-state`)
 - [x] 4.8 `--ref ns:id` accepted and stored on every write command, repeatable, unvalidated (D10,
       `external-references`)
-- [ ] 4.9 Reject writes that omit the author role, and validate enum values (`type`, `state`, `outcome`)
+- [x] 4.9 Reject writes that omit the author role, and validate enum values (`type`, `state`, `outcome`)
       against their permitted sets
 - [x] 4.10 `devlog header --change --role <r>` (repeatable) `--closer <r>` (repeatable) — declares the
       project's role set and which roles may close items, creating the log or appending a new header when

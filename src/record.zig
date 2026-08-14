@@ -660,7 +660,11 @@ fn parseRefs(allocator: Allocator, obj: std.json.ObjectMap, diag: ?*Diagnostics)
     return out;
 }
 
-fn enumFromString(comptime E: type, s: []const u8) ?E {
+/// `pub` since block 4C (`main.zig`'s `--type`/`--state`/`--outcome`
+/// validation, `4.9`) reuses this rather than duplicating an enum-lookup
+/// loop — the same permitted-set-of-strings shape `parseLine` already
+/// needed for parsing these same three fields off the wire.
+pub fn enumFromString(comptime E: type, s: []const u8) ?E {
     inline for (@typeInfo(E).@"enum".fields) |f| {
         if (std.mem.eql(u8, f.name, s)) return @field(E, f.name);
     }

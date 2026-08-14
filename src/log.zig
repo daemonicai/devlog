@@ -466,16 +466,70 @@ pub fn appendHeader(
     return .{ .outcome = if (created) .created else .appended, .seq = next_seq };
 }
 
-/// Appends one non-header record, assigning `seq` under the lock (D11).
-/// `rec.seq` is ignored and overwritten — callers do not need to compute
-/// it, and could not do so safely outside the lock in any case. Returns
-/// the assigned `seq`. `rec` must not be `.header` — see `appendHeader`.
+/// Result of the shared locked write path (`appendLocked`): the `seq`
+/// assigned under the lock, and — only when the record was `.item` — the
+/// item identifier assigned under that same lock (D9). `null` for every
+/// other kind.
+const AppendedRecord = struct {
+    seq: u64,
+    item: ?i64,
+};
+
+/// The shared locked write path (D11, D13, A1) behind both `appendRecord`
+/// and `appendItem`: open, validate the writer against the latest header,
+/// derive whatever this record kind needs derived from the parsed log
+/// (`seq` always; an `item` number too, when `rec == .item`), stamp, and
+/// atomically replace. One locked write path, one place that stamps — a
+/// check added here is inherited by both callers instead of needing to be
+/// kept in sync across two copies of the glue.
 ///
 /// Opens `.existing_only` (A2): a missing log is refused, naming
 /// `devlog header`, rather than created and then possibly left behind by
 /// a later refusal. Validates the writer's role against the **latest**
 /// header before writing anything (A1, D13, `work-items`) — see
-/// `checkRoleAllowed`.
+/// `checkRoleAllowed`. For a `.close`, additionally refuses an `--item`
+/// naming a number no `item` record has ever raised (`4.5`, architect
+/// ruling, DEVLOG `## 4` block 4C brief) — see `checkItemExists`. Closing
+/// an already-closed item is deliberately **not** refused here: which
+/// close wins is a derivation question (`5.1`), not the write boundary's
+/// (append-only-log: a correction is a new record, not a rewrite).
+fn appendLocked(
+    allocator: Allocator,
+    io: Io,
+    dir: Io.Dir,
+    sub_path: []const u8,
+    rec: record.Record,
+    diag: ?*record.Diagnostics,
+) !AppendedRecord {
+    var opened = try openLocked(allocator, io, dir, sub_path, .existing_only, diag);
+    defer opened.close(allocator);
+
+    try checkRoleAllowed(opened.log.records, rec, diag);
+
+    if (rec == .close) {
+        try checkItemExists(opened.log.records, rec.close.item, diag);
+    }
+
+    const next_seq = record.nextSeq(opened.log.records);
+    var stamped = withSeq(rec, next_seq);
+
+    const item_num: ?i64 = if (rec == .item) blk: {
+        const next_item = countItems(opened.log.records) + 1;
+        stamped.item.item = next_item;
+        break :blk next_item;
+    } else null;
+
+    try replaceWith(allocator, io, dir, sub_path, &opened, stamped, diag);
+
+    return .{ .seq = next_seq, .item = item_num };
+}
+
+/// Appends one non-header record, assigning `seq` under the lock (D11)
+/// via `appendLocked`. `rec.seq` is ignored and overwritten — callers do
+/// not need to compute it, and could not do so safely outside the lock in
+/// any case. Returns the assigned `seq`. `rec` must not be `.header` —
+/// see `appendHeader`. `rec` must not be `.item` either — item numbering
+/// is its own under-the-lock derivation (D9); see `appendItem`.
 pub fn appendRecord(
     allocator: Allocator,
     io: Io,
@@ -485,18 +539,72 @@ pub fn appendRecord(
     diag: ?*record.Diagnostics,
 ) !u64 {
     if (rec == .header) return error.RecordMustNotBeHeader;
+    if (rec == .item) return error.RecordMustBeAppendedViaAppendItem;
 
-    var opened = try openLocked(allocator, io, dir, sub_path, .existing_only, diag);
-    defer opened.close(allocator);
+    const result = try appendLocked(allocator, io, dir, sub_path, rec, diag);
+    return result.seq;
+}
 
-    try checkRoleAllowed(opened.log.records, rec, diag);
+pub const AppendItemResult = struct {
+    seq: u64,
+    /// The assigned identifier — `#<item>` is what `devlog item` prints
+    /// (`work-items`: "the tool returns its identifier").
+    item: i64,
+};
 
-    const next_seq = record.nextSeq(opened.log.records);
-    const stamped = withSeq(rec, next_seq);
+/// Appends an `item` record, assigning **both** `seq` and the item's own
+/// identifier under the same lock (`4.4`, D9: "the *n*th `item` record is
+/// `#n`"), via `appendLocked`. That number is a function of the log's
+/// contents, so it must be derived here, inside the locked read-then-write
+/// — the way `appendRecord`'s `seq` already is — never by the caller
+/// outside the lock, which is exactly the race `seq` itself would have
+/// with two concurrent writers. `rec` must be `.item`; its own `.item`
+/// field is ignored and overwritten, exactly as `appendRecord` ignores and
+/// overwrites `rec.seq()`. Shares `checkRoleAllowed` with `appendRecord`
+/// — the writer-role and `--to` checks are identical for an `item`, not a
+/// separate mechanism.
+pub fn appendItem(
+    allocator: Allocator,
+    io: Io,
+    dir: Io.Dir,
+    sub_path: []const u8,
+    rec: record.Record,
+    diag: ?*record.Diagnostics,
+) !AppendItemResult {
+    if (rec != .item) return error.RecordMustBeItem;
 
-    try replaceWith(allocator, io, dir, sub_path, &opened, stamped, diag);
+    const result = try appendLocked(allocator, io, dir, sub_path, rec, diag);
+    return .{ .seq = result.seq, .item = result.item.? };
+}
 
-    return next_seq;
+/// How many `item` records `records` already contains — the basis for
+/// both D9's next identifier (`appendItem`) and the "how many items exist"
+/// half of `checkItemExists`'s refusal message. A pure function of a
+/// parsed set, the same shape as `record.nextSeq`.
+fn countItems(records: []const record.Record) i64 {
+    var count: i64 = 0;
+    for (records) |r| {
+        if (r == .item) count += 1;
+    }
+    return count;
+}
+
+/// `4.5`, architect ruling (DEVLOG `## 4`, block 4C brief): a close naming
+/// an item number the log has never raised is refused rather than silently
+/// appended — the parsed log is already in hand under the lock, so this
+/// costs one linear scan. The same typo hazard A1's role/`--to` checks
+/// already guard against, one field over: a mistyped `--item 7` would
+/// otherwise close nothing, leave the real item open forever, and report
+/// no fault. Deliberately does **not** check whether the item is already
+/// closed — see `appendRecord`'s doc comment for why.
+fn checkItemExists(records: []const record.Record, item_num: i64, diag: ?*record.Diagnostics) !void {
+    for (records) |r| {
+        if (r == .item and r.item.item == item_num) return;
+    }
+    if (diag) |d| {
+        d.set("item #{d} does not exist — {d} item(s) have been raised so far", .{ item_num, countItems(records) });
+    }
+    return error.ItemNotFound;
 }
 
 /// A1 (architect ruling, DEVLOG `## 4`, settling `## NEXT`'s N1): "is
@@ -506,8 +614,12 @@ pub fn appendRecord(
 /// closer guardrail). One place enforces both, under the lock, against
 /// the latest header (D13: "the latest header wins") — so `close` (block
 /// 4C) inherits this rather than re-implementing it. Called only from
-/// `appendRecord`, after `rec == .header` has already been excluded
-/// there, so `rec.role()` is never `null`.
+/// `appendLocked`, which is the single locked write path behind both
+/// `appendRecord` and `appendItem` (consolidated closing block 4C's
+/// review, precisely so this check cannot come to exist on one path and
+/// not the other). `.header` is excluded by both public entry points
+/// before `appendLocked` is reached — `appendHeader` does not route
+/// through it at all — so `rec.role()` is never `null` here.
 ///
 /// **Extended in block 4B, on D13's own reasoning:** when `rec` carries
 /// a `to`, that addressee must also be a declared role. `--to reviewr`
@@ -992,13 +1104,23 @@ test "appendRecord accepts a close from a declared closer (A1)" {
         &diag,
     );
 
+    // Block 4C: appendRecord now refuses a close naming an item that was
+    // never raised, so this test's own item #1 has to exist first — the
+    // only change this test needed once that check landed.
+    _ = try appendItem(allocator, testing.io, tmp.dir, "DEVLOG.jsonl", .{ .item = .{
+        .common = .{ .seq = 0, .ts = "t1a", .role = "architect", .body = "raised" },
+        .item = 0,
+        .type = .note,
+        .blocking = false,
+    } }, &diag);
+
     const close = record.Record{ .close = .{
         .common = .{ .seq = 0, .ts = "t2", .role = "architect", .body = "resolved" },
         .item = 1,
         .state = .resolved,
     } };
     const seq = try appendRecord(allocator, testing.io, tmp.dir, "DEVLOG.jsonl", close, &diag);
-    try testing.expectEqual(@as(u64, 2), seq);
+    try testing.expectEqual(@as(u64, 3), seq);
 }
 
 test "a read against a missing log is a plain not-found, and creates nothing" {
@@ -1476,19 +1598,21 @@ test "round-trip: every one of the eight record kinds survives a real file, in o
     const post = record.Record{ .post = .{
         .common = .{ .seq = 0, .ts = "t4", .role = "worker", .body = "Locked append implemented." },
     } };
-    const item = record.Record{ .item = .{
-        .common = .{
-            .seq = 0,
-            .ts = "t5",
-            .role = "worker",
-            .to = "architect",
-            .refs = &.{ .{ .ns = "S", .id = "4" }, .{ .ns = "N", .id = "7" } },
-            .body = "Should the header carry a role?",
+    const item = record.Record{
+        .item = .{
+            .common = .{
+                .seq = 0,
+                .ts = "t5",
+                .role = "worker",
+                .to = "architect",
+                .refs = &.{ .{ .ns = "S", .id = "4" }, .{ .ns = "N", .id = "7" } },
+                .body = "Should the header carry a role?",
+            },
+            .item = 0, // ignored — appendItem assigns it under the lock (D9, block 4C)
+            .type = .question,
+            .blocking = true,
         },
-        .item = 1,
-        .type = .question,
-        .blocking = true,
-    } };
+    };
     const close = record.Record{ .close = .{
         .common = .{ .seq = 0, .ts = "t6", .role = "architect", .refs = &.{.{ .ns = "D", .id = "13" }}, .body = "No — exempt." },
         .item = 1,
@@ -1506,7 +1630,12 @@ test "round-trip: every one of the eight record kinds survives a real file, in o
     const seq_section = try appendRecord(allocator, testing.io, tmp.dir, "DEVLOG.jsonl", section, &diag);
     const seq_brief = try appendRecord(allocator, testing.io, tmp.dir, "DEVLOG.jsonl", brief, &diag);
     const seq_post = try appendRecord(allocator, testing.io, tmp.dir, "DEVLOG.jsonl", post, &diag);
-    const seq_item = try appendRecord(allocator, testing.io, tmp.dir, "DEVLOG.jsonl", item, &diag);
+    // item is appended via appendItem, not appendRecord (block 4C:
+    // appendRecord now refuses .item outright — see its doc comment) —
+    // the only line in this test that changed shape when 4C landed.
+    const item_result = try appendItem(allocator, testing.io, tmp.dir, "DEVLOG.jsonl", item, &diag);
+    const seq_item = item_result.seq;
+    try testing.expectEqual(@as(i64, 1), item_result.item);
     const seq_close = try appendRecord(allocator, testing.io, tmp.dir, "DEVLOG.jsonl", close, &diag);
     const seq_verdict = try appendRecord(allocator, testing.io, tmp.dir, "DEVLOG.jsonl", verdict, &diag);
     const seq_next = try appendRecord(allocator, testing.io, tmp.dir, "DEVLOG.jsonl", next, &diag);
@@ -1575,4 +1704,165 @@ test "round-trip: every one of the eight record kinds survives a real file, in o
     // increasing order — the property `append-only-log`'s "Order survives
     // reconstruction" scenario asks for.
     try record.validateSeqOrder(log.records, null);
+}
+
+// --- Block 4C: item numbering and the close-target check --------------
+
+fn makeItem(role: []const u8, ts: []const u8) record.Record {
+    return .{ .item = .{
+        .common = .{ .seq = 0, .ts = ts, .role = role, .body = "raised" },
+        .item = 0,
+        .type = .note,
+        .blocking = false,
+    } };
+}
+
+test "appendItem assigns item numbers under the lock, starting at 1 and counting up (D9, 4.4)" {
+    const allocator = testing.allocator;
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    var diag: record.Diagnostics = .init(allocator);
+    defer diag.deinit();
+    _ = try appendHeader(
+        allocator,
+        testing.io,
+        tmp.dir,
+        "DEVLOG.jsonl",
+        "t0",
+        "devlog 0.1.0",
+        .{ .change = "x", .roles = &.{"architect"}, .closers = &.{"architect"} },
+        &diag,
+    );
+
+    const first = try appendItem(allocator, testing.io, tmp.dir, "DEVLOG.jsonl", makeItem("architect", "t1"), &diag);
+    try testing.expectEqual(@as(i64, 1), first.item);
+    try testing.expectEqual(@as(u64, 2), first.seq);
+
+    const second = try appendItem(allocator, testing.io, tmp.dir, "DEVLOG.jsonl", makeItem("architect", "t2"), &diag);
+    try testing.expectEqual(@as(i64, 2), second.item);
+    try testing.expectEqual(@as(u64, 3), second.seq);
+
+    const bytes = try readAllLog(allocator, tmp.dir, testing.io);
+    defer allocator.free(bytes);
+    var parsed = try record.parseLog(allocator, bytes, &diag);
+    defer parsed.deinit();
+    try testing.expectEqual(@as(i64, 1), parsed.records[1].item.item);
+    try testing.expectEqual(@as(i64, 2), parsed.records[2].item.item);
+}
+
+test "appendItem refuses a role the latest header did not declare, and writes nothing (A1, forward from 4A)" {
+    const allocator = testing.allocator;
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    var diag: record.Diagnostics = .init(allocator);
+    defer diag.deinit();
+    _ = try appendHeader(
+        allocator,
+        testing.io,
+        tmp.dir,
+        "DEVLOG.jsonl",
+        "t0",
+        "devlog 0.1.0",
+        .{ .change = "x", .roles = &.{"architect"}, .closers = &.{"architect"} },
+        &diag,
+    );
+    const before = try readAllLog(allocator, tmp.dir, testing.io);
+    defer allocator.free(before);
+
+    const result = appendItem(allocator, testing.io, tmp.dir, "DEVLOG.jsonl", makeItem("reviewr", "t1"), &diag);
+    try testing.expectError(error.UndeclaredRole, result);
+    try testing.expect(std.mem.indexOf(u8, diag.message, "reviewr") != null);
+
+    const after = try readAllLog(allocator, tmp.dir, testing.io);
+    defer allocator.free(after);
+    try testing.expectEqualStrings(before, after);
+}
+
+test "appendRecord refuses an .item record outright — it must be appended via appendItem (block 4C)" {
+    const allocator = testing.allocator;
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const result = appendRecord(allocator, testing.io, tmp.dir, "DEVLOG.jsonl", makeItem("architect", "t"), null);
+    try testing.expectError(error.RecordMustBeAppendedViaAppendItem, result);
+}
+
+test "appendRecord refuses a close naming an item number that was never raised, and names how many exist (4.5)" {
+    const allocator = testing.allocator;
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    var diag: record.Diagnostics = .init(allocator);
+    defer diag.deinit();
+    _ = try appendHeader(
+        allocator,
+        testing.io,
+        tmp.dir,
+        "DEVLOG.jsonl",
+        "t0",
+        "devlog 0.1.0",
+        .{ .change = "x", .roles = &.{"architect"}, .closers = &.{"architect"} },
+        &diag,
+    );
+    _ = try appendItem(allocator, testing.io, tmp.dir, "DEVLOG.jsonl", makeItem("architect", "t1"), &diag);
+    const before = try readAllLog(allocator, tmp.dir, testing.io);
+    defer allocator.free(before);
+
+    const close = record.Record{ .close = .{
+        .common = .{ .seq = 0, .ts = "t2", .role = "architect", .body = "typo'd item number" },
+        .item = 7,
+        .state = .resolved,
+    } };
+    const result = appendRecord(allocator, testing.io, tmp.dir, "DEVLOG.jsonl", close, &diag);
+    try testing.expectError(error.ItemNotFound, result);
+    try testing.expect(std.mem.indexOf(u8, diag.message, "#7") != null);
+    try testing.expect(std.mem.indexOf(u8, diag.message, "1") != null);
+
+    const after = try readAllLog(allocator, tmp.dir, testing.io);
+    defer allocator.free(after);
+    try testing.expectEqualStrings(before, after);
+}
+
+test "appendRecord accepts a second close on an already-closed item — a correction, not an error (4.5, architect ruling)" {
+    const allocator = testing.allocator;
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    var diag: record.Diagnostics = .init(allocator);
+    defer diag.deinit();
+    _ = try appendHeader(
+        allocator,
+        testing.io,
+        tmp.dir,
+        "DEVLOG.jsonl",
+        "t0",
+        "devlog 0.1.0",
+        .{ .change = "x", .roles = &.{"architect"}, .closers = &.{"architect"} },
+        &diag,
+    );
+    _ = try appendItem(allocator, testing.io, tmp.dir, "DEVLOG.jsonl", makeItem("architect", "t1"), &diag);
+
+    const first_close = record.Record{ .close = .{
+        .common = .{ .seq = 0, .ts = "t2", .role = "architect", .body = "deferred for now" },
+        .item = 1,
+        .state = .deferred,
+    } };
+    _ = try appendRecord(allocator, testing.io, tmp.dir, "DEVLOG.jsonl", first_close, &diag);
+
+    const second_close = record.Record{ .close = .{
+        .common = .{ .seq = 0, .ts = "t3", .role = "architect", .body = "actually resolved" },
+        .item = 1,
+        .state = .resolved,
+    } };
+    _ = try appendRecord(allocator, testing.io, tmp.dir, "DEVLOG.jsonl", second_close, &diag);
+
+    const bytes = try readAllLog(allocator, tmp.dir, testing.io);
+    defer allocator.free(bytes);
+    var parsed = try record.parseLog(allocator, bytes, &diag);
+    defer parsed.deinit();
+    try testing.expectEqual(@as(usize, 4), parsed.records.len);
+    try testing.expectEqual(record.CloseState.deferred, parsed.records[2].close.state);
+    try testing.expectEqual(record.CloseState.resolved, parsed.records[3].close.state);
 }
