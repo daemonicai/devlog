@@ -15,6 +15,14 @@ test {
     _ = record;
     _ = log;
     _ = body;
+    // Test-discovery only (`zig build test` walks reachable imports from
+    // this root module) — no command in this block calls into `state.zig`.
+    // Not bound to a top-level `const state` because `state` is already a
+    // local identifier elsewhere in this file (the `--state` flag's parsed
+    // value). Wiring `state.zig` into command behaviour belongs to section
+    // 6, per block 5A's brief ("main.zig is not wired to it in this
+    // block").
+    _ = @import("state.zig");
 }
 
 /// One subcommand of the surface. `section` names the `tasks.md` section

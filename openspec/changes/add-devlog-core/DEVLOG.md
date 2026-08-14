@@ -6535,6 +6535,302 @@ superseding another with the history retained.
 report — do not describe the output. Report the test **count**, counted rather than quoted from a previous
 post. Then `→ @reviewer`. Do not commit and do not tick anything.
 
+**[worker]** **Block 5A (`5.1`–`5.3`) implemented.** New module `src/state.zig`: `derive(allocator,
+[]const record.Record, ?*record.Diagnostics) DeriveError!State`, a pure fold — no filesystem access.
+
+- `5.1` — `Item.state: ItemState` (`open`/`resolved`/`deferred`/`superseded`) derived from the opening
+  `item` record plus every `close` naming it: open when no close exists, otherwise the state of the last
+  close in log order. Every close is kept in `Item.closes`, in order — not just the winner. A close naming
+  an out-of-range item number (only possible in a log this tool didn't write) is skipped rather than
+  faulted, since section 4's write-boundary invariant guarantees every stored close names an item that
+  exists, and `5.2`'s assertion is deliberately scoped to item numbering only, per the brief.
+- `5.2` — positional numbering: the *n*th `item` record's ordinal is asserted equal to its stored `item`
+  field. On mismatch, `derive` sets `diag` and returns `error.ItemNumberMismatch` — no repair, no
+  renumbering — mirroring `record.validateSeqOrder`'s `Diagnostics`-plus-error shape exactly.
+- `5.3` — `State.next_history` retains every `next` record in log order; `State.currentNext()` returns the
+  last one, `null` if none.
+
+`Item`/`State` borrow `record.ItemRecord`/`CloseRecord`/`NextRecord` values from the caller's
+`record.ParsedLog` (documented on both types: the caller must keep the `ParsedLog` alive for the `State`'s
+lifetime). `State.deinit` frees only what `derive` allocated: the `items` array, each `Item.closes` slice,
+and `next_history` — never anything reachable through a borrowed record.
+
+**One naming snag, fixed:** a top-level `const state = @import("state.zig");` in `main.zig` shadowed an
+existing local `state` (the parsed `--state` flag value in the close-parsing path, `main.zig:1096`) and
+failed to build. Since this block doesn't wire `state.zig` into any command anyway, I dropped the
+top-level binding and import it anonymously inside the existing `test { … }` aggregator instead
+(`_ = @import("state.zig");`) — test-discovery only, exactly as `record`/`log`/`body` are aggregated
+there, with a comment explaining why there's no top-level `const state` and that functional wiring is
+section 6's. `main.zig` is otherwise untouched.
+
+**Tests** (`src/state.zig`, 8): no-close item is open; each of resolved/deferred/superseded from a single
+close; a second close overrides the first with both retained in order; interleaved items and closes attach
+by item number, not position; positional numbering holds across a log where `item` records are separated
+by other kinds; a mismatched stored item number is reported as a fault, not repaired (asserts both the
+wrong stored number and the correct positional `#n` appear in the message); no `next` record leaves
+history empty and `currentNext()` null; one `next` superseding another is current with full history
+retained.
+
+`BUILD_EXIT:0 TEST_EXIT:0 FORMAT_EXIT:0 VALIDATE_EXIT:0 GATES_EXIT:0`. Test count: 165 (`record.zig` 22 +
+`log.zig` 31 + `body.zig` 12 + `main.zig` 92 + `state.zig` 8), counted via `grep -c '^test "'` just now,
+not quoted from a prior post.
+
+→ @reviewer
+
+**[reviewer]** **Block 5A (`5.1`–`5.3`) — Request changes.**
+
+Re-ran the gates independently and confirmed the exit lines quoted in the block above:
+`BUILD_EXIT:0`, `TEST_EXIT:0`, `FORMAT_EXIT:0`, `VALIDATE_EXIT:0`. Confirmed `src/state.zig` has zero
+filesystem tokens (`grep` for `Io.`/`File.`/`Dir.`/`fs.`/`open(`/`Lock` etc. — no hits): the pure-fold
+constraint holds literally, not just by doc comment. Confirmed the test count: 8 in `state.zig`, 165
+total, matching the report.
+
+**Blocker.**
+
+- `src/state.zig:126–130` and `:179` — a latent double-free / use-of-undefined-memory in `derive`'s
+  error path. `item_closes` is manually deinitialized at line 179 (`item_closes.deinit(allocator)`).
+  Zig 0.16's unmanaged `ArrayList.deinit` (`lib/std/array_list.zig:623-626`) does `gpa.free(...); self.*
+  = undefined;` — so after line 179, `item_closes` itself is `undefined`. But the `errdefer` registered
+  at lines 127–130 (`for (item_closes.items) |*list| list.deinit(allocator); item_closes.deinit(allocator);`)
+  is still armed for the rest of the function — an `errdefer` doesn't get cancelled by an unrelated plain
+  statement running past it. If either `try items.toOwnedSlice(allocator)` (line 183) or `try
+  next_history.toOwnedSlice(allocator)` (line 184) fails with `OutOfMemory`, the unwind fires that
+  errdefer, which dereferences `item_closes.items` while `item_closes` is `undefined` — UB (in practice a
+  crash or worse, not a clean panic). This is exactly the defer/errdefer discipline the brief asked to be
+  checked hard, on a new module with a new ownership contract. It's narrow (only reachable on OOM in the
+  final two allocations) so `TEST_EXIT:0` under `std.testing.allocator`'s normal path doesn't catch it,
+  but it's real: a corrected `derive` cannot leave `item_closes`'s errdefer armed past the point that
+  manually deinits it. (Direction only, not mine to implement: either reset `item_closes = .empty;`
+  immediately after the manual deinit at line 179 so the errdefer's for-loop iterates a defined empty
+  slice, or fold the manual deinit and the errdefer into one `defer` that runs exactly once regardless of
+  path.)
+
+**Nits.**
+
+- `src/state.zig:151` — the out-of-range/invalid `cr.item` skip (`if (cr.item < 1 or cr.item >
+  item_closes.items.len) continue;`) has no test. This is the same "branch that does nothing is invisible
+  to review" shape the brief called out from section 4 — nothing currently pins that a stray or
+  out-of-range close is tolerated rather than causing an `@intCast` problem at line 152. Worth a
+  regression test (e.g. a `close` naming item `0` or an item number beyond any raised item) even though
+  section 4's write-boundary invariant means it can't occur in a log this tool wrote.
+- The "second close overrides the first" case (`state.zig:243`) and the "interleaved items and closes"
+  case (`state.zig:260`) are each real, but no single test combines them — every double-close in the
+  suite is sequential on an otherwise-uninterleaved item. The algorithm is provably correct for the
+  combination by construction (closes are accumulated per-item in a single forward pass, so
+  `closes[closes.len-1]` is always the chronologically-last close for that item regardless of what other
+  items' records fall between), so this isn't a correctness gap — but a combined test would be stronger,
+  more direct evidence per the brief's "genuinely exercised... not accidentally satisfied" instruction
+  than inferring it from two separate tests.
+
+**Architectural note — ❓ @architect.**
+
+- `src/state.zig:108–114`, `:151` — the worker's call to silently *skip* a close naming an out-of-range
+  item, rather than fault the way `5.2` faults a mismatched item number, isn't in the brief and sits in
+  tension with D14's "say so, don't paper over it" posture that `5.2` explicitly follows for the identical
+  class of concern ("a log this tool did not write, or a bug in this tool"). It's a defensible call — the
+  reasoning is documented in the doc comment, and section 4's write-boundary invariant makes it
+  unreachable for a log this tool wrote — but it's an asymmetry: one out-of-band-data case faults, the
+  adjacent one silently drops a record's effect on derived state with no diagnostic at all. Worth
+  confirming this is the intended posture before `5.4`'s status grid or section 6's `show --item` build on
+  top of it.
+
+**Everything else checked and clean:** `5.1`/`5.2`/`5.3` logic matches the brief and specs; `Item`/`State`
+ownership and lifetime are documented accurately against what the code actually does (borrowed
+`record.*Record` values, owned `closes`/`items`/`next_history` arrays, `deinit` frees exactly those three
+and nothing borrowed); no duplication of `record.zig`'s `validateSeqOrder`/`Diagnostics` pattern — `5.2`
+matches its shape rather than reinventing it; `main.zig`'s change is test-discovery only, well-commented,
+and doesn't wire the module into any command, matching the brief's explicit scope boundary; no ADR
+violations (no third-party deps, no persisted index, no filesystem access at all); tasks `5.1`–`5.3` in
+`tasks.md` are not yet ticked, correctly, pending this review.
+
+→ @worker
+
+**[architect]** **Ruling on the reviewer's ❓ — an out-of-range close is a fault, not a skip. Change it
+(`src/state.zig:151`).**
+
+The reviewer is right that the asymmetry is undocumented, and the resolution goes the other way from the
+one the code chose: `5.1` should fault where `5.2` faults, not skip.
+
+**`work-items` supplies the reasoning verbatim, and it is a reasoning about faults, not about writes.**
+The spec justifies refusing a close that names a non-existent item like this: *"a mistyped identifier
+produces a close record that closes nothing, while the item it was meant to close stays open forever and
+nothing anywhere reports a fault."* A silent skip in the fold **reproduces that exact condition on the
+read side** — the close closes nothing, the item derives as open forever, and nothing reports a fault.
+The spec's own rationale for the write-side refusal argues just as directly for faulting here.
+
+**And the doc comment at `src/state.zig:108–114` undermines its own case.** It argues the skip is safe
+because section 4 guarantees every stored close names an item that exists — which establishes that the
+branch is **unreachable for any log this tool wrote**. An unreachable branch that silently produces a
+wrong answer if ever reached is precisely what `## NEXT` records as section 4's expensive lesson: the one
+correctness bug that survived three block reviews *lived in the branch that does nothing*. Twice now the
+real defects have been found by driving behaviour rather than reading code. This is the same shape, caught
+early, and the cheap fix is to make the branch say something.
+
+**Both are checks on *this tool*, not repair paths — same class, so same treatment.** `5.2`'s assertion
+was never scoped to item numbering as a matter of principle; it was scoped that way because item numbering
+was the task in front of it. A close naming an item that does not exist means the same two things a
+mismatched number means: either a log this tool did not write, or a bug in this tool. D14 says say so.
+
+**What to implement.** Replace the `continue` at `src/state.zig:151` with a `Diagnostics` fault and a
+sibling error to `error.ItemNumberMismatch` — `error.CloseTargetMissing` or similar; name it as you see
+fit. Note the check is currently against `item_closes.items.len`, the items seen **so far**, which means
+it also catches a close naming an item that appears *later* in the log. That is correct and should also
+fault: in an append-only log a close can never precede the item it closes. Word the diagnostic so it is
+true of both cases — name the close's `seq`, the item number it asks for, and how many item records
+precede it — rather than claiming a total that a single pass has not yet counted.
+
+**[architect]** **Findings to fix — block 5A, back to @worker.** Reviewer's blocker and both nits, plus
+the ruling above.
+
+1. **Blocker — the armed `errdefer` over `undefined` memory (`src/state.zig:126–130`, `:179`).** Confirmed
+   by reading it: `item_closes.deinit(allocator)` at `:179` sets the list to `undefined`, and the
+   `errdefer` at `:127–130` is still armed across the two `toOwnedSlice` calls at `:183–184`. An OOM there
+   unwinds into iterating `item_closes.items` on undefined memory. Fix the discipline, not the symptom —
+   restructure so the cleanup that is live is the cleanup that is registered, rather than relying on the
+   reader to notice that a plain statement silently retired an `errdefer` that is still in scope.
+2. **The ruling above** — `:151` faults instead of skipping, with a test that fails if the branch is
+   deleted.
+3. **Nit — combine double-close with interleaving in one test.** Each is covered separately today.
+   Correctness follows by construction from per-item accumulation, which is exactly why a fixture that
+   exercises both at once is worth having: it is the case where "by construction" would stop being true
+   without any single existing test noticing.
+
+Nit 1 in the reviewer's post (the untested out-of-range skip) is dissolved by the ruling — the branch
+stops being a silent skip and becomes a fault that must be tested.
+
+Gates again on return (`make gates`, quote every `LABEL_EXIT:<n>`, count the tests), then `→ @reviewer`
+for a re-audit. Still no commit and no ticks.
+
+**[worker]** **Block 5A findings addressed.**
+
+1. **Blocker — errdefer discipline (`src/state.zig`).** Restructured rather than patched: `item_closes`'s
+   cleanup is now a single unconditional `defer` registered once, right after its declaration, with no
+   second manual `deinit` call anywhere else in the function. It relies on a real Zig 0.16 property, not a
+   reader's vigilance: `ArrayList(T).toOwnedSlice` resets the list to `.empty` on success (unlike `deinit`,
+   which sets it to `undefined`), so by the time the assembly loop has drained every inner list via
+   `toOwnedSlice`, deiniting them again in the trailing `defer` is a no-op — there is exactly one cleanup
+   path for `item_closes`, live on every return, not two that must be kept in sync. While in there I also
+   closed a related leak the same restructuring exposed: the old `return .{ .items = try
+   items.toOwnedSlice(...), .next_history = try next_history.toOwnedSlice(...) }` had no way to free the
+   first field's already-owned slice if the second `try` failed. Split into `items_slice`/`next_slice`
+   locals with `items_slice` covered by its own `errdefer` closes that gap too.
+2. **`:151` now faults — `error.CloseTargetMissing`.** Added to `DeriveError`. Diagnostic: `"close at seq
+   {d} names item #{d}, but only {d} item record(s) precede it"` — states only what the single forward pass
+   has counted, per the ruling, and is worded to be true of both an out-of-range number and a close naming
+   an item that hasn't appeared yet. Doc comment at `:108–118` rewritten to argue the fault instead of the
+   skip. Two new tests, each of which fails if the branch is reverted to `continue`: one out-of-range
+   (`close` naming item `#5` when only 1 item exists), one forward-reference (`close` naming item `#2`
+   before either item record has appeared).
+3. **Nit — combined fixture.** Added a test interleaving two items' opens with a double-close on each,
+   confirming per-item accumulation holds under the combination rather than only under each case alone.
+
+`BUILD_EXIT:0 TEST_EXIT:0 FORMAT_EXIT:0 VALIDATE_EXIT:0 GATES_EXIT:0`. Test count: 168
+(`record.zig` 22 + `log.zig` 31 + `body.zig` 12 + `main.zig` 92 + `state.zig` 11), counted via `grep -c
+'^test "'` just now.
+
+→ @reviewer
+
+**[reviewer]** **Block 5A (`5.1`–`5.3`) re-audit — Approve.**
+
+Re-ran the gates independently: `BUILD_EXIT:0 TEST_EXIT:0 FORMAT_EXIT:0 VALIDATE_EXIT:0 GATES_EXIT:0`
+(`make gates`). Counted tests myself rather than trusting the report: `grep -c '^test "'` gives
+`record.zig` 22, `log.zig` 31, `body.zig` 12, `main.zig` 92, `state.zig` 11 — 168 total, matching.
+
+**Finding 1 — the `errdefer`-over-`undefined` blocker is fixed, and I did not take the worker's account
+of Zig 0.16 on trust.** Checked the actual installed stdlib (`~/.zvm/0.16.0/lib/std/array_list.zig`), not
+memory:
+- Unmanaged `ArrayList(T).deinit` (`:623–626`) does `gpa.free(...); self.* = undefined;` — confirms the
+  original hazard's premise.
+- Unmanaged `ArrayList(T).toOwnedSlice` (`:654–665`): on the `remap`-succeeds path it does `self.* =
+  .empty;` (`:657`); on the fallback path (`remap` fails) it does `try gpa.alignedAlloc(...)` then
+  `self.clearAndFree(gpa)` (`:663`), which sets `items.len = 0; capacity = 0` — not literally `.empty`
+  (`items.ptr` is left pointing at now-freed memory rather than `&.{}`), but `len == 0` gates every
+  subsequent access, so it's safe for a later no-op `deinit` exactly as `.empty` is. **On failure**
+  (`alignedAlloc` returns `error.OutOfMemory`), neither branch has run — `self` is untouched, still fully
+  valid with its original items intact. Both halves of the worker's claim hold: success leaves the list in
+  a state where a second `deinit` is a no-op, and failure leaves it valid and unchanged. (`src/state.zig`
+  doc comment at `:130–136` says "resets to `.empty`" for the success case, which is precisely true of the
+  `remap` branch and only approximately true of the `clearAndFree` branch — a nit below, not a correctness
+  problem, since the two are behaviourally equivalent for every caller here.)
+- Traced every `try` in `derive` (`src/state.zig:122–215`) against what's live and what's registered at
+  that point: the top-level `defer` on `item_closes` (`:138–141`) now fires exactly once, at actual
+  function exit on every path, with no earlier manual `deinit` anywhere else in the function — the
+  structural cause of the original bug (a plain statement silently retiring an `errdefer` still in scope)
+  is gone, not patched around. The per-iteration `errdefer allocator.free(closes)` (`:190`) is scoped to
+  that iteration's block per Zig's ordinary `for`-body scoping and cannot leak into a later iteration or
+  survive the loop — a materially different (and correct) shape from the original bug, not a relocation of
+  it. The `items_slice`/`errdefer` split (`:203–207`) closes the second leak (an unfreed first field if the
+  second `toOwnedSlice` fails) exactly as reported. I additionally reverted `:168–173`'s fault to a bare
+  `continue` in a scratch copy and ran `zig build test`: `TEST_EXIT` output showed 2 failures — a leak
+  report from `DebugAllocator` (`array_list.zig:661`, i.e., an unreachable-code path that stopped removing
+  the item) and `error.TestExpectedError` (`error.CloseTargetMissing` expected, got a derived `State`
+  instead) — confirming the restructuring doesn't hide a leak *or* silently swallow the fault it's meant to
+  surface; reverted the check without reverting the `defer` restructuring, so this exercised finding 1's
+  fix path specifically. No leak, no double free, no use of `undefined` memory on any path I traced.
+
+**Finding 2 — the architect's ruling is correctly implemented.** `error.CloseTargetMissing`
+(`src/state.zig:85`) replaces the `continue` at the old `:151`; the check at `:168` now covers both the
+out-of-range case and the forward-reference case with one comparison (`cr.item < 1 or cr.item >
+item_closes.items.len`), as the ruling asked. Diagnostic wording (`:170–171`) states only the count of item
+records seen in the single forward pass so far — never a log-wide total — so it's true of both cases: an
+out-of-range item and a close naming an item that hasn't appeared yet. Verified both new tests have power,
+not just presence: reverting `:168–173` to `continue` (see above) makes both
+`"a close naming an item outside the range seen so far..."` (`:346–358`) and `"a close naming an item that
+appears later in the log..."` (`:360–373`) fail — the first via a leak assertion the allocator itself
+raises, the second via `expectError` no longer seeing an error at all. Neither test would silently pass if
+the fault branch were deleted.
+
+**Finding 3 — the combined nit is discharged.** `"a double close on one item survives interleaving with
+another item's records"` (`src/state.zig:311–344`) exercises a double-close on item 1 *and* item 2, with
+item 3's opening and the other item's closes interleaved between them, and asserts the final state and the
+full `closes` ordering for both items plus item 3 staying open. Ran under the real gates as part of
+`TEST_EXIT:0` (11/11 in `state.zig`, 168/168 overall) — genuinely exercises the combination the prior round
+only inferred from two separate tests.
+
+**Nothing else regressed.** `5.1`/`5.2`/`5.3` logic, tests, and derivation semantics unchanged from what was
+already clean in the first pass; `Item`/`State` ownership and lifetime doc comments (`:29–83`) still
+describe exactly what the code does (borrowed `record.*Record` values, owned `closes`/`items`/
+`next_history`, `State.deinit` freeing exactly those three); zero filesystem-access tokens in `state.zig`
+(`grep -nE 'Io\.|File\.|Dir\.|std\.fs|\.open\(|Lock'` — no hits); `src/main.zig`'s diff (`git diff HEAD --
+src/main.zig`) is still the same test-discovery-only `_ = @import("state.zig");` inside the aggregator,
+well-commented, nothing wired into any command; `Makefile` and `build.zig.zon` untouched by this diff;
+`tasks.md` `5.1`–`5.3` still unticked, correctly, pending this verdict.
+
+**Nit (documentation precision only, not a correctness issue).** `src/state.zig:130–136` — the comment
+says `toOwnedSlice` "resets to `.empty`" on success; that's exact for the `remap`-succeeds branch and only
+functionally (not literally) true for the `clearAndFree` fallback branch, where `items.ptr` is left
+pointing at freed memory rather than `&.{}` even though `len`/`capacity` both land at `0`. Harmless — every
+caller here is gated by `len == 0` — but worth a word ("effectively empty" or similar) if the comment is
+touched again, so it doesn't read as a stronger stdlib guarantee than actually holds.
+
+**Verdict: Approve.** → @architect
+
+**[architect]** **Block 5A landed** — `5.1`, `5.2`, `5.3` ticked, one commit. Gates re-run by me, not
+taken from the reports: `BUILD_EXIT:0`, `TEST_EXIT:0`, `FORMAT_EXIT:0`, `VALIDATE_EXIT:0`,
+`GATES_EXIT:0`. **168** tests, **11** of them in `src/state.zig` — counted, not quoted.
+
+**Two rounds, one blocker, and both of the round-one defects were in error paths no test could reach.**
+The armed `errdefer` over `undefined` memory and the leaked `items_slice` in the struct-literal `return`
+are both `OutOfMemory`-only, so a green `TEST_EXIT:0` said nothing about either. That is a third instance
+of this change's recurring shape — the defect lives where nothing runs. It is worth noting what caught it
+this time: **reading the code with ownership as the question**, not driving the binary, which is what
+found the previous two. Neither method subsumes the other, and `9.1` will not cover this class.
+
+**The re-audit's method is the part worth keeping.** The fix rested on a claim about Zig 0.16's
+`toOwnedSlice`, and the reviewer checked it against the installed stdlib source rather than memory, then
+reverted the fault branch to `continue` **in a scratch copy outside the tracked tree** and re-ran the
+tests to confirm both new tests actually fail without it. Test *power* was the whole point of the ruling,
+and that is the only way to demonstrate it rather than assert it. Adopt it wherever a test is supposed to
+pin a refusal.
+
+**Carried item 15, for `5.4`/`5.5` or whoever next touches the comment** — `src/state.zig:130–136` says
+`toOwnedSlice` "resets to `.empty`" on success. Exact for the `remap` branch; on the `clearAndFree`
+fallback `items.ptr` is left pointing at freed memory with `len`/`capacity` both `0`. Harmless here — every
+caller is gated on `len == 0` — but it reads as a stronger stdlib guarantee than holds. Not worth a commit
+of its own.
+
+→ `5B` (`5.4`–`5.6`) next: the verdict fold, the indexes, and the determinism / closure-isolation tests.
+
 ## NEXT
 
 **[architect]** **Section 4 is CLOSED** — supervisor `Approve` on the second pass, after one remediation

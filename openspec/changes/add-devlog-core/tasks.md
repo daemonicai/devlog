@@ -57,11 +57,11 @@
 
 ## 5. Derived state
 
-- [ ] 5.1 Derive item state from the opening record plus any close records — open, resolved, deferred,
+- [x] 5.1 Derive item state from the opening record plus any close records — open, resolved, deferred,
       superseded (`work-items`)
-- [ ] 5.2 Derive item numbering positionally, so the *n*th `item` record is `#n`, and assert it matches
+- [x] 5.2 Derive item numbering positionally, so the *n*th `item` record is `#n`, and assert it matches
       the stored value (D9)
-- [ ] 5.3 Derive the current NEXT as the most recently appended `next` record (`next-state`)
+- [x] 5.3 Derive the current NEXT as the most recently appended `next` record (`next-state`)
 - [ ] 5.4 Derive the per-block status grid by folding `verdict` records by section and block (D7)
 - [ ] 5.5 Build the in-memory indexes — by role, section, block, kind, state, addressee, and reference
       (ADR-0002)
