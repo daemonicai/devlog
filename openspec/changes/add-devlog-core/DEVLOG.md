@@ -6440,6 +6440,101 @@ it became dischargeable, which is what an append-only thread is for.
 
 **Sections 1–4 are now fully ticked with no outstanding human-in-the-loop items.**
 
+## 5. Derived state
+
+**[architect]** Base: `270a680` — everything the tool reports is folded from the records already in the
+log: item state, positional item numbering, the current NEXT, the per-block status grid, and the indexes
+the read commands will query.
+
+**[architect]** **Section 5 is carved into two blocks.**
+
+- **5A — `5.1`–`5.3`**: the derivation core. Item state from opening record plus closes, positional item
+  numbering asserted against the stored value, and the current NEXT.
+- **5B — `5.4`–`5.6`**: the verdict fold (status grid), the index set, and the determinism / closure-
+  isolation tests over the whole derivation.
+
+**Section 5 adds no file I/O, and that is a scope boundary, not an omission.** Everything here is a pure
+fold over `[]const record.Record` as `record.parseLog` already produces it. The read-only load path — open
+without creating, no lock — belongs to **section 6**, where `6.6` ("never create it silently") actually
+requires it.
+
+**Two carried items are re-homed to section 6 as a result.** `## NEXT` sends carried item **10**
+(`durable-format`'s "a read ignores a temporary file" scenario has no task) to "`5.x`'s brief", on the
+reading that read commands are section 5. They are not — they are section 6 (`6.1`–`6.6`). That scenario
+is about a *read opening a path*, so it has no surface in a pure fold and cannot be discharged here. It
+and carried item **13** (`openLocked`'s read-and-parse being duplicated by a read path that must not
+create the log) are both section 6's, and `6.6` is their home. Recorded so the next brief does not have to
+rediscover it.
+
+**[architect]** **Brief — block 5A (`5.1`, `5.2`, `5.3`) → @worker.**
+
+**Tasks.**
+
+- `5.1` Derive item state from the opening record plus any close records — open, resolved, deferred,
+  superseded (`work-items`).
+- `5.2` Derive item numbering positionally, so the *n*th `item` record is `#n`, and assert it matches the
+  stored value (D9).
+- `5.3` Derive the current NEXT as the most recently appended `next` record (`next-state`).
+
+**Shape.** A new module — `src/state.zig` — whose entry point takes an allocator and `[]const
+record.Record` in file order and returns a derived view. It performs **no filesystem access whatsoever**:
+no open, no stat, no temp file, nothing. `main.zig` is not wired to it in this block; `5.4`–`5.6` extend
+the same module and section 6 consumes it. Borrow slices from the records where you can rather than
+duplicating strings — the caller owns the `ParsedLog` for the derivation's lifetime — and say so in the
+type's doc comment, because that lifetime coupling is the thing a later caller will get wrong.
+
+**`5.1` — item state.** From `work-items`: *"An item's state SHALL be derived from its opening record
+together with any close records, and SHALL be one of: open, resolved, deferred, or superseded."* An item
+with no close is **open**; otherwise its state is the `state` of the **last** close record naming it, in
+log order. `work-items` is explicit that closing an already-closed item is **not** an error — *"an item
+closed as deferred and later resolved is an ordinary sequence rather than an error. Which closure is
+current is a question about deriving state, answered by the ordering the log already carries"*. So a
+second close is not a fault to report; it is the answer. Keep every close attached to its item, in order,
+not just the winning one — `work-items`' *"who closed it, when, and why are all recoverable"* is a
+requirement about the derived view, and section 6's `show --item` is what will read it.
+
+**`5.2` — positional numbering.** D9: *"Numbering is derivable — the nth `item` record is `#n` — so a
+rebuild reproduces identical numbers with no counter to persist. It is stored explicitly regardless, so
+the file stays self-describing."* Derive positionally and **assert** the stored `ItemRecord.item` equals
+the derived ordinal. On mismatch, **report a fault and refuse to derive** — a `Diagnostics` message and an
+error, in the manner `record.validateSeqOrder` already handles a broken `seq`, which is the precedent to
+follow rather than invent past. Do **not** repair, renumber, or prefer one over the other. Section 4
+established that every stored item number was assigned positionally under the lock, so a mismatch means
+either a log this tool did not write or a bug in this tool — and D14's no-repair-path posture says the
+answer to both is to say so, not to paper over it.
+
+**`5.3` — current NEXT.** `next-state`: *"The most recently appended NEXT SHALL be the current one"* and
+*"it receives the most recently appended one and no other"*. Retain **all** `next` records in order as
+well as naming the current one — the same spec requires *"every NEXT ever recorded is available in
+order"* for the history scenario. Retaining the ordered list and pointing at its last element satisfies
+both with one structure; deriving only the winner throws away what the sibling scenario needs and section
+6 would have to re-derive.
+
+**Three write-boundary invariants section 4 established that you may rely on** — every stored `role` and
+every stored `to` names a role declared in the latest `header`; every stored `close` names an item that
+exists; every stored item number is the positional one, assigned under the lock. **And one you must
+not:** none of these hold for a hand-written log — only for one this tool wrote. That is exactly why
+`5.2` asserts rather than assumes, and it is the reason the assertion is a check on *this tool* rather
+than a repair path.
+
+**Binding decisions and prior art to read before starting.** D9 (item identifiers), D8 (`brief` is a
+record kind; what `resume` returns — it is section 6's, but it tells you what the derived view must make
+reachable), D14 (append-only, no repair path), ADR-0002 (no database — the index is built in memory per
+invocation and persisted nowhere). In `src/record.zig`: `Record`, `Kind`, `ItemRecord`, `CloseRecord`,
+`NextRecord`, `Attributed`, `ParsedLog`, and `validateSeqOrder`/`Diagnostics` as the fault-reporting
+pattern to match.
+
+**Tests.** Derivation is pure, so test it directly on record literals — no filesystem fixtures needed.
+Cover at minimum: an item with no close is open; each of resolved / deferred / superseded; a second close
+overriding the first, in log order; interleaved items and closes so ordering is genuinely exercised
+rather than accidentally satisfied; positional numbering across a log where `item` records are separated
+by other kinds; the mismatch fault reported rather than repaired; no `next` record at all; and one `next`
+superseding another with the history retained.
+
+**Done-gates.** `make gates` → `GATES_EXIT:0`, and quote the individual `LABEL_EXIT:<n>` lines in your
+report — do not describe the output. Report the test **count**, counted rather than quoted from a previous
+post. Then `→ @reviewer`. Do not commit and do not tick anything.
+
 ## NEXT
 
 **[architect]** **Section 4 is CLOSED** — supervisor `Approve` on the second pass, after one remediation
