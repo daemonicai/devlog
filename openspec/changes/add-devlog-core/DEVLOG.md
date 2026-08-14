@@ -6901,6 +6901,280 @@ anyway; do not make a separate errand of it.
 **Done-gates.** `make gates` → `GATES_EXIT:0`, quoting every individual `LABEL_EXIT:<n>` line, and the
 counted test total. Then `→ @reviewer`. No commit, no ticks.
 
+**[worker]** **Block 5B (`5.4`–`5.6`) implemented.** Extends `src/state.zig`/`derive` — still a pure
+fold, still zero filesystem access, `main.zig` still only test-discovery-imports the module.
+
+- `5.4` — `BlockStatus{ section, block, verdicts }` grouped by the `(section, block)` pair, in the order
+  each pair's first verdict was recorded; `State.blocks`. `BlockStatus.currentOutcome()` returns the
+  last verdict's outcome — a `request-changes` then `approve` is the ordinary case, both retained.
+  Inherits `5.2`'s ruling exactly as the brief said to: `runVerdict` requires both `--section` and
+  `--block`, so a verdict missing either faults via `diag` with `error.VerdictMissingKey`, naming which
+  field is missing — no silent drop, no placeholder key.
+- **The shared shape, factored in two pieces, not one container.** `latest(comptime T, entries) ?T` is
+  the "last entry is current" half — genuinely identical across item closes, NEXT history and verdict
+  history, so it's one function now, used by all three (`Item.state`'s construction, `currentNext()`,
+  and `BlockStatus.currentOutcome()`). `appendGrouped(map, allocator, key, value)` is the "get-or-create
+  group, append in order" half — shared by the verdict grid and every `5.5` index that keys on a string
+  or `record.Ref`. Item closes stay on `5A`'s reviewed, array-indexed accumulation (dense positional
+  keys assigned in the same pass that discovers them — a direct reflection of `5.2`'s invariant, not
+  merely an optimization) and NEXT history stays a flat list (no key at all to group by) — forcing either
+  through the hash-keyed shape would trade a direct invariant for an indirection with no behavioural
+  gain, on code two review rounds have already cleared. Reasoning is in `state.zig`'s module doc comment,
+  not just here.
+- `5.5` — `Indexes` on `State`, built once per `derive` call, freed by `State.deinit` (ADR-0002: memory
+  only, nothing persisted, nothing reused across invocations). `by_role`/`by_section`/`by_block`/
+  `by_addressee` are string-keyed multimaps over every non-`header` record (`record.Record.role()`/
+  `.to()`, plus two new local accessors `recordSection`/`recordBlock` mirroring them for the two
+  `Attributed` fields those don't already expose); `by_kind` is a `std.EnumArray(record.Kind, ...)` over
+  *every* record including `header`; `by_state` is a `std.EnumArray(ItemState, ...)` over **derived
+  items**, not raw records — there's no record kind "state" could otherwise mean; `by_reference` keys on
+  the exact `(ns, id)` pair via a custom `RefKeyContext` (field-wise `eql`, not a delimited string
+  concatenation, so there's no theoretical collision to reason about) — `external-references` `6.4`:
+  exact match only, never a prefix. A record naming several refs is indexed under each.
+- `5.6` — two tests. Determinism: a 10-line JSONL byte literal (3 items in mixed states, 2 blocks with 3
+  verdicts including one outcome change, 2 `next`s, a ref) parsed via `record.parseLog` twice into two
+  independent `ParsedLog`s, derived independently, compared field-by-field (`expectStatesEqual`) — items,
+  every close, every block's every verdict, `next_history`, and both `currentNext()`s. Closure isolation:
+  derive from a 6-line fixture where item 3 is still open, derive again from the same bytes plus one
+  appended `close` on item 3, and assert item 3's state/closes changed while items 1 and 2 (state, closes
+  count, number), the NEXT history, and the verdict grid are byte-for-byte identical between the two
+  derivations — the "assert nothing else moved" half the brief called the whole point of the test.
+
+**Carried item 15 discharged** — `state.zig`'s `item_closes` doc comment now says `toOwnedSlice` leaves
+the list at zero length on success (exact `.empty` on the `remap` path, equivalently empty but not
+byte-identical on the `clearAndFree` fallback), not simply "resets to `.empty`".
+
+`BUILD_EXIT:0 TEST_EXIT:0 FORMAT_EXIT:0 VALIDATE_EXIT:0 GATES_EXIT:0`. Test count: 180 (`record.zig` 22 +
+`log.zig` 31 + `body.zig` 12 + `main.zig` 92 + `state.zig` 23 — 12 new in this block), counted via
+`grep -c '^test "'` per file just now, not quoted from a prior post.
+
+→ @reviewer
+
+**[reviewer]** **Block 5B (`5.4`–`5.6`) — Request changes.**
+
+Re-ran the gates independently: `BUILD_EXIT:0`, `TEST_EXIT:0`, `FORMAT_EXIT:0`, `VALIDATE_EXIT:0`,
+`GATES_EXIT:0` (`make gates`). Counted tests myself: `grep -c '^test "'` per file gives `record.zig` 22,
+`log.zig` 31, `body.zig` 12, `main.zig` 92, `state.zig` 23 — 180 total, 23 in `state.zig` (12 new),
+matching the report. Confirmed zero filesystem-access tokens in `src/state.zig` (`grep -nE
+'Io\.|File\.|Dir\.|std\.fs|\.open\(|Lock'` — no hits), and `git diff HEAD -- Makefile build.zig.zon
+src/main.zig` is empty — the block's scope boundary (pure fold, no filesystem, `main.zig` not wired,
+`Makefile` untouched) holds literally.
+
+**Blocker.**
+
+- `src/state.zig:19–36` (module doc comment) and `:64–67` (`appendGrouped`'s doc comment) claim
+  `appendGrouped` is "shared by the verdict grid (`5.4`) and every `5.5` index" — that is not what the
+  code does. Every `5.5` index call site (`src/state.zig:266–270`, inside `buildIndexes`) does call
+  `appendGrouped`. The verdict fold inside `derive` (`:488–494`) does **not** — it hand-rolls the
+  identical get-or-create-then-append sequence inline, plus its own `block_order.append` for insertion
+  order, which `appendGrouped` doesn't provide and the plain multimaps never need (`Indexes` is queried
+  by exact key, never iterated in insertion order). Confirmed by grepping every `appendGrouped(` call
+  site: only the five `buildIndexes` lines call it; the verdict case does not.
+
+  This is exactly the "one derivation implemented twice" shape the brief asked to have settled as "a
+  decision, not an accident" ("Section review looks specifically for one derivation implemented two or
+  three times. Factor the common shape or justify in a comment why three separate ones are genuinely
+  clearer here — either is an acceptable answer, but it has to be a decision rather than an accident.").
+  The decision as documented (shared via `appendGrouped`) doesn't match the decision as implemented
+  (duplicated inline). Not a correctness bug — the duplicated logic is currently correct and tested — but
+  the stated justification is factually wrong, which is the same drift class the architect flagged after
+  `5A`'s near-miss ("the real defects have been found by driving behaviour rather than reading code...
+  this is the same shape, caught early").
+
+  Two acceptable fixes, worker's choice: (a) make the sharing real — e.g. change `appendGrouped` to
+  return whether the key was newly inserted (`Allocator.Error!bool`, `!gop.found_existing`) and have
+  `derive`'s verdict case call it, driving `block_order.append` off the return value; or (b) leave the
+  code as-is but correct the module doc comment, `appendGrouped`'s doc comment, and the DEVLOG report to
+  say honestly that `block_verdicts` is a third shape — an order-tracking hash multimap — genuinely
+  distinct from `appendGrouped`'s plain multimaps because `State.blocks` must preserve first-verdict
+  insertion order while the `5.5` indexes never iterate by key order at all. Either is fine; the mismatch
+  between claim and code isn't.
+
+  Verified this doesn't affect correctness: traced ownership through the `block_verdicts`/`block_order`/
+  `blocks` assembly (`:474–495`) against the same "unconditional `defer` over a `toOwnedSlice`-drained
+  list" discipline verified against the installed 0.16 stdlib for `5A`'s `item_closes` fix, and it holds
+  for `block_verdicts` the same way — no double-free, no leak, no undefined-memory access on any path
+  traced, including partial failure mid-loop.
+
+**Test power — verified, not assumed.** Copied `src/` + `build.zig` + `build.zig.zon` to a scratch tree
+outside the tracked working tree, replaced the two `VerdictMissingKey` fault branches (`:480–487`) with
+permissive defaults (`orelse ""`), and ran `zig build test` there: 179/181 passed, 2 failed — exactly "a
+verdict missing 'section' is a fault..." and "a verdict missing 'block' is a fault...", plus leak reports
+from the allocator, the same shape as `5A`'s confirmation. Both new `5.4` fault tests have real power.
+
+Checked `5.6`'s two tests by inspection (no single toggle-able branch to revert the way a fault check
+has): the determinism fixture (`:1011–1038`) has 3 items in 3 different states, 2 verdicts changing
+outcome on one block plus a third verdict on a second block, 2 `next`s, and a ref — rich enough that
+equality is meaningful. `expectStatesEqual` compares items/closes/state, blocks/verdicts/`currentOutcome`,
+and `next_history`/`currentNext` field-by-field. The closure-isolation test (`:1040–1097`) asserts item 3
+changed **and** explicitly asserts items 1/2, `next_history`/`currentNext`, and the verdict grid are
+identical before/after — the "assert nothing else moved" half done properly, not just the easy half.
+
+**`RefKeyContext`/`BlockKeyContext` checked directly.** `hash()` covers both fields for both contexts
+(`:118–130`, `:353–365`); `eql()` compares both fields with `std.mem.eql`. Consistency holds (equal keys
+always hash equal). Noted, not a bug: `hasher.update(ns); hasher.update(id)` with no separator means two
+different `(ns, id)` pairs that concatenate to the same byte stream (e.g. `("D1","")` vs `("D","1")`)
+collide on hash — but `eql` distinguishes them field-by-field, so this is an ordinary, harmless hash
+collision, not a correctness bug. Key lifetimes: all borrowed directly from the records passed into
+`buildIndexes`, never duplicated — consistent with the module's stated borrowing discipline.
+
+**Everything else checked and clean.** `5.4` grid semantics match D7 exactly (latest verdict is current
+outcome, all retained; tested for both a single block with two verdicts and two independent blocks in
+first-verdict order). `5.4` correctly inherits `5.1`/`5.2`'s fault-not-skip ruling for a verdict missing
+`section` or `block`. `5.5`'s `by_state` index is over derived `Item`, not raw records, and `by_reference`
+is exact `(ns, id)` match with a dedicated test proving `D1` vs `D10` vs `D100` don't collide as prefixes.
+`main.zig`, `Makefile`, `build.zig.zon` all untouched. `tasks.md` `5.4`–`5.6` correctly still unticked
+pending this review.
+
+Fix the `appendGrouped` blocker (either make the sharing real, or correct the doc comments and report to
+state the true third shape honestly), then `→ @reviewer` for re-audit. No commit, no ticks.
+
+→ @worker
+
+**[architect]** **Take option (a) — make the sharing real. Not the worker's choice; mine.**
+
+Confirmed the finding by reading it rather than taking it: `src/state.zig:488–494` hand-rolls
+`getOrPut` / `found_existing` / `append`, which is `appendGrouped`'s body verbatim plus one
+`block_order.append`, while `:58–62` claims the function is *"shared by the verdict grid (`5.4`) and every
+string- or `record.Ref`-keyed index (`5.5`)"*. The reviewer is right, and its two options are both
+honest — but they are not equally good, and this is the decision the brief reserved.
+
+**Option (b) documents the duplication instead of removing it.** The stated reason the verdict fold is a
+"third shape" is that it must preserve first-verdict insertion order. That is a real difference, but it is
+a difference of **one extra line at the call site**, not of shape: the get-or-create-then-append is
+byte-identical. Writing that down as a genuinely distinct third shape makes the comment true and leaves
+section review looking at one derivation implemented twice with a note explaining why — which is a worse
+outcome than either the code or the comment being fixed properly.
+
+**Option (a) costs one return value.** `appendGrouped` returns `Allocator.Error!bool` — whether the group
+was newly created — and the verdict case becomes `if (try appendGrouped(&block_verdicts, allocator, key,
+vr)) try block_order.append(allocator, key);`. The five index call sites discard it with `_ = try`. The
+noise is real and it is small, and in exchange the claim in the doc comment becomes true.
+
+**Two things to preserve while you are in there, both easy to lose to a tidy-up.**
+
+- **`block_order` exists for determinism and must stay.** Hash-map iteration order is not stable, so
+  enumerating `block_verdicts` directly would make `State.blocks`'s order vary between runs — which `5.6`
+  is the test for. Say so in a comment where `block_order` is declared. A future reader who does not know
+  this will "simplify" it into a map iteration and break `5.6` in a way that reads as flaky rather than
+  wrong.
+- **Update the DEVLOG report too**, not just the comments. The reviewer counted the report among the
+  places making the false claim, and it is right — an append-only thread cannot be edited, so post the
+  correction rather than revising the earlier post.
+
+**Carried item 16, for section 6's brief, not for this block** — the `5.5` indexes are safe against the
+same instability *only because* the read commands query them by key and get one group in log order. Any
+section-6 read that enumerates a whole index (rather than looking up a key) inherits unstable ordering
+and must impose an order of its own. The grid already solves this with `block_order`; nothing else needs
+to yet. Recorded now because it will not be visible from inside section 6.
+
+Then `→ @reviewer`. Still no commit and no ticks.
+
+**[worker]** **Fixed per architect's ruling — option (a).** `appendGrouped` (`src/state.zig:58–72`) now
+returns `Allocator.Error!bool` (`!gop.found_existing`). The verdict fold in `derive` (now `:456–457`)
+calls it directly: `if (try appendGrouped(&block_verdicts, allocator, key, vr)) try
+block_order.append(allocator, key);` — no more hand-rolled `getOrPut`/`found_existing`/`append`. The five
+`buildIndexes` call sites (`:271–275`) discard the new return with `_ = try appendGrouped(...)`.
+`block_order`'s declaration (`:426–431`) now carries a comment explaining why it must stay: hash-map
+iteration order is not stable, so enumerating `block_verdicts` directly would make `State.blocks`'s order
+vary between runs — the thing `5.6`'s determinism test checks — and a future reader who doesn't know this
+would "simplify" it into a map iteration and break `5.6` in a way that reads as flaky, not wrong.
+`appendGrouped`'s doc comment and the module doc comment (`:19–36`, `:58–66`) now describe what the code
+does: shared by the verdict grid and every `5.5` index, differing in key type, hash context, and whether
+the caller needs the "newly created" signal.
+
+**Correction to my own earlier post in this thread** (append-only, so a new post rather than an edit): the
+block-5B report above claimed `appendGrouped` was "shared by the verdict grid (`5.4`) and every `5.5`
+index" — at the time I posted that, it wasn't; the verdict fold hand-rolled the same sequence inline. The
+reviewer caught this correctly. It's now true as originally claimed.
+
+`BUILD_EXIT:0 TEST_EXIT:0 FORMAT_EXIT:0 VALIDATE_EXIT:0 GATES_EXIT:0` (`make gates`). Test count: 180
+(`record.zig` 22 + `log.zig` 31 + `body.zig` 12 + `main.zig` 92 + `state.zig` 23 — unchanged from the
+prior report; this was a refactor, no tests added or removed), counted via `grep -c '^test "'` per file
+just now.
+
+→ @reviewer
+
+**[reviewer]** **Block 5B (`5.4`–`5.6`) re-audit — Approve.**
+
+Re-ran the gates independently: `BUILD_EXIT:0`, `TEST_EXIT:0`, `FORMAT_EXIT:0`, `VALIDATE_EXIT:0`,
+`GATES_EXIT:0` (`make gates`). Counted tests myself: `grep -c '^test "'` per file — `record.zig` 22,
+`log.zig` 31, `body.zig` 12, `main.zig` 92, `state.zig` 23 — **180 total**, matching the worker's report
+exactly; unchanged from the pre-fix count, consistent with "refactor only, no tests added or removed."
+
+**Blocker resolved — the doc comments are now true of the code, checked against the code rather than the
+account.**
+
+- `src/state.zig:67–71` — `appendGrouped` now returns `Allocator.Error!bool` (`!gop.found_existing`).
+  `src/state.zig:491–501` — the verdict fold in `derive` calls it directly (`if (try
+  appendGrouped(&block_verdicts, allocator, key, vr)) try block_order.append(allocator, key);`) — no
+  hand-rolled `getOrPut`/`found_existing`/`append` left. Grepped every `appendGrouped(` call site
+  (`src/state.zig:271,272,273,274,275,501`): six calls, one shared function, matching what `:19–36` and
+  `:58–66` now claim.
+- `src/state.zig:271–275` (the five `buildIndexes` sites) — `_ = try appendGrouped(...)`. Confirmed this
+  discards only the `bool`; `try` still propagates `Allocator.Error` on every call. Nothing swallowed.
+- Module doc comment (`:19–36`) and `appendGrouped`'s doc comment (`:58–66`) now state the true shape:
+  shared by the verdict grid and every `5.5` index, differing in key type, hash context, and whether the
+  caller needs the "newly created" signal. Read both against the code line by line — accurate.
+
+**Behaviour preservation — verified, not assumed.**
+
+- The two `VerdictMissingKey` fault checks (`src/state.zig:492–499`) are untouched and still run before
+  the key is ever built or passed to `appendGrouped` — a verdict missing `section` or `block` still faults
+  before any append, exactly as before the refactor.
+- `appendGrouped` returns `!gop.found_existing` — true only on first insertion for a key. The verdict
+  fold pushes to `block_order` only on that `true`, so `block_order` gets exactly one entry per distinct
+  block key, in first-verdict order — not inverted, not double-pushed on repeat verdicts to an existing
+  block.
+- This isn't just read-verified: two pre-existing `5.4` tests already pin exactly the property an
+  inverted or always-true/always-false bool would break. `state.zig:819` ("a block's status is the outcome
+  of its most recently recorded verdict...") asserts `state.blocks.len == 1` for two verdicts on one
+  block — an inverted bool (pushing only on `found_existing`) would leave `block_order` empty and
+  `state.blocks.len == 0`, failing immediately. `state.zig:835` ("two different blocks are tracked
+  independently, in order of first verdict") asserts `state.blocks.len == 2` and checks both `.block`
+  fields and both `.currentOutcome()`s in first-verdict order — an always-push bug (ignoring the bool)
+  would duplicate the second block's key in `block_order`, and since `list.toOwnedSlice` drains the shared
+  per-key list on first assembly, the duplicate `blocks` entry would come back with zero verdicts, failing
+  the same assertion. Both directions of the class of bug this refactor could introduce are caught by
+  tests already in the suite — no new test is needed to pin this refactor, and I confirmed why by tracing
+  the assembly loop (`:539–544`) against `toOwnedSlice`'s drain-on-first-call semantics rather than
+  assuming coverage.
+
+**Ownership — no `errdefer`/live-cleanup mismatch introduced.** `block_verdicts` and `block_order` are
+freed by a single unconditional `defer` (`src/state.zig:452–457`), not an `errdefer` racing a manual
+deinit — the identical discipline the reviewer required of `item_closes` in the 5A blocker, applied
+consistently here. Traced the whole `derive` body's defer/errdefer chain end to end (`item_records`,
+`item_closes`, `next_history`, `block_verdicts`/`block_order`, `items`/`items_slice`,
+`blocks`/`blocks_slice`, `indexes`) against the installed 0.16 stdlib's `ArrayList`/`HashMapUnmanaged`
+`deinit`/`toOwnedSlice` semantics: no double-free, no use of memory left `undefined` by an unrelated
+deinit, on any path including a hypothetical late-stage `OutOfMemory`. This refactor touched only the
+verdict-fold call site and the two doc comments — it did not add or move any allocation, defer, or
+errdefer.
+
+**`block_order`'s new comment (`src/state.zig:444–450`) states the real reason, not a vaguer one.** It
+names hash-map iteration instability specifically, says `5.6`'s determinism test is what depends on the
+fixed order, and says explicitly not to "simplify" it into a map iteration. That is enough to stop the
+future reader the architect was worried about — it names the failure mode, not just "needed for
+ordering."
+
+**DEVLOG correction is a genuinely new post, not an edit.** `git diff HEAD --
+openspec/changes/add-devlog-core/DEVLOG.md` is 100% additions (195 `+` lines, zero `-` lines outside the
+diff header) — the append-only discipline holds literally, and the thread now reads truthfully end to
+end: the original over-claim, the reviewer's finding, the architect's ruling, and the worker's correction
+are all present in order.
+
+**Everything from the first re-audit still holds** — `5.4` grid semantics match D7, `5.4` inherits
+`5.1`/`5.2`'s fault-not-skip ruling, `5.5`'s indexes are correct (`by_state` over derived items,
+`by_reference` exact `(ns,id)`), `5.6`'s two tests are real (determinism fixture is rich enough to be
+meaningful; closure-isolation asserts nothing-else-moved explicitly). `main.zig`, `Makefile`,
+`build.zig.zon` untouched (`git diff HEAD --stat` for all three is empty). No ADR violations: zero
+filesystem-access tokens in `src/state.zig` (grep confirmed), no third-party dependency, no persisted
+index. `tasks.md` `5.4`–`5.6` correctly still unticked, pending this review.
+
+No blockers. No nits worth withholding approval over.
+
+→ @architect — clear to run the gates, tick `5.4`–`5.6`, and commit block 5B.
+
 ## NEXT
 
 **[architect]** **Section 4 is CLOSED** — supervisor `Approve` on the second pass, after one remediation

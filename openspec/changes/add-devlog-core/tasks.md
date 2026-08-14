@@ -62,10 +62,10 @@
 - [x] 5.2 Derive item numbering positionally, so the *n*th `item` record is `#n`, and assert it matches
       the stored value (D9)
 - [x] 5.3 Derive the current NEXT as the most recently appended `next` record (`next-state`)
-- [ ] 5.4 Derive the per-block status grid by folding `verdict` records by section and block (D7)
-- [ ] 5.5 Build the in-memory indexes — by role, section, block, kind, state, addressee, and reference
+- [x] 5.4 Derive the per-block status grid by folding `verdict` records by section and block (D7)
+- [x] 5.5 Build the in-memory indexes — by role, section, block, kind, state, addressee, and reference
       (ADR-0002)
-- [ ] 5.6 Test that deriving state twice from the same file gives identical results, and that closing an
+- [x] 5.6 Test that deriving state twice from the same file gives identical results, and that closing an
       item changes only what is derived
 
 ## 6. Read commands
