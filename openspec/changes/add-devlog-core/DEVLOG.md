@@ -6831,6 +6831,76 @@ of its own.
 
 → `5B` (`5.4`–`5.6`) next: the verdict fold, the indexes, and the determinism / closure-isolation tests.
 
+**[architect]** **Brief — block 5B (`5.4`, `5.5`, `5.6`) → @worker.**
+
+**Tasks.**
+
+- `5.4` Derive the per-block status grid by folding `verdict` records by section and block (D7).
+- `5.5` Build the in-memory indexes — by role, section, block, kind, state, addressee, and reference
+  (ADR-0002).
+- `5.6` Test that deriving state twice from the same file gives identical results, and that closing an
+  item changes only what is derived.
+
+**Shape.** Extend `src/state.zig` and its existing `derive`. Same constraints as 5A, unchanged: a **pure
+fold** over `[]const record.Record` in file order, **no filesystem access of any kind**, `main.zig` still
+not wired to it. Section 6 does the wiring.
+
+**`5.4` — the status grid.** D7: *"A `verdict` carries the block, an outcome (`approve`,
+`approve-with-nits`, `request-changes`) and the commit. The per-block status grid is then a fold over
+verdict records rather than the largest hand-maintained table in `NEXT`."* Key by the pair
+(`common.section`, `common.block`). The **latest** verdict for a block is its current status, and every
+verdict for that block is retained in order — a block that went `request-changes` then `approve` is the
+ordinary case, and both are part of the record.
+
+**`5.4` inherits 5A's ruling, and you should not have to ask.** `VerdictRecord`'s `section` and `block`
+live on `Attributed`, where both are `?[]const u8`. `runVerdict` (`src/main.zig:1147–1148`) requires both,
+so every verdict this tool wrote has both — the identical invariant class as "every stored close names an
+item that exists". Therefore: a `verdict` missing `section` or `block` **faults** with a `Diagnostics`
+message and an error, exactly as an out-of-range close now does. Do not silently drop it from the grid,
+and do not invent a placeholder key. The reasoning is in the architect's ruling above; this is the same
+ruling applied to the same shape.
+
+**Three folds, one shape — build it once.** You now have item closes (5.1), NEXT history (5.3) and
+verdict history (5.4): all three are "group records by a key, keep them in log order, and name the last
+one as current". Section review looks specifically for one derivation implemented two or three times.
+Factor the common shape or justify in a comment why three separate ones are genuinely clearer here —
+either is an acceptable answer, but it has to be a decision rather than an accident.
+
+**`5.5` — the indexes.** By role, section, block, kind, state, addressee, and reference. Notes on the two
+that are not what they first look like:
+
+- **`state`** is *item* state from `5.1`, so that index is over derived items, not over all records.
+- **`reference`** keys on `Attributed.refs` (`record.Ref`, `ns:id`). `6.4` requires *"exact match only,
+  never a prefix"*, so key on the exact `ns:id` pair. A record carrying several refs belongs under each.
+
+ADR-0002 is binding and specific here: the index is built **in memory, per invocation, and persisted
+nowhere**. No cache file, no serialisation, no reuse across runs. These indexes exist to serve section
+6's read commands and section 7's search — build what those need to be fast without ingesting the log,
+and nothing speculative beyond that.
+
+**`5.6` — the two tests, and how to write the first one without a file.** *"Deriving state twice from the
+same file gives identical results"* is a determinism requirement, not an I/O one: satisfy it by running
+`record.parseLog` over the **same byte literal** twice and deriving from each, then asserting the two
+derived views are equal field by field. That exercises parse-and-derive end to end, which is the real
+content of the requirement, and keeps section 5's no-filesystem boundary intact. Compare deeply — two
+runs that both produce empty results are equal and prove nothing, so the fixture must be rich enough to
+be worth comparing: several items in mixed states, verdicts across two blocks including one that changed
+outcome, more than one `next`, and refs.
+
+*"Closing an item changes only what is derived"* is the `next-state` requirement that the presentation
+*"SHALL NOT be capable of drifting from the actual state of the items"*. Derive from a fixture, append a
+`close` record to it, derive again, and assert precisely: that item's state and closes changed, and
+**nothing else did** — not the other items, not the NEXT history, not the grid, not the item numbering.
+The assertion that nothing else moved is the whole test; an assertion that the closed item changed is the
+easy half.
+
+**Carried item 15 applies if you touch `src/state.zig:130–136`** — the comment claims `toOwnedSlice`
+"resets to `.empty`", which is exact only for the `remap` branch. Fix the wording if you are in there
+anyway; do not make a separate errand of it.
+
+**Done-gates.** `make gates` → `GATES_EXIT:0`, quoting every individual `LABEL_EXIT:<n>` line, and the
+counted test total. Then `→ @reviewer`. No commit, no ticks.
+
 ## NEXT
 
 **[architect]** **Section 4 is CLOSED** — supervisor `Approve` on the second pass, after one remediation
