@@ -6275,7 +6275,199 @@ creep into the architectural notes the brief explicitly parked in `## NEXT`.
 
 → @architect
 
+---
+
+**[supervisor]** **Section 4 review, round two — `Approve`.**
+
+Same scope, `git diff b59f249..HEAD`, now nine commits (`ca9fddc` … `c895f23`). Gates re-run by me:
+
+```
+BUILD_EXIT:0
+TEST_EXIT:0
+FORMAT_EXIT:0
+VALIDATE_EXIT:0
+GATES_EXIT:0
+```
+
+`grep -c '^test "' src/*.zig` → `body.zig` 12, `log.zig` 31, `main.zig` 92, `record.zig` 22 = **157**
+named, counted not quoted; 158 run, the +1 being `main.zig`'s anonymous aggregator as in every prior
+block. `tasks.md` is byte-identical to `e8b6fdb` — the remediation ticked nothing, as briefed — and `3.2`
+is the only unticked box in sections 1–4.
+
+### All three blockers are closed, and I checked them against the binary rather than the diff
+
+**B1 — closed, and closed structurally.** `takes_positional` (`src/main.zig:544-547`) is read through
+`findCommand(command_hint)`, so the exemption is a property, not a name. The new branch
+(`src/main.zig:610-616`) sets `unexpected_argument` through the same `setFault`/`reportFault` path as the
+other five fault kinds, so it inherits A6's first-fault-wins and the parse-fault-beats-`--help`
+precedence rather than sitting beside them.
+
+I went looking for the mirror-image defect — the over-broad refusal — because that is what a fix for an
+absent refusal risks, and the parser is nothing but bare tokens. It is not there. Against the built
+binary, on a header declaring a role literally named `post`:
+
+```
+post --role post --section post --block post --to architect   → exit 0   (values colliding with command names)
+section --role architect --section 4 --title post --base post → exit 0
+post --ref D:1 --ref S:2 --ref n:3                            → exit 0   (repeatable --ref)
+section --title "A long multi word title" --base a1b2c3       → exit 0
+post --help / --help / --version                              → exit 0
+search some query here / show 42 / list --whatever            → exit 1  "not implemented yet"
+```
+
+That last line is the one that matters: the exemption is inert rather than mis-wired, and no unbuilt
+command has acquired a new refusal. The reason no legitimate bare token can reach the branch is
+structural — `takeFlagValue` (`src/main.zig:454-461`) advances `i` past a flag's value inside the same
+iteration, and the command word is claimed by the strictly earlier `p.command == null` arm
+(`:606-607`) — so the only tokens left are genuinely stray ones. `!startsWithDash(arg)` at `:610` is
+redundant given `strict` (the `:608` arm already takes every dash-leading token), but harmless.
+
+All eight write commands now refuse a stray token with one message, and the two that motivated the
+finding are dead:
+
+```
+post stray-token                   → exit 1  unexpected argument 'stray-token'   log unchanged
+item --blocking true --type note   → exit 1  unexpected argument 'true'          log unchanged, no #1
+post --bogus                       → exit 1  unknown flag '--bogus'              unregressed
+```
+
+**B2 — closed, and `sameRoleSet` is genuine set equality.** You asked me to satisfy myself about the
+duplicate-bearing-header case specifically. `src/log.zig:379-388` is mutual containment over
+`containsString` (`:665-670`, plain `std.mem.eql` membership) with **no length comparison**, which is
+what makes it correct rather than merely sufficient: `sameRoleSet(["a","a"], ["a"])` → `true` (same set,
+the pre-fix header is recognised as unchanged), `sameRoleSet(["a","b"], ["a"])` → `false` on the `b` leg,
+`sameRoleSet(["a"], ["a","b"])` → `false` on the same leg. A length check would have made the first case
+wrong. Empty-vs-nonempty is right too, by the vacuous-then-failing pair. Confirmed end to end: reorder →
+`unchanged`, log stays one line; repeated `--role`/`--closer` → exit 1 naming the value, no file created
+at all, since `findDuplicate` (`src/main.zig:300-308`) fires before `appendHeader` and therefore before
+any I/O.
+
+**B3 — closed by amendment, and the amendments match the shipped code.** I read
+`specs/work-items/spec.md:46-55` and `:91-97` against `checkItemExists` (`src/log.zig:600-615`) and the
+closer check (`src/main.zig:767-770`) rather than against the ruling post: the item-existence refusal,
+the deliberate non-rule that a second close is accepted, and `closers ⊆ roles` are all now stated with
+scenarios, and all three say what the code does. `append-only-log/spec.md:45-51, 68-76` and D13's
+amendment likewise describe the set semantics that shipped, including that a duplicate is refused rather
+than deduplicated.
+
+### One new finding — a note, not a blocker, and I want to be explicit about why
+
+You asked whether there is a third instance of the B3 class. The closest thing I found is this:
+
+**`--change` is silently excluded from header identity.** `headerUnchanged` (`src/log.zig:453-457`)
+compares `tool`, `roles`, `closers` — never `change`. Against the built binary:
+
+```
+header --change c1 --role architect --role worker --closer architect          → created
+header --change TOTALLY-DIFFERENT --role architect --role worker --closer …   → unchanged, exit 0
+grep -o '"change":"[^"]*"' DEVLOG.jsonl                                        → "change":"c1"
+```
+
+An agent that names the wrong change is told `unchanged`, exits `0`, and is never informed that the log
+it just wrote to belongs to something else. That is the same *shape* as B1's axiom — a command line
+accepted without being fully accounted for — and it sits inside the exact function this remediation
+rewrote and the exact rule the spec amendment restated, with `4.10` being the box that put `--change` on
+a command line in the first place.
+
+**I am not making it a blocker, on three grounds.** `change` is provenance only — nothing in `src/`
+reads it back, and no section-5 or section-6 derivation is named on it, so unlike `checkItemExists` it
+carries no invariant forward. The behaviour is documented where it lives (`src/log.zig:434-437` states
+the identity triple explicitly), so this is silence rather than the code-and-document-disagree case D10
+was written for. And the tool has never shipped, so no log exists that could already be mislabelled.
+It wants a sentence in D13 saying `change` is stamped at creation and is not part of the declaration's
+identity — or a decision that a differing `--change` should be refused — and `8.4` cannot be written
+without one either way. `## NEXT`, and yours to rule on whenever it suits; I would not spend a third
+round on it.
+
+### Architectural notes — `## NEXT`
+
+Round one's five notes stand unchanged and I am not re-raising them; none became a blocker. Three to add:
+
+- **`takes_positional` is a boolean, so B1 reopens for `search` in 7.2 unless section 7 closes it.** A
+  command that takes *one* positional is exempted from *all* of them: `search a b c` will assign `a` and
+  drop `b` and `c` on the same silent path B1 just removed. Cheap to handle while writing `7.2`,
+  expensive to rediscover there. Naming it now is the whole point of having found B1 late.
+- **The parse-fault family has no home outside code comments.** Six variants now
+  (`src/main.zig:374-379`), and the property they collectively enforce — *the tool refuses any command
+  line it cannot fully account for, and writes nothing* — is this dispatcher's stated axiom
+  (`src/main.zig:1143-1150`) and appears in no spec, no design decision, and no README. `8.1`'s command
+  surface is the right home; this is a reminder that it must actually land there, not a finding against
+  this section, since the other five variants predate it.
+- **Three of the eight record kinds are named in no capability spec.** `section`, `brief`, and `verdict`
+  exist only in `design.md`'s Record schema table and D7/D8 — `append-only-log` never enumerates the
+  kinds, and the word `verdict` appears nowhere under `specs/`. That is adequate for `8.4`, which will be
+  written from the schema table, but it means the specs archived with this change will not describe a
+  third of the write surface. Worth a deliberate decision before archive rather than a discovery during
+  it.
+
+### What I re-checked across the whole section now that two commits exist
+
+The remediation touched `src/log.zig` and `src/main.zig` only; `build.zig.zon`, the `Makefile`, and
+`tasks.md` are untouched by both new commits. No new filesystem state — I drove all eight commands
+through the binary again into one directory and it contains exactly `DEVLOG.jsonl`. No rewrite,
+truncate, repair, or migrate path appeared. `stringSlicesEqual` is genuinely gone rather than orphaned,
+so the section ships no dead scaffolding from the superseded comparison. No test was weakened: the
+diff's only deletions are that function, a superseded comment, and the `search` spec line it replaced.
+ADR-0001, ADR-0002 and ADR-0003 hold by sum across all nine commits, not merely per block.
+
+Section 4 is coherent as one design, its spec requirements hold end to end, and the two blockers that
+were code are fixed at the structural level rather than patched. Closed.
+
+→ @architect — `3.2` is excluded from this verdict as before; it is the Product Owner's.
+
 ## NEXT
+
+**[architect]** **Section 4 is CLOSED** — supervisor `Approve` on the second pass, after one remediation
+round. Base was `b59f249`.
+
+Landed: `d131498` (4A, `4.3`/`4.8`/`4.10`/`4.11`), `96df34c` (4B, `4.1`/`4.2`/`4.7`), `e8ccf41` (the
+Product Owner's addressee-validation amendment, mid-section), `e8b6fdb` (4C, `4.4`–`4.6`/`4.9`), `c95ebfd`
+(rulings and the B3 amendments), `c895f23` (remediation, ticks nothing). Gates `GATES_EXIT:0`, **157**
+named tests / **158** run — counted, not quoted. All eleven boxes ticked.
+
+**Sections 1–4 have exactly one unticked box: `3.2`.** Still the Product Owner's real-terminal check,
+handed over during 4A and unanswered. The recipe is in 4A's worker post. It ticks on their word.
+
+**Section 5 is next** — derived state (`5.1`–`5.6`). It needs no new I/O: everything it derives is already
+in the log, and section 4 established the write-side invariants it may rely on. Read `## 4.`'s decisions
+A1–A6 before briefing it; several are load-bearing for what section 5 is allowed to assume.
+
+**Three invariants section 4 established at the write boundary that section 5 may rely on — and one it
+must not.** May: every stored `role` and every stored `to` names a declared role; every stored `close`
+names an item that exists; every stored item number is the positional one, assigned under the lock. Must
+not: **none of these hold for a hand-written log**, only for one this tool wrote. `5.2` asserting stored
+item numbers match derived ones is therefore a check on *this tool*, not a repair path — and `durable-
+format`'s "a read ignores a temporary file" scenario still has no task, which `5.x`'s brief should fix
+(carried item 10).
+
+**For section 7, before `search` is designed — `7.2` reopens B1 unless it is handled.** `takes_positional`
+is a **boolean**, so `search a b c` will silently drop `b` and `c`: the exact silent-acceptance defect the
+section-4 supervisor found and the remediation fixed, reintroduced by the mechanism that fixed it. Either
+`search` takes exactly one positional and refuses a second, or the property becomes a count/arity rather
+than a flag. Decide it in `7.2`'s brief, not in its review.
+
+**Three things bound for section 8, all of them "the archived specs do not describe the tool":**
+
+- **`section`, `brief` and `verdict` are named in no capability spec at all** — they exist only in
+  `design.md`'s schema table and D7/D8. A third of the write surface would archive undescribed. `8.4` is
+  the backstop, but this is worth a spec delta rather than prose.
+- **The six-variant parse-fault family lives only in code comments.** `8.1` is where the command surface's
+  failure modes must be written down.
+- **`headerUnchanged` excludes `change` from header identity** (`src/log.zig:453-457`) — verified against
+  the binary: `--change TOTALLY-DIFFERENT` against an existing log reports `unchanged` and stores the old
+  value. The supervisor found this in round two and deliberately did **not** block on it: `change` is
+  provenance only, nothing in `src/` reads it back, no derivation depends on it, and the identity triple is
+  documented at `src/log.zig:434-437`, so this is silence rather than a document disagreeing with code. It
+  wants one sentence in D13 before `8.4`. **I agree it is not worth a third round.**
+
+**What section 4 actually taught, worth more than any single finding:** its one correctness bug (`post
+stray-token` exiting `0` and writing a record) was invisible to three block reviews — one of which
+byte-diffed the parser's test suite — because **no test pinned the behaviour and the defect lived in the
+branch that does nothing.** An absent refusal has no line to review. Both of this section's real bugs (that
+one, and 4A's `Io.Dir.cwd()` panic) were found by driving the built binary end to end, not by reading code.
+That is now twice. **`9.1` is not merely a validation task — it is the only automated mechanism this
+project has that would catch either class**, and it should be briefed as such rather than as a replay
+exercise.
 
 **[architect]** **Section 3 is CLOSED** — supervisor `Approve` on the second pass, after one remediation
 round. Base was `5d2e805`.
@@ -6292,27 +6484,14 @@ and is read exactly when the obligation becomes dischargeable, which this block 
 retroactively, inside section 4's timeline.** It is not an unfinished section-3 task, and `CLAUDE.md §1.4`
 should not re-open section 3 over it on a cold start.
 
-**Section 4's first write block must settle three things the section-3 supervisor named. All three are
-already-known consequences, not discoveries to be made again:**
-
-- **C1 — failure reporting has three shapes, not two.** `Diagnostics.message` is a plain string;
-  `writeRefusalMessage` is writer-based; and `error.InvalidUtf8` from D14's check has **no message at all**
-  and names no field, because `validateStrings`/`write` take no `diag`. The spec now promises "refused
-  with a clear message" and nothing can currently produce one. Correct for section 3 — `write` is a pure
-  codec that prints nothing — but the brief must settle all three together. Shape: a
-  `refusalMessage(err) []const u8`, plus a decision on whether `write` gains a `diag`.
-- **C2 — refusals must precede any filesystem effect.** `openLocked` creates the log (`log.zig:162`), so a
-  refusal *after* it leaves a zero-byte `DEVLOG.jsonl` and breaks 1.5. Unreachable in the finished tool
-  (4.11 forces a header first) and pre-existing rather than introduced — but this is the **second**
-  instance of the same seam. So: `readBody` before `openLocked`, and `devlog header` never calls
-  `readBody` at all, since `HeaderRecord` has no body.
-- **C4 — for 8.4:** the spec scopes the UTF-8 `SHALL` to `body`, while the code validates **every** string
-  field. They agree through "never write a record it cannot read back", but the record-format
-  specification must carry the field-level breadth explicitly, or a reimplementer validates `body` alone
-  and reintroduces B1 through `--to`.
-
-**C3 (nit)** — neither `writeRefusalMessage` test (`body.zig:291–307`) asserts the *absence* of the
-`devlog: ` prefix; both would still pass if it were re-added. One assertion pins it.
+**C1, C2 and C3 were settled by section 4** — C1 as decision A4 (two message shapes, `fail()` the single
+printer, `record.write` gaining a `diag`), C2 as A2/A3 (a non-header write never creates the log; refusals
+precede filesystem effect), C3 in 4A's nit pass. **C4 is still open and still owed to `8.4`:** the spec
+scopes the UTF-8 `SHALL` to `body`, while the code validates **every** string field. They agree through
+"never write a record it cannot read back", but the record-format specification must carry the field-level
+breadth explicitly, or a reimplementer validates `body` alone and reintroduces the invalid-UTF-8 hazard
+through `--to`. Section 4's supervisor confirmed the breadth is correctly implemented — `title`, `base`,
+`commit` and `header`'s own strings are all covered — so what remains is purely the writing-down.
 
 **Two workflow facts worth knowing before trusting the enforcement, both discovered this session:**
 
@@ -6345,17 +6524,11 @@ the body as bytes already. What it adds is the terminal check, the empty-body re
 round-trip test. **D5 is what it is briefed against, and D5 was amended this section** — read it as it now
 stands, not as remembered.
 
-**For section 4's first brief — the one thing that must not be rediscovered:**
-
-- **N1 — section 4 cannot satisfy `4.5` and `4.11` through section 2's API.** Both need the latest header's
-  `roles`/`closers` *at write time*. `appendRecord` (`src/log.zig:425`) is the only thing holding the lock
-  and the parsed log, and exposes neither — `latestHeader` is private (`:364`), the return is a bare `u64`.
-  Validating before the call means a second unlocked parse per write command: a TOCTOU window against a
-  concurrent `devlog header`, plus the per-command index duplication this project exists to avoid. Shape:
-  either `appendRecord` takes the role check, or `openLocked` gains a public variant returning the parsed
-  log and latest header under the lock. Deliberately not fixed in section 2, which would have been
-  guessing.
-- `tasks.md:52`'s `--role` overload and the `--change` vs `--log` naming, per carried item 3 below.
+**N1 was settled by section 4 as decision A1** — `appendRecord` performs the role check itself, under the
+lock, rather than `openLocked` exposing the parsed log to `main.zig`; the alternative would have exported
+lock lifetime to every future call site. It later grew the addressee and item-existence checks for free,
+which is the evidence the shape was right. The section-4 remediation consolidated both public write paths
+onto one `appendLocked`, so the check cannot come to exist on one path and not the other.
 
 **Standing rule, learned the expensive way this section — sweep repo-wide when a decision amends an
 invariant.** One `durable-format` amendment left **seven** restatements of the retired absolute across
@@ -6383,12 +6556,14 @@ empty. This session produced three false all-clears from too-narrow greps, one o
    it. Product Owner confirmed `architect` is the sole closer across their projects and that the agents
    know it as "the orchestrator"; the fix was to stop `worker.md:65` prescribing a hardcoded role check.
    Upstream `dmons` scaffold is theirs, separately. See the section 2 post.
-3. **`tasks.md:52`'s `--role` overload is concrete, not latent** — the dispatcher rejects a repeat while
-   4.10 needs it repeatable. Carry the resolution into 4.10's brief; the dispatcher will need genuine
-   command-scoped arity, not a relaxed check. Settle `--change` vs `--log` naming there too.
-4. **`Parsed.isAmbiguous()`** — four ordered `if`s at `src/main.zig:185–203` whose correctness rests on
-   comment discipline. Four conditions have now landed correctly by care, not structure. Section 2 adds
-   none; **4.8's `--ref ns:id` check is the forcing move.**
+3. ~~`tasks.md:52`'s `--role` overload.~~ **CLOSED in section 4 (A5).** The dispatcher gained genuine
+   command-scoped flag arity via a two-phase parse, so `header`'s `--role` is repeatable while every other
+   command's is exactly-once. `--change` and `--log` both kept: different things, both needed, and
+   `header --help` says which is which.
+4. ~~`Parsed.isAmbiguous()`'s four ordered `if`s.~~ **CLOSED in section 4 (A6).** Replaced by a single
+   `?ParseFault` set once, first-fault-wins encoded in one place. It has since absorbed two further fault
+   kinds — `--ref` malformation and the remediation's `unexpected_argument` — without an ordering
+   decision at either call site, which is the evidence the structure was the fix rather than more care.
 5. **For 8.5** — `zig build test -Dversion=X` fails, because the override makes `build_options.version` and
    `manifest.version` disagree and the test reads it as skew. 8.5 is where the override is meant to be used.
 6. **Diagnostic nit** — `--role "" --role x` reports "requires a non-empty value" rather than "given more
