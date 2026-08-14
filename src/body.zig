@@ -116,30 +116,36 @@ fn isBlank(bytes: []const u8) bool {
     return true;
 }
 
-/// Writes the user-facing message for a `readBody` refusal to `w` — no
-/// `devlog: ` prefix, and no trailing newline. Owning the prefix and the
-/// newline (and the exit code) belongs to one place, `main.zig`'s
-/// `fail()`, not here: before this fix, this function *and* every
-/// `main.zig` call site each carried their own `devlog: `, so a body
-/// refusal printed `devlog: devlog: refusing…` (supervisor finding N-a,
-/// section 3 remediation). A caller composes this message with `fail()`
-/// the same way it would `record.Diagnostics.message`, which has never
-/// carried a prefix either. Kept here, next to the errors it explains,
-/// rather than duplicated in every section 4 command that calls
-/// `readBody`.
+/// The user-facing message for a `readBody` refusal — no `devlog: `
+/// prefix, no trailing newline. A pure `fn(err) []const u8` (A4,
+/// architect ruling, DEVLOG `## 4`): every one of these messages is
+/// static, known entirely from the error value, so there is no reason
+/// for this to own a writer the way a dynamic message (one that must name
+/// a field, a role, or a path — see `record.Diagnostics`) does. Renamed
+/// from `writeRefusalMessage`, which wrote through an `Io.Writer` for no
+/// dynamic content it ever produced.
+///
+/// Owning the `devlog: ` prefix and the trailing newline (and the exit
+/// code) belongs to one place, `main.zig`'s `fail()`, not here: before a
+/// section-3 fix, this function *and* every `main.zig` call site each
+/// carried their own `devlog: `, so a body refusal printed
+/// `devlog: devlog: refusing…` (supervisor finding N-a). A caller
+/// composes this message with `fail()` the same way it would
+/// `record.Diagnostics.message`, which has never carried a prefix
+/// either. Kept here, next to the errors it explains, rather than
+/// duplicated in every section 4 command that calls `readBody`.
 ///
 /// The terminal message names the real fix — file redirection — because
 /// the caller is an agent that needs to know what to do, not just that
 /// it was wrong (architect ruling, DEVLOG ## 3).
-pub fn writeRefusalMessage(w: *Io.Writer, err: ReadBodyError) void {
-    switch (err) {
-        error.StdinIsTerminal => w.print(
-            "refusing to read a body from a terminal — redirect it from a file instead, e.g. `devlog post ... < body.md`",
-            .{},
-        ) catch {},
-        error.EmptyBody => w.print("refusing an empty body", .{}) catch {},
-        else => w.print("failed to read body from stdin: {s}", .{@errorName(err)}) catch {},
-    }
+pub fn refusalMessage(err: ReadBodyError) []const u8 {
+    return switch (err) {
+        error.StdinIsTerminal => "refusing to read a body from a terminal — redirect it from a file instead, e.g. `devlog post ... < body.md`",
+        error.EmptyBody => "refusing an empty body",
+        error.ReadFailed => "failed to read body from stdin",
+        error.OutOfMemory => "out of memory while reading body from stdin",
+        error.Canceled => "reading body from stdin was canceled",
+    };
 }
 
 // --- Tests -----------------------------------------------------------------
@@ -288,22 +294,21 @@ test "readBody does not trim, translate, or otherwise touch a real body's bytes"
     }
 }
 
-test "writeRefusalMessage for a terminal points at file redirection, naming the real fix" {
-    var out: Io.Writer.Allocating = .init(testing.allocator);
-    defer out.deinit();
-
-    writeRefusalMessage(&out.writer, error.StdinIsTerminal);
-    const msg = out.written();
+test "refusalMessage for a terminal points at file redirection, naming the real fix, with no devlog: prefix (C3)" {
+    const msg = refusalMessage(error.StdinIsTerminal);
     try testing.expect(std.mem.indexOf(u8, msg, "< body.md") != null);
     try testing.expect(std.mem.indexOf(u8, msg, "redirect") != null);
+    // C3 (section-3 supervisor nit): pin the *absence* of the prefix, not
+    // just the content — main.zig's fail() owns it, and a re-added
+    // prefix here would silently double it without either assertion
+    // above objecting.
+    try testing.expect(!std.mem.startsWith(u8, msg, "devlog: "));
 }
 
-test "writeRefusalMessage for an empty body says so plainly" {
-    var out: Io.Writer.Allocating = .init(testing.allocator);
-    defer out.deinit();
-
-    writeRefusalMessage(&out.writer, error.EmptyBody);
-    try testing.expect(std.mem.indexOf(u8, out.written(), "empty") != null);
+test "refusalMessage for an empty body says so plainly, with no devlog: prefix (C3)" {
+    const msg = refusalMessage(error.EmptyBody);
+    try testing.expect(std.mem.indexOf(u8, msg, "empty") != null);
+    try testing.expect(!std.mem.startsWith(u8, msg, "devlog: "));
 }
 
 test "3.4: a body round-trips unchanged through the full read-then-write-then-read path" {

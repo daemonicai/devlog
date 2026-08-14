@@ -6,12 +6,8 @@ const std = @import("std");
 const build_options = @import("build_options");
 const manifest = @import("manifest");
 const Io = std.Io;
+const Allocator = std.mem.Allocator;
 
-// The record model and its JSON codec (block 2A), the locked-append I/O
-// layer (block 2B), and the stdin body reader (block 3.1-3.4) have no
-// consumer yet in this dispatcher — sections 4/6/7 wire them in.
-// Referenced here only so `zig build test` discovers their tests; no
-// production logic reaches any of them yet.
 const record = @import("record.zig");
 const log = @import("log.zig");
 const body = @import("body.zig");
@@ -22,22 +18,71 @@ test {
 }
 
 /// One subcommand of the surface. `section` names the `tasks.md` section
-/// that owns its real behaviour, so the placeholder help below never
-/// invents a promise this block doesn't keep.
+/// that owns its real behaviour. `usage`, when set, is the command's real
+/// `--help` body (block 4A: `header`, `post`); commands without one still
+/// get the honest "not yet implemented" placeholder rather than an
+/// invented promise.
 const CommandSpec = struct {
     name: []const u8,
     summary: []const u8,
     section: []const u8,
+    usage: ?[]const u8 = null,
 };
+
+const header_usage =
+    \\USAGE
+    \\    devlog --log <path> header --change <name> --role <r> [--role <r> ...]
+    \\        --closer <r> [--closer <r> ...]
+    \\
+    \\Declares the project's role set (D13). Creates the log if it does not
+    \\exist yet; appends a new header when the tool version or the
+    \\declaration differs from the latest header already in the log;
+    \\writes nothing at all when neither differs.
+    \\
+    \\FLAGS
+    \\    --change <name>  The change this log belongs to, stored on the
+    \\                     header record. Required, exactly once.
+    \\    --role <r>       A role this project's workflow has. Repeatable;
+    \\                     at least one required.
+    \\    --closer <r>     A role allowed to close a work item (the
+    \\                     `work-items` guardrail — self-declared, not
+    \\                     enforced). Repeatable; at least one required,
+    \\                     and every value must also be given as --role.
+    \\
+    \\`--log <path>` (above the command) is the file this invocation
+    \\operates on; `--change <name>` is the change's own slug, stored
+    \\inside the header record it writes. They name different things.
+    \\
+    \\Takes no body: never reads stdin.
+;
+
+const post_usage =
+    \\USAGE
+    \\    devlog --log <path> --role <role> post [--section <s>] [--block <b>]
+    \\        [--to <role>] [--ref <ns:id> ...] < body.md
+    \\
+    \\Posts general working-channel traffic: the fields every attributed
+    \\record kind shares, plus a body, nothing else.
+    \\
+    \\FLAGS
+    \\    --section <s>   The tasks.md section this post concerns. Optional.
+    \\    --block <b>     The task range this post concerns. Optional.
+    \\    --to <role>     The addressed role. Optional.
+    \\    --ref <ns:id>   A structured external reference. Repeatable,
+    \\                    unvalidated — any namespace is accepted.
+    \\
+    \\The body is read verbatim from stdin — never a flag, never a
+    \\heredoc. Redirect it from a file: `devlog ... post < body.md`.
+;
 
 /// Names only, from sections 4, 6 and 7 of the change's `tasks.md`. This
 /// block dispatches to them and gives each a `--help`; their behaviour is
-/// those sections' to build.
+/// those sections' to build. `header` and `post` are real as of block 4A.
 const commands = [_]CommandSpec{
-    .{ .name = "header", .summary = "Declare the project's role set, creating the log or appending a new header.", .section = "4" },
+    .{ .name = "header", .summary = "Declare the project's role set, creating the log or appending a new header.", .section = "4", .usage = header_usage },
     .{ .name = "section", .summary = "Open a section and record its base commit.", .section = "4" },
     .{ .name = "brief", .summary = "Post the architect's block brief to a worker.", .section = "4" },
-    .{ .name = "post", .summary = "Post general working-channel traffic.", .section = "4" },
+    .{ .name = "post", .summary = "Post general working-channel traffic.", .section = "4", .usage = post_usage },
     .{ .name = "item", .summary = "Raise a work item and print its identifier.", .section = "4" },
     .{ .name = "close", .summary = "Close a work item with a reason (declared closers only).", .section = "4" },
     .{ .name = "verdict", .summary = "Record a typed review verdict for a block.", .section = "4" },
@@ -60,8 +105,8 @@ const commands = [_]CommandSpec{
 /// remediation — section 1's `## NEXT` had already flagged the missing
 /// mechanism as N3, before either shape existed). `record.Diagnostics`'s
 /// own messages already carry no prefix, so this is what every one of
-/// them — `Diagnostics.message`, a `writeRefusalMessage` result, or a
-/// plain literal — should be printed through, uniformly.
+/// them — `Diagnostics.message`, `body.refusalMessage`'s result, or a
+/// plain literal — should be printed through, uniformly (A4).
 fn fail(stderr: *Io.Writer, comptime fmt: []const u8, args: anytype) u8 {
     stderr.print("devlog: " ++ fmt ++ "\n", args) catch {};
     return 1;
@@ -74,24 +119,203 @@ fn findCommand(name: []const u8) ?CommandSpec {
     return null;
 }
 
-/// Result of a single hand-rolled pass over argv (ADR-0002: no third-party
-/// parser). Errors are recorded rather than acted on immediately, so that
-/// `--help` and `--version` — which must never fail — can still win when
-/// they appear anywhere in a malformed invocation.
+fn containsStr(haystack: []const []const u8, needle: []const u8) bool {
+    for (haystack) |s| {
+        if (std.mem.eql(u8, s, needle)) return true;
+    }
+    return false;
+}
+
+fn startsWithDash(s: []const u8) bool {
+    return std.mem.startsWith(u8, s, "-");
+}
+
+fn startsWithDoubleDash(s: []const u8) bool {
+    return std.mem.startsWith(u8, s, "--");
+}
+
+/// Flag names that consume the following argv token as a value,
+/// regardless of which command eventually owns them (a superset across
+/// every command this block builds) — used only by `findCommandToken` to
+/// avoid mistaking a flag's value for the command token, never to
+/// validate a flag itself. A command a later block adds is that block's
+/// problem, not this pre-scan's.
+const value_taking_flags = [_][]const u8{
+    "--log", "--role", "--change", "--closer", "--section", "--block", "--to", "--ref",
+};
+
+fn isValueTakingFlag(name: []const u8) bool {
+    for (value_taking_flags) |f| {
+        if (std.mem.eql(u8, f, name)) return true;
+    }
+    return false;
+}
+
+/// Phase 1 of the two-phase parse (A5, carried item 3): locates the bare
+/// command token, if any, without validating a single flag. Its only
+/// consumer is `parseArgs`, which needs to know *which command's flag
+/// spec* it is parsing against before it parses a single flag — most
+/// concretely, whether `--role` is `header`'s repeatable declaration or
+/// every other command's exactly-once attribution, since that can no
+/// longer be a single global rule (`tasks.md:52`'s overload). Mirrors
+/// phase 2's own "does the next token look like a flag" rule when
+/// deciding whether to skip a recognised flag's value, so the two phases
+/// never disagree about where the command token sits.
+fn findCommandToken(args: []const [:0]const u8) ?[]const u8 {
+    var i: usize = 0;
+    while (i < args.len) : (i += 1) {
+        const arg: []const u8 = args[i];
+        if (startsWithDash(arg)) {
+            if (isValueTakingFlag(arg) and i + 1 < args.len and !startsWithDoubleDash(args[i + 1])) {
+                i += 1;
+            }
+            continue;
+        }
+        return arg;
+    }
+    return null;
+}
+
+/// The first parse-time ambiguity found in argv, if any (A6, `## NEXT`
+/// carried item 4): one tagged value, set once at the point it is first
+/// detected and reported at a single call site in `run` — replacing the
+/// four independently-checked booleans this dispatcher used to carry
+/// through a hand-ordered run of `if`s, correct only by comment
+/// discipline. Precedence between fault *kinds* never has to be decided
+/// separately from precedence between fault *positions*: only the first
+/// one found, scanning argv left to right, is ever recorded — see
+/// `Parsed.setFault`.
+const ParseFault = union(enum) {
+    unknown_flag: []const u8,
+    missing_value_for: []const u8,
+    empty_value_for: []const u8,
+    repeated_flag: []const u8,
+    malformed_ref: []const u8,
+};
+
+/// Result of phase 2's real scan over argv (ADR-0002: no third-party
+/// parser). `roles`/`closers`/`refs` are owned lists — free with
+/// `deinit` — because their flags are genuinely repeatable (`header`'s
+/// `--role`/`--closer`; `post`'s `--ref`, 4.8); every other flag is a
+/// single optional slice borrowed from `args`.
 const Parsed = struct {
     log_path: ?[]const u8 = null,
-    role: ?[]const u8 = null,
-    role_empty: bool = false,
-    role_repeated: bool = false,
     help: bool = false,
     version: bool = false,
     command: ?[]const u8 = null,
-    unknown_flag: ?[]const u8 = null,
-    missing_value_for: ?[]const u8 = null,
+    fault: ?ParseFault = null,
+
+    /// Exactly-once attribution, for every command except `header`.
+    role: ?[]const u8 = null,
+    /// `header`'s repeatable role declaration. Empty unless the command
+    /// is `header`.
+    roles: std.ArrayList([]const u8) = .empty,
+    /// `header`-only.
+    change: ?[]const u8 = null,
+    /// `header`-only, repeatable.
+    closers: std.ArrayList([]const u8) = .empty,
+
+    /// `post`-only, each optional and exactly-once.
+    section: ?[]const u8 = null,
+    block: ?[]const u8 = null,
+    to: ?[]const u8 = null,
+    /// `post`-only, repeatable (4.8).
+    refs: std.ArrayList(record.Ref) = .empty,
+
+    fn deinit(self: *Parsed, allocator: Allocator) void {
+        self.roles.deinit(allocator);
+        self.closers.deinit(allocator);
+        self.refs.deinit(allocator);
+    }
+
+    fn setFault(self: *Parsed, fault: ParseFault) void {
+        if (self.fault == null) self.fault = fault;
+    }
 };
 
-fn parseArgs(args: []const [:0]const u8) Parsed {
+/// Consumes the value for the single-value flag at `args[i]`, advancing
+/// `i` past it. If no value follows, or the following token looks like
+/// another flag, records a `missing_value_for` fault (first fault wins —
+/// `Parsed.setFault`) and leaves `i` where it is, so the look-alike flag
+/// is processed as its own token on the next loop iteration rather than
+/// silently consumed.
+fn takeFlagValue(p: *Parsed, args: []const [:0]const u8, i: *usize, name: []const u8) ?[]const u8 {
+    if (i.* + 1 >= args.len or startsWithDoubleDash(args[i.* + 1])) {
+        p.setFault(.{ .missing_value_for = name });
+        return null;
+    }
+    i.* += 1;
+    return args[i.*];
+}
+
+/// Sets a single-value, exactly-once flag. Ambiguity (already set) is
+/// checked *before* emptiness, matching this tool's pre-existing
+/// behaviour for `--role`: `--role "" --role x` reports "requires a
+/// non-empty value", not "given more than once", because the first,
+/// empty attempt never actually populates `field` (`## NEXT` carried
+/// item 6 — a known quirk, not a defect this rework is meant to fix).
+fn setOnce(p: *Parsed, field: *?[]const u8, name: []const u8, value: []const u8) void {
+    if (field.* != null) {
+        p.setFault(.{ .repeated_flag = name });
+        return;
+    }
+    if (value.len == 0) {
+        p.setFault(.{ .empty_value_for = name });
+        return;
+    }
+    field.* = value;
+}
+
+/// Appends to a repeatable flag (`--role`/`--closer` on `header`) — no
+/// ambiguity check, since repeating is the point, but still refuses an
+/// empty element.
+fn appendValue(p: *Parsed, allocator: Allocator, list: *std.ArrayList([]const u8), name: []const u8, value: []const u8) Allocator.Error!void {
+    if (value.len == 0) {
+        p.setFault(.{ .empty_value_for = name });
+        return;
+    }
+    try list.append(allocator, value);
+}
+
+/// `--ref ns:id` (4.8): split on the *first* `:`, both sides non-empty.
+/// A malformed value is a parse fault (A6); beyond well-formedness this
+/// checks nothing else — `external-references` requires an unknown
+/// namespace be accepted without complaint (D10).
+fn appendRef(p: *Parsed, allocator: Allocator, list: *std.ArrayList(record.Ref), value: []const u8) Allocator.Error!void {
+    const colon = std.mem.indexOfScalar(u8, value, ':') orelse {
+        p.setFault(.{ .malformed_ref = value });
+        return;
+    };
+    const ns = value[0..colon];
+    const id = value[colon + 1 ..];
+    if (ns.len == 0 or id.len == 0) {
+        p.setFault(.{ .malformed_ref = value });
+        return;
+    }
+    try list.append(allocator, .{ .ns = ns, .id = id });
+}
+
+/// Phase 2 (A5): the real scan, now that `findCommandToken` has already
+/// determined which command's flag spec applies — `wants_header`/
+/// `wants_post` decide `--role`'s arity and whether `--change`/`--closer`
+/// (`header`) or `--section`/`--block`/`--to`/`--ref` (`post`) are
+/// recognised at all. `--help`, `--version`, `--log`, and `--role` are
+/// always recognised regardless of position relative to the command
+/// token (the "any position" behaviour this dispatcher has always had).
+/// An unrecognised flag is a fault when it appears before the command
+/// token is found (unconditionally — there is no command yet to defer
+/// to) *or* when the command is `header`/`post` (built in this block, so
+/// their grammars are enforced everywhere on the line, not just before
+/// the bare word); an unrecognised flag after any other command's bare
+/// token is left alone, for that command's own section to validate once
+/// it exists (unchanged pre-4A behaviour).
+fn parseArgs(allocator: Allocator, args: []const [:0]const u8) Allocator.Error!Parsed {
     var p: Parsed = .{};
+    const command_hint = findCommandToken(args);
+    const wants_header = command_hint != null and std.mem.eql(u8, command_hint.?, "header");
+    const wants_post = command_hint != null and std.mem.eql(u8, command_hint.?, "post");
+    const strict = wants_header or wants_post;
+
     var i: usize = 0;
     while (i < args.len) : (i += 1) {
         const arg: []const u8 = args[i];
@@ -101,42 +325,56 @@ fn parseArgs(args: []const [:0]const u8) Parsed {
         } else if (std.mem.eql(u8, arg, "--version")) {
             p.version = true;
         } else if (std.mem.eql(u8, arg, "--log")) {
-            if (i + 1 >= args.len or std.mem.startsWith(u8, args[i + 1], "--")) {
-                if (p.missing_value_for == null) p.missing_value_for = "--log";
-            } else {
-                i += 1;
-                p.log_path = args[i];
-            }
+            if (takeFlagValue(&p, args, &i, "--log")) |v| p.log_path = v;
         } else if (std.mem.eql(u8, arg, "--role")) {
-            if (i + 1 >= args.len or std.mem.startsWith(u8, args[i + 1], "--")) {
-                if (p.missing_value_for == null) p.missing_value_for = "--role";
-            } else {
-                i += 1;
-                // A second --role is a parse ambiguity, not a last-wins
-                // overwrite (DEVLOG ## 1, supervisor finding B4): the tool
-                // cannot tell which value the caller meant, so silently
-                // keeping one and dropping the other is exactly the class
-                // of accident this tool exists to prevent. `header`'s
-                // repeatable --role (task 4.10) is a distinct, command-
-                // scoped meaning this dispatcher does not build yet.
-                if (p.role != null) {
-                    p.role_repeated = true;
-                } else if (args[i].len == 0) {
-                    p.role_empty = true;
-                } else {
-                    p.role = args[i];
-                }
+            if (wants_header) {
+                if (takeFlagValue(&p, args, &i, "--role")) |v| try appendValue(&p, allocator, &p.roles, "--role", v);
+            } else if (takeFlagValue(&p, args, &i, "--role")) |v| {
+                setOnce(&p, &p.role, "--role", v);
             }
-        } else if (p.command == null and !std.mem.startsWith(u8, arg, "-")) {
+        } else if (wants_header and std.mem.eql(u8, arg, "--change")) {
+            if (takeFlagValue(&p, args, &i, "--change")) |v| setOnce(&p, &p.change, "--change", v);
+        } else if (wants_header and std.mem.eql(u8, arg, "--closer")) {
+            if (takeFlagValue(&p, args, &i, "--closer")) |v| try appendValue(&p, allocator, &p.closers, "--closer", v);
+        } else if (wants_post and std.mem.eql(u8, arg, "--section")) {
+            if (takeFlagValue(&p, args, &i, "--section")) |v| setOnce(&p, &p.section, "--section", v);
+        } else if (wants_post and std.mem.eql(u8, arg, "--block")) {
+            if (takeFlagValue(&p, args, &i, "--block")) |v| setOnce(&p, &p.block, "--block", v);
+        } else if (wants_post and std.mem.eql(u8, arg, "--to")) {
+            if (takeFlagValue(&p, args, &i, "--to")) |v| setOnce(&p, &p.to, "--to", v);
+        } else if (wants_post and std.mem.eql(u8, arg, "--ref")) {
+            if (takeFlagValue(&p, args, &i, "--ref")) |v| try appendRef(&p, allocator, &p.refs, v);
+        } else if (p.command == null and !startsWithDash(arg)) {
             p.command = arg;
-        } else if (p.command == null) {
-            // An unrecognised flag before the subcommand is a global-scope
-            // error. Anything after the subcommand is left alone — its
-            // flags belong to sections 4, 6 and 7, not this dispatcher.
-            if (p.unknown_flag == null) p.unknown_flag = arg;
+        } else if (startsWithDash(arg) and (strict or p.command == null)) {
+            p.setFault(.{ .unknown_flag = arg });
         }
+        // else: a bare token after the command (never reassigned — the
+        // first one found is final), or a flag belonging to a command
+        // this block does not build, left untouched for that command's
+        // own section to validate once it exists.
     }
+
     return p;
+}
+
+fn reportFault(stderr: *Io.Writer, fault: ParseFault) u8 {
+    return switch (fault) {
+        .unknown_flag => |flag| fail(stderr, "unknown flag '{s}' — see --help", .{flag}),
+        .missing_value_for => |flag| fail(stderr, "{s} requires a value", .{flag}),
+        .empty_value_for => |flag| fail(stderr, "{s} requires a non-empty value", .{flag}),
+        .repeated_flag => |flag| fail(stderr, "{s} given more than once — see --help", .{flag}),
+        .malformed_ref => |val| fail(stderr, "--ref '{s}' is malformed — expected ns:id, both sides non-empty", .{val}),
+    };
+}
+
+/// Prints whatever `record.Diagnostics` named, or a generic fallback
+/// naming the error value when nothing more specific was set (A4: two
+/// message shapes, not three — this is the one call site that prints
+/// both of them uniformly through `fail()`).
+fn reportLogError(stderr: *Io.Writer, err: anyerror, diag: *const record.Diagnostics) u8 {
+    if (diag.message.len != 0) return fail(stderr, "{s}", .{diag.message});
+    return fail(stderr, "{s}", .{@errorName(err)});
 }
 
 fn printTopHelp(w: *Io.Writer) void {
@@ -156,7 +394,8 @@ fn printTopHelp(w: *Io.Writer) void {
         \\    --role <role>  The calling role, as declared for this project by
         \\                   'devlog header' (any name the project has
         \\                   declared). Carried on every write. Given at most
-        \\                   once.
+        \\                   once — except by 'devlog header' itself, which
+        \\                   declares the role set and gives it repeatably.
         \\    --help         Show this help, or a command's help after its name.
         \\    --version      Print the tool version and exit.
         \\
@@ -186,6 +425,10 @@ fn printTopHelp(w: *Io.Writer) void {
 }
 
 fn printCommandHelp(w: *Io.Writer, spec: CommandSpec) void {
+    if (spec.usage) |usage| {
+        w.print("devlog {s} — {s}\n\n{s}\n", .{ spec.name, spec.summary, usage }) catch {};
+        return;
+    }
     w.print(
         \\devlog {s} — {s}
         \\
@@ -197,37 +440,152 @@ fn printCommandHelp(w: *Io.Writer, spec: CommandSpec) void {
     ) catch {};
 }
 
-/// Dispatches one invocation and returns the process exit code. Pure
-/// function of argv (minus argv[0]) so it can be exercised by tests without
-/// a real process — no allocation, no filesystem access, matching this
-/// block's scope (record types, the log file, and every subcommand's real
-/// behaviour belong to later sections).
-fn run(args: []const [:0]const u8, stdout: *Io.Writer, stderr: *Io.Writer) u8 {
-    const p = parseArgs(args);
+/// `YYYY-MM-DDTHH:MM:SSZ`, UTC, seconds precision (design.md's
+/// record-schema example). Computed once by the caller and threaded
+/// down as a plain string — the clock is injected into `run`, not called
+/// from inside a command (architect ruling, DEVLOG `## 4`) — so every
+/// command's record is assertable against a pinned `ts` in a test,
+/// rather than each command reaching for the wall clock itself.
+fn formatTimestamp(buf: []u8, io: Io) []const u8 {
+    const now = Io.Clock.real.now(io);
+    const total_seconds: i64 = @intCast(@divTrunc(now.nanoseconds, std.time.ns_per_s));
+    const epoch_seconds: std.time.epoch.EpochSeconds = .{ .secs = @intCast(total_seconds) };
+    const year_day = epoch_seconds.getEpochDay().calculateYearDay();
+    const month_day = year_day.calculateMonthDay();
+    const day_seconds = epoch_seconds.getDaySeconds();
+    // `buf` is always sized by this file's own callers for exactly this
+    // fixed-width format (20 bytes) — not user input, so a formatting
+    // failure here would mean this function's own buffer contract broke,
+    // not a value the caller supplied.
+    return std.fmt.bufPrint(buf, "{d:0>4}-{d:0>2}-{d:0>2}T{d:0>2}:{d:0>2}:{d:0>2}Z", .{
+        year_day.year,
+        month_day.month.numeric(),
+        month_day.day_index + 1,
+        day_seconds.getHoursIntoDay(),
+        day_seconds.getMinutesIntoHour(),
+        day_seconds.getSecondsIntoMinute(),
+    }) catch unreachable;
+}
+
+/// `devlog header` (4.10, D13). Validates every required flag before
+/// touching the filesystem (A3), then wires `log.appendHeader` — which
+/// already implements all three outcomes — rather than reimplementing
+/// them. Never calls `body.readBody`: `HeaderRecord` has no body field,
+/// so there is nothing to read (A3).
+fn runHeader(
+    allocator: Allocator,
+    io: Io,
+    dir: Io.Dir,
+    ts: []const u8,
+    log_path: []const u8,
+    p: *const Parsed,
+    stdout: *Io.Writer,
+    stderr: *Io.Writer,
+) u8 {
+    const change = p.change orelse return fail(stderr, "'header' requires --change <name>", .{});
+    if (p.roles.items.len == 0) return fail(stderr, "'header' requires at least one --role <r>", .{});
+    if (p.closers.items.len == 0) return fail(stderr, "'header' requires at least one --closer <r>", .{});
+
+    for (p.closers.items) |closer| {
+        if (!containsStr(p.roles.items, closer)) {
+            return fail(stderr, "--closer '{s}' must also be given as --role", .{closer});
+        }
+    }
+
+    const tool = std.fmt.allocPrint(allocator, "devlog {s}", .{build_options.version}) catch {
+        return fail(stderr, "out of memory", .{});
+    };
+    defer allocator.free(tool);
+
+    var diag: record.Diagnostics = .init(allocator);
+    defer diag.deinit();
+
+    const result = log.appendHeader(
+        allocator,
+        io,
+        dir,
+        log_path,
+        ts,
+        tool,
+        .{ .change = change, .roles = p.roles.items, .closers = p.closers.items },
+        &diag,
+    ) catch |err| return reportLogError(stderr, err, &diag);
+
+    // Three genuinely different outcomes, all exiting 0 (architect
+    // ruling, DEVLOG ## 4): an agent that cannot tell them apart cannot
+    // tell whether its declaration took effect.
+    stdout.print("{s}\n", .{@tagName(result.outcome)}) catch {};
+    return 0;
+}
+
+/// `devlog post` (4.3): the common fields plus a body, nothing else.
+/// Order matches A3 exactly: `--role` (already parsed) is checked, then
+/// the body is read from stdin, and only then does anything reach the
+/// filesystem — a refusal at either step never opens, let alone creates
+/// or modifies, the log.
+fn runPost(
+    allocator: Allocator,
+    io: Io,
+    dir: Io.Dir,
+    stdin: Io.File,
+    ts: []const u8,
+    log_path: []const u8,
+    p: *const Parsed,
+    stdout: *Io.Writer,
+    stderr: *Io.Writer,
+) u8 {
+    _ = stdout;
+    const role = p.role orelse return fail(stderr, "'post' requires --role <role>", .{});
+
+    const body_bytes = body.readBody(allocator, io, stdin) catch |err| {
+        return fail(stderr, "{s}", .{body.refusalMessage(err)});
+    };
+    defer allocator.free(body_bytes);
+
+    const rec = record.Record{ .post = .{ .common = .{
+        .seq = 0,
+        .ts = ts,
+        .role = role,
+        .section = p.section,
+        .block = p.block,
+        .to = p.to,
+        .refs = p.refs.items,
+        .body = body_bytes,
+    } } };
+
+    var diag: record.Diagnostics = .init(allocator);
+    defer diag.deinit();
+
+    _ = log.appendRecord(allocator, io, dir, log_path, rec, &diag) catch |err| {
+        return reportLogError(stderr, err, &diag);
+    };
+
+    return 0;
+}
+
+/// Dispatches one invocation and returns the process exit code.
+fn run(
+    allocator: Allocator,
+    io: Io,
+    dir: Io.Dir,
+    stdin: Io.File,
+    ts: []const u8,
+    args: []const [:0]const u8,
+    stdout: *Io.Writer,
+    stderr: *Io.Writer,
+) u8 {
+    var p = parseArgs(allocator, args) catch return fail(stderr, "out of memory", .{});
+    defer p.deinit(allocator);
 
     // Parse-ambiguity errors beat --help/--version (architect ruling, DEVLOG
-    // ## 1). The caller is an agent composing an invocation, and D13 stakes
-    // this tool's design on exit codes being trustworthy: a line the parser
-    // could not make sense of is not a coherent request for help or the
-    // version, even if one of those tokens is also present. Silent success
-    // on an unparseable line — a stray or hallucinated --help swallowing a
-    // real write and exiting 0 with nothing done — is the one outcome this
-    // tool must never produce.
-    if (p.unknown_flag) |flag| {
-        return fail(stderr, "unknown flag '{s}' — see --help", .{flag});
-    }
-
-    if (p.missing_value_for) |flag| {
-        return fail(stderr, "{s} requires a value", .{flag});
-    }
-
-    if (p.role_empty) {
-        return fail(stderr, "--role requires a non-empty value", .{});
-    }
-
-    if (p.role_repeated) {
-        return fail(stderr, "--role given more than once — see --help", .{});
-    }
+    // ## 1; reaffirmed unchanged by A5/A6). The caller is an agent composing
+    // an invocation, and D13 stakes this tool's design on exit codes being
+    // trustworthy: a line the parser could not make sense of is not a
+    // coherent request for help or the version, even if one of those tokens
+    // is also present. Silent success on an unparseable line — a stray or
+    // hallucinated --help swallowing a real write and exiting 0 with nothing
+    // done — is the one outcome this tool must never produce.
+    if (p.fault) |f| return reportFault(stderr, f);
 
     // Past this point the line is coherent, if possibly incomplete (no
     // command, an unknown command, --log missing) — and a coherent request
@@ -259,15 +617,20 @@ fn run(args: []const [:0]const u8, stdout: *Io.Writer, stderr: *Io.Writer) u8 {
     // `--log` is required, with no default and no guessing
     // (durable-format/spec.md:56): a command that needs the log and wasn't
     // given `--log` is an error, before anything else is attempted.
-    if (p.log_path == null) {
+    const log_path = p.log_path orelse {
         return fail(stderr, "'{s}' requires --log <path>", .{spec.name});
+    };
+
+    if (std.mem.eql(u8, spec.name, "header")) {
+        return runHeader(allocator, io, dir, ts, log_path, &p, stdout, stderr);
+    }
+    if (std.mem.eql(u8, spec.name, "post")) {
+        return runPost(allocator, io, dir, stdin, ts, log_path, &p, stdout, stderr);
     }
 
-    // `--role` is carried for task 4.9's future enforcement; nothing reads
-    // it yet, and the vocabulary question is parked in DEVLOG.md's NEXT.
-
-    // No subcommand has a body yet (sections 4, 6, 7). Fail honestly rather
-    // than silently succeed, and touch nothing on the way out (D5).
+    // No other subcommand is wired yet (sections 4B, 4C, 6, 7). Fail
+    // honestly rather than silently succeed, and touch nothing on the way
+    // out (D5).
     return fail(stderr, "'{s}' is not implemented yet", .{spec.name});
 }
 
@@ -284,27 +647,73 @@ pub fn main(init: std.process.Init) !void {
     var stderr_file_writer: Io.File.Writer = .init(.stderr(), io, &stderr_buffer);
     const stderr = &stderr_file_writer.interface;
 
-    const exit_code = run(args[1..], stdout, stderr);
+    var ts_buf: [24]u8 = undefined;
+    const ts = formatTimestamp(&ts_buf, io);
+
+    // Io.Dir.cwd() is the AT_FDCWD sentinel, not a real file descriptor —
+    // log.zig's atomicReplace fsyncs the directory itself (D11's
+    // durability guarantee, `syncDir`) via a raw wrapped Io.File, which
+    // the kernel rejects for that sentinel with EBADF. Opening "." against
+    // it yields a genuine directory handle every log.zig call can act on,
+    // this dispatcher included.
+    var cwd = try Io.Dir.cwd().openDir(io, ".", .{});
+
+    const exit_code = run(arena, io, cwd, Io.File.stdin(), ts, args[1..], stdout, stderr);
 
     stdout.flush() catch {};
     stderr.flush() catch {};
+    cwd.close(io);
 
     std.process.exit(exit_code);
 }
 
+// --- Tests -----------------------------------------------------------------
+
+/// A stand-in for stdin that is never a terminal (matching `body.zig`'s
+/// own `openAsStdin` helper) — every test below that reaches `run` needs
+/// a real, non-terminal `Io.File` to pass as `stdin`, even the many that
+/// never actually read it (a command fails before reaching
+/// `body.readBody` in every case exercised here). Callers open one fresh
+/// file per test invocation inside `tmp.dir`, so nothing is shared or
+/// reused across tests.
+fn openStdinStandin(dir: Io.Dir, io: Io, contents: []const u8) !Io.File {
+    {
+        var f = try dir.createFile(io, "stdin-standin", .{ .truncate = true });
+        defer f.close(io);
+        try f.writePositionalAll(io, contents, 0);
+    }
+    return dir.openFile(io, "stdin-standin", .{ .mode = .read_only });
+}
+
+const test_ts = "2026-08-14T09:00:00Z";
+
+/// Every one of these tests exercises argv parsing and command-dispatch
+/// gating that fails, by construction, before `run` ever reaches
+/// `log.zig` or `body.zig` — no test call below is exercising a real
+/// write. A fresh, isolated tmp dir and a harmless empty stdin stand-in
+/// are still supplied on every call (rather than a shared or invalid
+/// value) so that stays true by construction rather than by care: if a
+/// future edit ever made one of these paths reach the filesystem for
+/// real, it would touch only its own throwaway directory, never the
+/// repository.
 fn expectRun(
-    allocator: std.mem.Allocator,
+    allocator: Allocator,
     args: []const [:0]const u8,
     expected_code: u8,
     stdout_contains: ?[]const u8,
     stderr_contains: ?[]const u8,
 ) !void {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var stdin_file = try openStdinStandin(tmp.dir, std.testing.io, "");
+    defer stdin_file.close(std.testing.io);
+
     var out: Io.Writer.Allocating = .init(allocator);
     defer out.deinit();
     var err_out: Io.Writer.Allocating = .init(allocator);
     defer err_out.deinit();
 
-    const code = run(args, &out.writer, &err_out.writer);
+    const code = run(allocator, std.testing.io, tmp.dir, stdin_file, test_ts, args, &out.writer, &err_out.writer);
     try std.testing.expectEqual(expected_code, code);
 
     if (stdout_contains) |needle| {
@@ -333,12 +742,17 @@ test "--help with no command prints top-level help and exits 0" {
 }
 
 test "--version prints the build-option version, not a re-derived one" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var stdin_file = try openStdinStandin(tmp.dir, std.testing.io, "");
+    defer stdin_file.close(std.testing.io);
+
     var out: Io.Writer.Allocating = .init(std.testing.allocator);
     defer out.deinit();
     var err_out: Io.Writer.Allocating = .init(std.testing.allocator);
     defer err_out.deinit();
 
-    const code = run(&.{"--version"}, &out.writer, &err_out.writer);
+    const code = run(std.testing.allocator, std.testing.io, tmp.dir, stdin_file, test_ts, &.{"--version"}, &out.writer, &err_out.writer);
     try std.testing.expectEqual(@as(u8, 0), code);
 
     var expected: [64]u8 = undefined;
@@ -354,19 +768,32 @@ test "a recognised command without --log is an error, not an attempt" {
     try expectRun(std.testing.allocator, &.{"post"}, 1, null, "requires --log");
 }
 
-test "a recognised command with --log fails honestly as not implemented" {
+test "a recognised but unimplemented command with --log fails honestly as not implemented" {
+    // status is still a placeholder past block 4A — header and post are
+    // the two commands this block makes real; every other command must
+    // still fail this way rather than silently succeed.
+    try expectRun(
+        std.testing.allocator,
+        &.{ "--log", "DEVLOG.jsonl", "status" },
+        1,
+        null,
+        "'status' is not implemented yet",
+    );
+}
+
+test "post with --log but no --role fails on its own real requirement now that it is implemented (4.3)" {
     try expectRun(
         std.testing.allocator,
         &.{ "--log", "DEVLOG.jsonl", "post" },
         1,
         null,
-        "'post' is not implemented yet",
+        "requires --role",
     );
 }
 
 test "a command's own --help works without --log and doesn't dispatch it" {
     try expectRun(std.testing.allocator, &.{ "post", "--help" }, 0, "devlog post", null);
-    try expectRun(std.testing.allocator, &.{ "post", "--help" }, 0, "section 4", null);
+    try expectRun(std.testing.allocator, &.{ "post", "--help" }, 0, "USAGE", null);
 }
 
 test "header (D13) is a known command, listed and dispatched like the rest" {
@@ -376,12 +803,15 @@ test "header (D13) is a known command, listed and dispatched like the rest" {
     // header is the one command that will create the file (D13/4.10 own
     // creation semantics; this block only wires the same flag check).
     try expectRun(std.testing.allocator, &.{"header"}, 1, null, "requires --log");
+    // header is real now (4.10) — --role alone is not enough; --change
+    // and --closer are also required, checked before any filesystem
+    // access.
     try expectRun(
         std.testing.allocator,
         &.{ "--log", "DEVLOG.jsonl", "header", "--role", "architect" },
         1,
         null,
-        "'header' is not implemented yet",
+        "requires --change",
     );
 }
 
@@ -534,4 +964,397 @@ test "--log and --role are recognised in any position relative to the command" {
         null,
         "'status' is not implemented yet",
     );
+}
+
+// --- New in block 4A: command-scoped arity (A5), --ref (4.8) -------------
+
+test "header's --role is repeatable, unlike every other command's" {
+    try expectRun(
+        std.testing.allocator,
+        &.{ "--log", "DEVLOG.jsonl", "header", "--role", "architect", "--role", "worker", "--change", "x" },
+        1,
+        null,
+        // Still fails — --closer is missing — but crucially *not* on
+        // "--role given more than once": repeating --role for header is
+        // not an ambiguity.
+        "requires at least one --closer",
+    );
+}
+
+test "--closer that was never also given as --role is refused before any filesystem access" {
+    try expectRun(
+        std.testing.allocator,
+        &.{ "--log", "DEVLOG.jsonl", "header", "--change", "x", "--role", "architect", "--closer", "reviewer" },
+        1,
+        null,
+        "--closer 'reviewer' must also be given as --role",
+    );
+}
+
+test "post's --ref rejects a value with no colon (4.8, A6)" {
+    try expectRun(
+        std.testing.allocator,
+        &.{ "--log", "DEVLOG.jsonl", "--role", "architect", "post", "--ref", "no-colon-here" },
+        1,
+        null,
+        "malformed",
+    );
+}
+
+test "post's --ref rejects an empty namespace or an empty id" {
+    try expectRun(
+        std.testing.allocator,
+        &.{ "--log", "DEVLOG.jsonl", "--role", "architect", "post", "--ref", ":2" },
+        1,
+        null,
+        "malformed",
+    );
+    try expectRun(
+        std.testing.allocator,
+        &.{ "--log", "DEVLOG.jsonl", "--role", "architect", "post", "--ref", "D:" },
+        1,
+        null,
+        "malformed",
+    );
+}
+
+test "a flag only header accepts is an unknown flag when given to post" {
+    try expectRun(
+        std.testing.allocator,
+        &.{ "--log", "DEVLOG.jsonl", "--role", "architect", "post", "--change", "x" },
+        1,
+        null,
+        "unknown flag '--change'",
+    );
+}
+
+test "a flag only post accepts is an unknown flag when given to header (reviewer nit, 4.8)" {
+    try expectRun(
+        std.testing.allocator,
+        &.{ "--log", "DEVLOG.jsonl", "--role", "architect", "header", "--change", "x", "--ref", "D:1" },
+        1,
+        null,
+        "unknown flag '--ref'",
+    );
+}
+
+test "header's own --help names --change vs --log distinctly (A5)" {
+    try expectRun(std.testing.allocator, &.{ "header", "--help" }, 0, "--change <name>", null);
+    try expectRun(std.testing.allocator, &.{ "header", "--help" }, 0, "--log <path>", null);
+}
+
+// --- New in block 4A: real end-to-end writes ------------------------------
+
+test "devlog header creates the log, prints 'created', and the file carries the declared roles and closers" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var stdin_file = try openStdinStandin(tmp.dir, std.testing.io, "");
+    defer stdin_file.close(std.testing.io);
+
+    var out: Io.Writer.Allocating = .init(std.testing.allocator);
+    defer out.deinit();
+    var err_out: Io.Writer.Allocating = .init(std.testing.allocator);
+    defer err_out.deinit();
+
+    const code = run(
+        std.testing.allocator,
+        std.testing.io,
+        tmp.dir,
+        stdin_file,
+        test_ts,
+        &.{ "--log", "DEVLOG.jsonl", "header", "--change", "add-devlog-core", "--role", "architect", "--role", "worker", "--closer", "architect" },
+        &out.writer,
+        &err_out.writer,
+    );
+    try std.testing.expectEqual(@as(u8, 0), code);
+    try std.testing.expectEqualStrings("created\n", out.written());
+
+    const bytes = try log.readAllLog(std.testing.allocator, tmp.dir, std.testing.io);
+    defer std.testing.allocator.free(bytes);
+    var diag: record.Diagnostics = .init(std.testing.allocator);
+    defer diag.deinit();
+    var parsed = try record.parseLog(std.testing.allocator, bytes, &diag);
+    defer parsed.deinit();
+
+    try std.testing.expectEqual(@as(usize, 1), parsed.records.len);
+    try std.testing.expectEqual(record.Kind.header, std.meta.activeTag(parsed.records[0]));
+    try std.testing.expectEqualStrings("add-devlog-core", parsed.records[0].header.change);
+    try std.testing.expectEqual(@as(usize, 2), parsed.records[0].header.roles.len);
+    try std.testing.expectEqualStrings("architect", parsed.records[0].header.closers[0]);
+    try std.testing.expectEqualStrings(test_ts, parsed.records[0].header.ts);
+}
+
+test "devlog post appends a record with every field, refs included, and prints nothing on success" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    var diag: record.Diagnostics = .init(std.testing.allocator);
+    defer diag.deinit();
+    _ = try log.appendHeader(
+        std.testing.allocator,
+        std.testing.io,
+        tmp.dir,
+        "DEVLOG.jsonl",
+        "t0",
+        "devlog 0.1.0",
+        .{ .change = "add-devlog-core", .roles = &.{"architect"}, .closers = &.{"architect"} },
+        &diag,
+    );
+
+    var stdin_file = try openStdinStandin(tmp.dir, std.testing.io, "Progress notes.\n\nMore than one line.");
+    defer stdin_file.close(std.testing.io);
+
+    var out: Io.Writer.Allocating = .init(std.testing.allocator);
+    defer out.deinit();
+    var err_out: Io.Writer.Allocating = .init(std.testing.allocator);
+    defer err_out.deinit();
+
+    const code = run(
+        std.testing.allocator,
+        std.testing.io,
+        tmp.dir,
+        stdin_file,
+        test_ts,
+        &.{ "--log", "DEVLOG.jsonl", "--role", "architect", "post", "--section", "4", "--block", "4.3", "--to", "worker", "--ref", "D:2", "--ref", "S:9" },
+        &out.writer,
+        &err_out.writer,
+    );
+    try std.testing.expectEqual(@as(u8, 0), code);
+    try std.testing.expectEqualStrings("", out.written());
+    try std.testing.expectEqualStrings("", err_out.written());
+
+    const bytes = try log.readAllLog(std.testing.allocator, tmp.dir, std.testing.io);
+    defer std.testing.allocator.free(bytes);
+    var parsed = try record.parseLog(std.testing.allocator, bytes, &diag);
+    defer parsed.deinit();
+
+    try std.testing.expectEqual(@as(usize, 2), parsed.records.len);
+    const post = parsed.records[1].post;
+    try std.testing.expectEqualStrings("architect", post.common.role);
+    try std.testing.expectEqualStrings("4", post.common.section.?);
+    try std.testing.expectEqualStrings("4.3", post.common.block.?);
+    try std.testing.expectEqualStrings("worker", post.common.to.?);
+    try std.testing.expectEqualStrings(test_ts, post.common.ts);
+    try std.testing.expectEqualStrings("Progress notes.\n\nMore than one line.", post.common.body);
+    try std.testing.expectEqual(@as(usize, 2), post.common.refs.len);
+    try std.testing.expectEqualStrings("D", post.common.refs[0].ns);
+    try std.testing.expectEqualStrings("2", post.common.refs[0].id);
+    try std.testing.expectEqualStrings("S", post.common.refs[1].ns);
+    try std.testing.expectEqualStrings("9", post.common.refs[1].id);
+}
+
+test "a ref in a namespace the tool has never seen is stored without complaint (4.8, external-references)" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    var diag: record.Diagnostics = .init(std.testing.allocator);
+    defer diag.deinit();
+    _ = try log.appendHeader(
+        std.testing.allocator,
+        std.testing.io,
+        tmp.dir,
+        "DEVLOG.jsonl",
+        "t0",
+        "devlog 0.1.0",
+        .{ .change = "x", .roles = &.{"architect"}, .closers = &.{"architect"} },
+        &diag,
+    );
+
+    var stdin_file = try openStdinStandin(tmp.dir, std.testing.io, "hi");
+    defer stdin_file.close(std.testing.io);
+    var out: Io.Writer.Allocating = .init(std.testing.allocator);
+    defer out.deinit();
+    var err_out: Io.Writer.Allocating = .init(std.testing.allocator);
+    defer err_out.deinit();
+
+    const code = run(
+        std.testing.allocator,
+        std.testing.io,
+        tmp.dir,
+        stdin_file,
+        test_ts,
+        &.{ "--log", "DEVLOG.jsonl", "--role", "architect", "post", "--ref", "totally-unknown-ns:whatever" },
+        &out.writer,
+        &err_out.writer,
+    );
+    try std.testing.expectEqual(@as(u8, 0), code);
+
+    const bytes = try log.readAllLog(std.testing.allocator, tmp.dir, std.testing.io);
+    defer std.testing.allocator.free(bytes);
+    var parsed = try record.parseLog(std.testing.allocator, bytes, &diag);
+    defer parsed.deinit();
+    try std.testing.expectEqualStrings("totally-unknown-ns", parsed.records[1].post.common.refs[0].ns);
+}
+
+// --- New in block 4A: refusals precede filesystem effect (A2, A3, C2) ----
+
+test "post against a log that does not exist yet is refused, names devlog header, and creates nothing" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var stdin_file = try openStdinStandin(tmp.dir, std.testing.io, "hi");
+    defer stdin_file.close(std.testing.io);
+
+    var out: Io.Writer.Allocating = .init(std.testing.allocator);
+    defer out.deinit();
+    var err_out: Io.Writer.Allocating = .init(std.testing.allocator);
+    defer err_out.deinit();
+
+    const code = run(
+        std.testing.allocator,
+        std.testing.io,
+        tmp.dir,
+        stdin_file,
+        test_ts,
+        &.{ "--log", "DEVLOG.jsonl", "--role", "architect", "post" },
+        &out.writer,
+        &err_out.writer,
+    );
+    try std.testing.expectEqual(@as(u8, 1), code);
+    try std.testing.expect(std.mem.indexOf(u8, err_out.written(), "devlog header") != null);
+
+    // Nothing but this test's own stdin stand-in exists — no DEVLOG.jsonl,
+    // no temp file (done-gate 3, A2).
+    var count: usize = 0;
+    var it = tmp.dir.iterate();
+    while (try it.next(std.testing.io)) |entry| {
+        try std.testing.expectEqualStrings("stdin-standin", entry.name);
+        count += 1;
+    }
+    try std.testing.expectEqual(@as(usize, 1), count);
+}
+
+test "header is the only command that ever creates the log (done-gate 4)" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var stdin_file = try openStdinStandin(tmp.dir, std.testing.io, "hi");
+    defer stdin_file.close(std.testing.io);
+
+    var out: Io.Writer.Allocating = .init(std.testing.allocator);
+    defer out.deinit();
+    var err_out: Io.Writer.Allocating = .init(std.testing.allocator);
+    defer err_out.deinit();
+
+    // post fails before ever creating the log.
+    _ = run(
+        std.testing.allocator,
+        std.testing.io,
+        tmp.dir,
+        stdin_file,
+        test_ts,
+        &.{ "--log", "DEVLOG.jsonl", "--role", "architect", "post" },
+        &out.writer,
+        &err_out.writer,
+    );
+
+    var stdin_file2 = try openStdinStandin(tmp.dir, std.testing.io, "hi");
+    defer stdin_file2.close(std.testing.io);
+    const header_code = run(
+        std.testing.allocator,
+        std.testing.io,
+        tmp.dir,
+        stdin_file2,
+        test_ts,
+        &.{ "--log", "DEVLOG.jsonl", "header", "--change", "x", "--role", "architect", "--closer", "architect" },
+        &out.writer,
+        &err_out.writer,
+    );
+    try std.testing.expectEqual(@as(u8, 0), header_code);
+
+    var saw_log = false;
+    var it = tmp.dir.iterate();
+    while (try it.next(std.testing.io)) |entry| {
+        if (std.mem.eql(u8, entry.name, "DEVLOG.jsonl")) saw_log = true;
+    }
+    try std.testing.expect(saw_log);
+}
+
+test "post from an undeclared role is refused, names the declared roles, and the log is byte-for-byte unchanged (4.11, A1)" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    var diag: record.Diagnostics = .init(std.testing.allocator);
+    defer diag.deinit();
+    _ = try log.appendHeader(
+        std.testing.allocator,
+        std.testing.io,
+        tmp.dir,
+        "DEVLOG.jsonl",
+        "t0",
+        "devlog 0.1.0",
+        .{ .change = "x", .roles = &.{ "architect", "worker" }, .closers = &.{"architect"} },
+        &diag,
+    );
+    const before = try log.readAllLog(std.testing.allocator, tmp.dir, std.testing.io);
+    defer std.testing.allocator.free(before);
+
+    var stdin_file = try openStdinStandin(tmp.dir, std.testing.io, "hi");
+    defer stdin_file.close(std.testing.io);
+    var out: Io.Writer.Allocating = .init(std.testing.allocator);
+    defer out.deinit();
+    var err_out: Io.Writer.Allocating = .init(std.testing.allocator);
+    defer err_out.deinit();
+
+    const code = run(
+        std.testing.allocator,
+        std.testing.io,
+        tmp.dir,
+        stdin_file,
+        test_ts,
+        &.{ "--log", "DEVLOG.jsonl", "--role", "reviewr", "post" },
+        &out.writer,
+        &err_out.writer,
+    );
+    try std.testing.expectEqual(@as(u8, 1), code);
+    try std.testing.expect(std.mem.indexOf(u8, err_out.written(), "reviewr") != null);
+    try std.testing.expect(std.mem.indexOf(u8, err_out.written(), "architect") != null);
+    try std.testing.expect(std.mem.indexOf(u8, err_out.written(), "worker") != null);
+
+    const after = try log.readAllLog(std.testing.allocator, tmp.dir, std.testing.io);
+    defer std.testing.allocator.free(after);
+    try std.testing.expectEqualStrings(before, after);
+}
+
+test "a refused header write leaves an already-existing log byte-for-byte unchanged" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    var diag: record.Diagnostics = .init(std.testing.allocator);
+    defer diag.deinit();
+    _ = try log.appendHeader(
+        std.testing.allocator,
+        std.testing.io,
+        tmp.dir,
+        "DEVLOG.jsonl",
+        "t0",
+        "devlog 0.1.0",
+        .{ .change = "x", .roles = &.{"architect"}, .closers = &.{"architect"} },
+        &diag,
+    );
+    const before = try log.readAllLog(std.testing.allocator, tmp.dir, std.testing.io);
+    defer std.testing.allocator.free(before);
+
+    var stdin_file = try openStdinStandin(tmp.dir, std.testing.io, "");
+    defer stdin_file.close(std.testing.io);
+    var out: Io.Writer.Allocating = .init(std.testing.allocator);
+    defer out.deinit();
+    var err_out: Io.Writer.Allocating = .init(std.testing.allocator);
+    defer err_out.deinit();
+
+    // --closer not also given as --role: refused before appendHeader is
+    // ever called.
+    const code = run(
+        std.testing.allocator,
+        std.testing.io,
+        tmp.dir,
+        stdin_file,
+        test_ts,
+        &.{ "--log", "DEVLOG.jsonl", "header", "--change", "x", "--role", "architect", "--closer", "reviewer" },
+        &out.writer,
+        &err_out.writer,
+    );
+    try std.testing.expectEqual(@as(u8, 1), code);
+
+    const after = try log.readAllLog(std.testing.allocator, tmp.dir, std.testing.io);
+    defer std.testing.allocator.free(after);
+    try std.testing.expectEqualStrings(before, after);
 }

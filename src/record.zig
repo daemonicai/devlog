@@ -257,24 +257,31 @@ pub const Record = union(Kind) {
 
 // --- Serialisation ---------------------------------------------------------
 
-fn validateUtf8(s: []const u8) error{InvalidUtf8}!void {
-    if (!std.unicode.utf8ValidateSlice(s)) return error.InvalidUtf8;
+/// `field` names the offending field in `diag`'s message (A4, section 4:
+/// collapsing D14's previously anonymous `error.InvalidUtf8` into the same
+/// two-shape scheme every other failure in this file already uses —
+/// `Diagnostics` for anything that must name a field, a role, or a path).
+fn validateUtf8(s: []const u8, field: []const u8, diag: ?*Diagnostics) error{InvalidUtf8}!void {
+    if (!std.unicode.utf8ValidateSlice(s)) {
+        if (diag) |d| d.set("field '{s}' is not valid UTF-8", .{field});
+        return error.InvalidUtf8;
+    }
 }
 
 /// Every string field `Attributed` carries — `body` is the one section 3
 /// named, but `role`, `section`, `block`, `to`, and each `refs[].ns`/`.id`
 /// arrive from `argv` just as unvalidated (D14).
-fn validateAttributed(common: Attributed) error{InvalidUtf8}!void {
-    try validateUtf8(common.ts);
-    try validateUtf8(common.role);
-    if (common.section) |v| try validateUtf8(v);
-    if (common.block) |v| try validateUtf8(v);
-    if (common.to) |v| try validateUtf8(v);
+fn validateAttributed(common: Attributed, diag: ?*Diagnostics) error{InvalidUtf8}!void {
+    try validateUtf8(common.ts, "ts", diag);
+    try validateUtf8(common.role, "role", diag);
+    if (common.section) |v| try validateUtf8(v, "section", diag);
+    if (common.block) |v| try validateUtf8(v, "block", diag);
+    if (common.to) |v| try validateUtf8(v, "to", diag);
     for (common.refs) |r| {
-        try validateUtf8(r.ns);
-        try validateUtf8(r.id);
+        try validateUtf8(r.ns, "refs[].ns", diag);
+        try validateUtf8(r.id, "refs[].id", diag);
     }
-    try validateUtf8(common.body);
+    try validateUtf8(common.body, "body", diag);
 }
 
 /// D14: the tool never writes a record it cannot read back. Every string
@@ -285,32 +292,32 @@ fn validateAttributed(common: Attributed) error{InvalidUtf8}!void {
 /// back. Enforced at this one boundary rather than per command, since
 /// every string field carries the same hazard and every command would
 /// otherwise have to remember the check itself.
-fn validateStrings(rec: Record) error{InvalidUtf8}!void {
+fn validateStrings(rec: Record, diag: ?*Diagnostics) error{InvalidUtf8}!void {
     switch (rec) {
         .header => |r| {
-            try validateUtf8(r.ts);
-            try validateUtf8(r.tool);
-            try validateUtf8(r.change);
-            for (r.roles) |v| try validateUtf8(v);
-            for (r.closers) |v| try validateUtf8(v);
+            try validateUtf8(r.ts, "ts", diag);
+            try validateUtf8(r.tool, "tool", diag);
+            try validateUtf8(r.change, "change", diag);
+            for (r.roles) |v| try validateUtf8(v, "roles[]", diag);
+            for (r.closers) |v| try validateUtf8(v, "closers[]", diag);
         },
         .section => |r| {
-            try validateAttributed(r.common);
-            try validateUtf8(r.title);
-            try validateUtf8(r.base);
+            try validateAttributed(r.common, diag);
+            try validateUtf8(r.title, "title", diag);
+            try validateUtf8(r.base, "base", diag);
         },
         .brief, .post, .next => {
             const common = switch (rec) {
                 inline .brief, .post, .next => |r| r.common,
                 else => unreachable,
             };
-            try validateAttributed(common);
+            try validateAttributed(common, diag);
         },
-        .item => |r| try validateAttributed(r.common),
-        .close => |r| try validateAttributed(r.common),
+        .item => |r| try validateAttributed(r.common, diag),
+        .close => |r| try validateAttributed(r.common, diag),
         .verdict => |r| {
-            try validateAttributed(r.common);
-            try validateUtf8(r.commit);
+            try validateAttributed(r.common, diag);
+            try validateUtf8(r.commit, "commit", diag);
         },
     }
 }
@@ -329,9 +336,12 @@ pub const WriteError = Io.Writer.Error || error{InvalidUtf8};
 /// anything (D14) — a record that fails this check reaches `w` not at
 /// all, not partially, so a caller building content in memory before it
 /// ever touches disk (as `log.zig`'s `encodeLine` does) never ends up
-/// with a half-written buffer to reason about.
-pub fn write(w: *Io.Writer, record: Record) WriteError!void {
-    try validateStrings(record);
+/// with a half-written buffer to reason about. `diag`, when given, is
+/// set with which field failed (A4) — the one place `error.InvalidUtf8`
+/// used to fail anonymously, naming no field (section-3 supervisor
+/// finding C1).
+pub fn write(w: *Io.Writer, record: Record, diag: ?*Diagnostics) WriteError!void {
+    try validateStrings(record, diag);
 
     var s: std.json.Stringify = .{ .writer = w };
     try s.beginObject();
@@ -488,7 +498,7 @@ pub const Diagnostics = struct {
         self.* = undefined;
     }
 
-    fn set(self: *Diagnostics, comptime fmt: []const u8, args: anytype) void {
+    pub fn set(self: *Diagnostics, comptime fmt: []const u8, args: anytype) void {
         if (self.owned) self.allocator.free(self.message);
         // Formatting the message itself cannot fail short of OOM; on OOM,
         // say so explicitly rather than emit a truncated fragment of the
@@ -875,7 +885,7 @@ const testing = std.testing;
 fn encodeAlloc(allocator: Allocator, record: Record) ![]u8 {
     var out: Io.Writer.Allocating = .init(allocator);
     defer out.deinit();
-    try write(&out.writer, record);
+    try write(&out.writer, record, null);
     return allocator.dupe(u8, out.written());
 }
 
@@ -1010,13 +1020,14 @@ test "close, verdict and next round-trip their kind-specific fields" {
     try testing.expectEqualStrings("Resume at 4.1.", parsed_next.next.common.body);
 }
 
-test "write refuses a body that is not valid UTF-8, and touches the writer not at all (D14)" {
+test "write refuses a body that is not valid UTF-8, names 'body' in diag, and touches the writer not at all (D14, A4)" {
     // The mechanism D14 guards against: std.json.Stringify would otherwise
     // silently re-encode this as a JSON array of byte numbers, which
     // requireString can never parse back. write catches it before a
     // single byte reaches w, not partway through — verified here by
     // checking the writer received nothing at all, not just that the
-    // call failed.
+    // call failed. A4: before this, error.InvalidUtf8 named no field at
+    // all — diag now says which one.
     const allocator = testing.allocator;
     const rec = Record{ .post = .{
         .common = .{ .seq = 1, .ts = "t", .role = "worker", .body = "before \xff\xfe after" },
@@ -1024,15 +1035,19 @@ test "write refuses a body that is not valid UTF-8, and touches the writer not a
 
     var out: Io.Writer.Allocating = .init(allocator);
     defer out.deinit();
-    try testing.expectError(error.InvalidUtf8, write(&out.writer, rec));
+    var diag: Diagnostics = .init(allocator);
+    defer diag.deinit();
+    try testing.expectError(error.InvalidUtf8, write(&out.writer, rec, &diag));
     try testing.expectEqual(@as(usize, 0), out.written().len);
+    try testing.expect(std.mem.indexOf(u8, diag.message, "body") != null);
 }
 
-test "write refuses invalid UTF-8 in any string field, not only body (D14)" {
+test "write refuses invalid UTF-8 in any string field, not only body, and names that field (D14, A4)" {
     // role, section, block, to, ts, refs[].ns/.id, title, base, commit,
     // tool, change, roles[], closers[] all arrive from argv and carry the
     // same hazard as body — this pins one non-body field so the check
-    // isn't accidentally body-only.
+    // isn't accidentally body-only, and that diag names *that* field, not
+    // a hardcoded "body".
     const allocator = testing.allocator;
     const rec = Record{ .post = .{
         .common = .{ .seq = 1, .ts = "t", .role = "worker", .to = "arch\xffitect", .body = "fine" },
@@ -1040,8 +1055,12 @@ test "write refuses invalid UTF-8 in any string field, not only body (D14)" {
 
     var out: Io.Writer.Allocating = .init(allocator);
     defer out.deinit();
-    try testing.expectError(error.InvalidUtf8, write(&out.writer, rec));
+    var diag: Diagnostics = .init(allocator);
+    defer diag.deinit();
+    try testing.expectError(error.InvalidUtf8, write(&out.writer, rec, &diag));
     try testing.expectEqual(@as(usize, 0), out.written().len);
+    try testing.expect(std.mem.indexOf(u8, diag.message, "to") != null);
+    try testing.expect(std.mem.indexOf(u8, diag.message, "body") == null);
 }
 
 test "a body of accented letters, CJK characters, and emoji round-trips through write and parseLine (D14)" {

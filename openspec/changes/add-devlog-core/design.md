@@ -173,10 +173,23 @@ the example log. `#12` can never be confused with `D2`.
 Numbering is derivable — the *n*th `item` record is `#n` — so a rebuild reproduces identical numbers with
 no counter to persist. It is stored explicitly regardless, so the file stays self-describing.
 
-### D10 — `refs` may appear on every record kind
+### D10 — `refs` may appear on every attributed record kind
 
 Including `close`, since a closure's reasoning frequently cites the decision that settled it. Uniform
-across kinds; no per-kind exceptions to remember.
+across the attributed kinds; no per-kind exceptions to remember among them.
+
+**Narrowed during block 4A, on the same ground as D13's role exemption.** `header` carries no `refs`,
+because `header` carries none of the common fields at all — it is not an attributed record. This was
+already true in the implementation the moment 2A gave `header` its own struct rather than the shared
+`Attributed` one, and the earlier phrasing ("every record kind", "no per-kind exceptions") had never been
+reconciled with it. The exemption is the same one, for the same reason: a `header` is the record that
+establishes who may write, so it precedes the vocabulary the other kinds are written in. Nothing else
+changes — `refs` remains free-form, unvalidated, and repeatable on every kind an agent actually addresses
+to anyone. `devlog header` therefore takes no `--ref`, and offering one is an unknown-flag refusal.
+
+This matters beyond tidiness because `8.4` requires the format be reimplementable from the prose alone: a
+reimplementer reading "every record kind" puts a `refs` field on `header` and writes a record this tool
+will not produce.
 
 ### D11 — Locked, atomic appends
 
@@ -275,14 +288,21 @@ an array of integers" is exactly the kind of clause a second implementation gets
 
 ## Record schema
 
-One JSON object per line. Fields common to all kinds:
+One JSON object per line. Three fields are carried by every kind without exception:
 
 | Field | Type | Notes |
 |---|---|---|
 | `kind` | string | one of the eight kinds; determines the remaining fields |
 | `seq` | int | assigned under lock, strictly increasing, contiguous — the total order |
 | `ts` | string | ISO 8601 UTC |
-| `role` | string | must be one of the roles declared in the log's latest `header`; absent on `header` itself (D13) |
+
+The remaining common fields are carried by the seven **attributed** kinds — every kind except `header`,
+which carries none of them (D13 for `role`, D10 for `refs`, and the rest for the same reason: a `header`
+is provenance and declaration, not a post addressed by someone to someone about something):
+
+| Field | Type | Notes |
+|---|---|---|
+| `role` | string | must be one of the roles declared in the log's latest `header` (D13) |
 | `section` | string | optional — the `tasks.md` section, e.g. `"3"` |
 | `block` | string | optional — task range, e.g. `"3.1-3.3"` |
 | `to` | string | optional — addressed role |

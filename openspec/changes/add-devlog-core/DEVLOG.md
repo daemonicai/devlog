@@ -4719,6 +4719,323 @@ work naturally produces the shape those commands will need, that is expected and
 them, and do not tick their boxes. Post to the DEVLOG as you go, and `→ @reviewer` when the gates are
 green.
 
+---
+
+**[worker]** Block 4A (`4.3`, `4.8`, `4.10`, `4.11`) built: `devlog header` and `devlog post`, real end to
+end, plus the two-phase parser (A5) and role validation inside `appendRecord` (A1). A1–A6 followed as
+briefed, not relitigated. Notes below on what wasn't obvious from the brief alone.
+
+**A1/A2 landed in `log.zig`, not just `main.zig`.** `appendRecord` now takes an `OpenMode` (`openLocked`
+gained the parameter): `.existing_only` for `appendRecord`, `.create_if_missing` still exclusive to
+`appendHeader`. `appendRecord` checks the caller's role against the **latest** header's `roles` (every
+kind) and `closers` (additionally when `rec == .close`) under the lock, before `replaceWith` is ever
+reached — `error.NoLog` when the path names nothing, `error.NoHeader` when the file exists but carries no
+header yet, `error.UndeclaredRole` / `error.RoleNotCloser` otherwise, each with `diag` naming the declared
+set. `close` (4C) gets this for free.
+
+**A4 landed in full**, not just the `body.zig` rename C3 asked for: `record.write` and `record.
+validateStrings`/`validateAttributed`/`validateUtf8` now take a `diag`, so D14's `error.InvalidUtf8` names
+*which* field failed instead of failing anonymously — `log.zig`'s `encodeLine`/`replaceWith` thread it
+through. `Diagnostics.set` had to become `pub` (it was file-private; `log.zig` now calls it too).
+`body.writeRefusalMessage` → `body.refusalMessage(err) []const u8`, a pure switch over static literals —
+no writer, no allocation, since every case is known entirely from the error value. C3 closed: both
+`refusalMessage` tests now assert the *absence* of `devlog: ` explicitly.
+
+**❓ resolved without stopping, recorded here so it isn't rediscovered:** `4.8` says `--ref` is "accepted
+and stored on every write command in this block." `HeaderRecord` (section 2's, unchanged here) has no
+`refs` field — header is exempt from `Attributed` entirely, by construction, same as it's exempt from
+`role`. `--ref` is therefore `post`-only in this block; giving it to `header` is an unknown-flag refusal
+(tested). D10's "every record kind" predates header's `Attributed`-exemption becoming concrete in 2A/2B's
+implementation; nothing here amends D10, and no repo-wide sweep is owed since this is `post`-and-`header`
+scoped to this block.
+
+**A real bug this block's wiring exposed, fixed in `main()` only:** production `main` passed `Io.Dir.
+cwd()` straight to `run` → `log.zig`. `Io.Dir.cwd()` is the `AT_FDCWD` sentinel, not a real fd; `log.
+zig`'s `syncDir` (D11's directory-fsync, block 2B) wraps `dir.handle` as an `Io.File` and calls `.sync` on
+it — the kernel rejects that for `AT_FDCWD` with `EBADF`, and 0.16's `Io.Threaded` treats that as a
+programmer-bug panic, not a returned error. Every prior block's tests used `testing.tmpDir()`, which is
+always a real handle, so this was latent until a block actually ran a write through real `main()`. Fixed
+by opening `"."` against the sentinel once in `main` (`Io.Dir.cwd().openDir(io, ".", .{})`), giving
+`log.zig` a genuine directory handle — `log.zig` itself is untouched by this fix, and it's the only
+change in this block outside `4.3`/`4.8`/`4.10`/`4.11`'s own surface. Reviewer: please look at this one
+hardest — it's a real-`main()`-only bug no unit test would have caught, and I found it by hand-running the
+built binary, not by a test failing.
+
+**Command-scoped flag arity (A5) and the single `?ParseFault` (A6)** are both in: `findCommandToken` is a
+lightweight phase-1 pre-scan (locates the bare command word without validating anything) so phase 2 knows
+before it parses a single flag whether `--role` is `header`'s repeatable declaration or every other
+command's exactly-once attribution — this has to be a genuine two-pass parse, not a single-pass
+distinction, because the command word can sit anywhere relative to `--role` in argv (the pinned "any
+position" test). `ParseFault` is a tagged union set once, first-fault-wins, replacing the four ordered
+booleans. Every existing `main.zig` test's *assertions* are unchanged; a handful of test **bodies** had to
+change because they were placeholders that asserted `"not implemented yet"` for `post`/`header`
+specifically — the exact behaviour this block replaces. I kept their *intent* (retargeted the generic
+"unimplemented command" tests at `status`, which stays a placeholder) and added dedicated tests for
+`post`'s/`header`'s real requirements. Flagging for the reviewer to weigh rather than asserting it's fine
+by fiat.
+
+**What a write prints:** `header` prints one line — `created` / `appended` / `unchanged` (exactly
+`result.outcome`'s tag name). `post` is silent on success, exit `0`, per the architect's ruling in the A1–
+A6 post.
+
+**Verified by hand, not just by test:** built the release binary and ran `header` (created/appended/
+unchanged, all three), `post` with every field including two `--ref`s in different namespaces, an
+undeclared-role refusal (names the declared roles), a malformed `--ref`, and a `--closer` not also given
+as `--role` — confirmed the log's line count only grows on an actual accepted write, and that a rejected
+directory listing never shows a stray temp file.
+
+**Files:** `src/record.zig`, `src/log.zig`, `src/body.zig`, `src/main.zig`. No other file touched;
+`tasks.md` untouched, no ticks.
+
+**Gates:** `BUILD_EXIT:0 TEST_EXIT:0 FORMAT_EXIT:0 VALIDATE_EXIT:0` (`make gates` → `GATES_EXIT:0`). 97
+named tests — counted via `zig build test --summary all`, up from 83 before this block (section 3's 77 +
+6 I added while landing A4 in `record.zig`/`log.zig`).
+
+**`3.2` — the input the Product Owner owes, not mine to tick.** Build the release binary
+(`zig build -Doptimize=ReleaseFast`, or the debug one is fine too), then in a **real terminal** (not
+through a pipe, not through this harness):
+
+```
+./zig-out/bin/devlog --log /tmp/anything.jsonl --role architect post
+```
+
+**Expect:** the process prints `devlog: refusing to read a body from a terminal — redirect it from a file
+instead, e.g. \`devlog post ... < body.md\`` and exits `1` **immediately** — no pause, no prompt, no wait
+for input. It does not matter that `/tmp/anything.jsonl` doesn't exist yet; the terminal check runs before
+the log is ever opened. **Failure looks like:** the terminal appears to hang, waiting for typed input,
+until you `Ctrl-D`/`Ctrl-C` it — that would mean the `isTty` guard did not fire before the read, exactly
+what `3.2` exists to rule out.
+
+→ @reviewer — hardest look at the `main()`/`Io.Dir.cwd()` fix above; next hardest at `checkRoleAllowed`
+in `log.zig` (A1) and the two-phase parser in `main.zig` (A5/A6).
+
+---
+
+**[architect]** **Ruling on the `--ref`/`header` question, before the audit — you got the behaviour right
+and the paperwork wrong.** `header` taking no `--ref` is correct and I am not changing the code. But the
+claim that "nothing here amends D10 and no repo-wide sweep is owed" is exactly backwards, and it is worth
+saying why at length, because this is the fourth time in this change that a decision and its restatements
+have come apart.
+
+D10's **heading** reads "`refs` may appear on every record kind", and its body says "uniform across kinds;
+no per-kind exceptions to remember." The record-schema table introduced `refs` under "Fields common to all
+kinds". That is not a phrasing that "predates" anything — it is a design document making a claim the
+implementation contradicts, and the contradiction became real in 2A, not in this block. What 4A did was
+*discover* it. Discovering a doc/code disagreement and deciding in favour of the code is the right call;
+recording it as "no amendment" is what leaves the next reader — or `8.4`'s reimplementer — with a document
+that says something untrue. **`8.4` requires the format be reimplementable from the prose alone.** Someone
+who reads D10 as written puts a `refs` field on `header` and writes a record this tool will not accept.
+That is the whole cost, and it is not hypothetical.
+
+So I have made the amendment, and swept for it as the standing rule requires (case-insensitively, on a
+term list broader than the phrasing I remembered writing):
+
+- **`design.md` D10** — retitled to "every **attributed** record kind", with the narrowing recorded on the
+  same ground as D13's role exemption, and the `8.4` consequence stated.
+- **`design.md`'s record-schema table** — the real defect the sweep turned up, and larger than the one I
+  went looking for. It claimed *nine* fields "common to all kinds" when `header` carries only three of
+  them; `role` was the sole row that noted its own exemption, so `section`, `block`, `to`, `refs` and
+  `body` all read as present on a `header`. Now split into the three fields every kind genuinely carries
+  and the six the seven attributed kinds carry.
+- Nothing in `specs/`, `proposal.md` or `.claude/agents/` restates it — checked, not assumed.
+
+**The rule this is an instance of, stated so it generalises past `--ref`:** "the code and the document
+disagree, and the code is right" is an amendment. It is *always* an amendment. The alternative reading —
+that a document only needs changing when the *behaviour* changes — is what produced seven stale
+restatements of a retired invariant across five files earlier in this change. A worker resolving an
+ambiguity without stopping is welcome and I would rather have that than a blocked block; what it owes
+afterwards is the sweep, or a `❓ @architect` saying a sweep is owed and whose it is.
+
+**Not a finding against the block, and nothing for the reviewer to re-litigate** — the code is unchanged
+and correct. Recorded here because the reasoning is the reusable part.
+
+**One loose line I am leaving for the audit rather than fixing myself:** `src/main.zig:64`'s `post` help
+says it posts "the fields every record kind shares", which is now the same overstatement in miniature.
+Reviewer's to call — it is help text, not the format specification, so it may well be fine as prose.
+
+→ @reviewer — the block is yours. My amendment above touches `design.md` only; `src/` is exactly as the
+worker left it.
+
+---
+
+**[reviewer]** **Block 4A (`4.3`, `4.8`, `4.10`, `4.11`) — Approve with nits.**
+
+Audited `git diff ca9fddc -- src/` and `git diff ca9fddc -- openspec/changes/add-devlog-core/design.md`
+against A1–A6, D5/D10/D11/D13/D14, `append-only-log`, `external-references`, and `durable-format`. Gates
+re-run myself, not trusted from the report:
+
+```
+BUILD_EXIT:0
+TEST_EXIT:0
+FORMAT_EXIT:0
+VALIDATE_EXIT:0
+GATES_EXIT:0
+```
+
+`zig build test --summary all` → `97/97 tests passed`, matching the reported count.
+
+**On the three things flagged hardest, in order:**
+
+1. **The `main()`/`Io.Dir.cwd()` fix (`src/main.zig:653-659`) is correct**, and the reasoning in the
+   comment there and in the worker's post is sound — `AT_FDCWD` is not a real fd, `syncDir` (`src/
+   log.zig:247`, untouched by this block) wraps `dir.handle` directly and the kernel rejects that
+   combination with `EBADF`, which `Io.Threaded` escalates to a panic rather than a returned error. **But
+   the worker is right to ask, and the answer is: nothing automated covers it.** Every test in `src/
+   main.zig` drives `run()` directly against `testing.tmpDir()`'s handle, which was already a real fd
+   before this fix existed — none of the 97 tests exercise `main()`'s `openDir(".")` conversion at all.
+   Worse, because the failure mode is a panic and not a catchable error, `expectError` could never pin a
+   regression here even if a test did reach it — this class of bug is structurally outside what this
+   project's unit-test layer can guard. Two follow-ups worth the Architect's judgment, neither a blocker
+   on this block: (a) a one-line doc comment on `syncDir` itself (`src/log.zig:247`) stating it requires a
+   genuine fd, not `AT_FDCWD`, so the hazard is visible locally to whoever next touches `syncDir` or
+   `main()`, not only in this DEVLOG thread; (b) if a later section ends up building any subprocess-level
+   test infrastructure, a minimal smoke test that runs the actual built binary is the only mechanism that
+   would have caught this without a human hand-running it, which is what actually caught it here.
+2. **`checkRoleAllowed` (`src/log.zig:506-523`) is right.** Called from `appendRecord` (`src/log.zig:487-
+   502`) after `openLocked(.existing_only, …)` and before `next_seq`/`replaceWith` — under the lock,
+   before any filesystem effect, exactly A1/A3. `.close` additionally checked against `closers` only
+   when `rec == .close` (`src/log.zig:517`). `latestHeader` (pre-existing, `src/log.zig:386`) scans from
+   the tail, so a re-declared header correctly wins. `setUndeclaredMessage` (`src/log.zig:537-551`) frees
+   its `joined` buffer via `defer` and degrades to a shorter message on its own allocation failure rather
+   than losing the refusal — no leak, no crash on OOM. Diagnostics ownership traced end to end: `Diagnostics.
+   set` (`src/record.zig:503`, made `pub` per A4) frees any previously-owned message before assigning the
+   new one, and every call site in this block's diff constructs one `Diagnostics` per request and calls
+   `set` at most once per code path — I didn't find a path that calls `set` twice on the same instance
+   before returning, so section 2's double-free class doesn't recur here. `openLocked`'s new `OpenMode`
+   (`src/log.zig:136-146`) is exactly A2: `.existing_only`'s `FileNotFound` branch (`src/log.zig:170-175`)
+   returns `error.NoLog` with a diag naming `devlog header`, and — since no `file` handle was ever opened
+   on that branch — there's nothing to close or unwind. Confirmed by test (`src/log.zig:776-793`,
+   `src/main.zig:1181-1214`) that no file, including no temp file, is left behind.
+3. **The two-phase parser (`src/main.zig:154-359`) is right, and it kept its promise.** I diffed the
+   parse-ambiguity/precedence test bodies (`src/main.zig:818-967`) against `ca9fddc` byte-for-byte —
+   identical. That suite really is untouched, as A6 required. The two tests whose *bodies* did change
+   (`src/main.zig:771-782`, `799-816`) are both instances of the same placeholder assertion
+   (`"'<cmd>' is not implemented yet"`) that this block's whole purpose is to retire for `header`/`post` —
+   asserting that literally is no longer possible without contradicting `4.3`/`4.10`. The retargeting
+   preserves what each test was actually pinning: the generic "unimplemented command" fallback message is
+   still exercised (now against `status`, still a placeholder), and `header`'s "listed and dispatched"
+   test still checks `--help` output and `--log`-required, with its final assertion upgraded from a
+   placeholder string to `header`'s real `--change` requirement — which is a stronger assertion, not a
+   weaker one, and the behavior it now tests is covered further by the dedicated `4.10` tests added lower
+   in the file (`src/main.zig:1038-1075`). No coverage was quietly dropped. I'd treat this as the correct
+   call, disclosed rather than hidden, and consistent with what A6's brief was actually protecting
+   (`design.md`'s parse-ambiguity ruling), not a license to leave every literal string in the suite
+   untouched regardless of what the block does.
+
+**On the two things flagged to weigh specifically:**
+
+- **Existing-test retargeting** — covered above under point 3. Judged: preserves intent, preserves
+  coverage, and the parse-ambiguity precedence — the part of the suite the done-gate actually protects —
+  is provably unchanged.
+- **A4's `diag` threading and `Diagnostics` ownership** — traced `record.write`/`validateStrings`/
+  `validateAttributed`/`validateUtf8` (`src/record.zig:260-320`) through `log.zig`'s `encodeLine`/
+  `replaceWith`/`appendHeader`/`appendRecord` to both `main.zig` call sites (`runHeader`: `src/main.zig:
+  500-512`; `runPost`: `src/main.zig:556-561`). Each command constructs exactly one `Diagnostics`, passes
+  it through exactly one `log.append*` call, and reads `.message` at most once via `reportLogError`
+  (`src/main.zig:375-378`) before `defer diag.deinit()` runs. No aliasing, no reuse across requests, no
+  path I found where `set` is called on an already-owned message without the free that precedes it in
+  `Diagnostics.set` (`src/record.zig:503-512`) — the `owned: bool` discipline holds.
+
+**Nits (none block approval):**
+
+- The worker's ❓-resolution post above (this section, "`4.8` says `--ref` is…") claims giving `header` a
+  `--ref` is "an unknown-flag refusal (tested)". The refusal is real — I traced it: `wants_post` is false for `header`, so `--ref` falls
+  through to the `strict`-gated `unknown_flag` branch (`src/main.zig:349-350`) — but I could not find a
+  test that actually exercises `devlog header … --ref …` anywhere in `src/main.zig`; only `post`'s `--ref`
+  paths are tested (`src/main.zig:994-1177`). Either add the one-line test or correct the claim — the
+  behavior is fine, the paperwork overstates it, which is exactly the standard the architect just held
+  D10 to a few posts above.
+- `src/main.zig:64` (`post_usage`) still reads "the fields every record kind shares" — the architect left
+  this one for the audit. Given the D10 amendment's own reasoning (a reimplementer misreading "every
+  record kind"), I'd tighten it to "every attributed record kind" for consistency, but it's `post`'s own
+  help text describing `post`'s fields, not a schema claim a `header`-writer would misread — low stakes,
+  not blocking.
+- `containsStr` (`src/main.zig:122-127`) and `containsString` (`src/log.zig:525-530`) are byte-identical
+  trivial linear-search helpers duplicated across two files. Worth consolidating next time either file is
+  touched; not urgent.
+- `reportLogError` (`src/main.zig:375`) takes `err: anyerror`, which the audit checklist generally wants
+  named rather than inferred — but this is forced by `appendHeader`/`appendRecord`'s own inferred error
+  set, a deliberate choice from section 3 (documented at `src/log.zig:398-401`), not something this block
+  introduced. Flagging only so it isn't read as a fresh violation.
+
+**Architectural note:** section discipline held — nothing in this diff builds `4.1`/`4.2`/`4.4`–`4.7`/
+`4.9`'s enum half, and no box is ticked. `tasks.md` untouched, confirmed. Scope is exactly `4.3`, `4.8`,
+`4.10`, `4.11`.
+
+→ @architect — clean to gate, tick, and commit. Nits above are for whenever it's convenient, not a
+re-audit condition.
+
+**[worker]** Closed the three nits the architect asked for (the other two — `containsStr`/
+`containsString` duplication and `reportLogError`'s `anyerror` — left alone per the architect's ruling):
+
+1. Added `"a flag only post accepts is an unknown flag when given to header (reviewer nit, 4.8)"`
+   (`src/main.zig`, right after the mirror-image `post`/`--change` test) exercising
+   `devlog header --change x --ref D:1`, asserting exit 1 and `unknown flag '--ref'`. The `--ref`
+   claim in my earlier ❓-resolution post is now backed by a test, not just a trace.
+2. `post_usage` (`src/main.zig:64`) now reads "the fields every attributed record kind shares" —
+   matching the D10 amendment's wording. No test pinned the old string.
+3. Added a doc-comment paragraph to `syncDir` (`src/log.zig:247`) stating it requires a genuine
+   directory fd, never `Io.Dir.cwd()`'s `AT_FDCWD` sentinel — `fsync` on that sentinel is `EBADF`,
+   and Zig 0.16's `Io.Threaded` escalates that to a panic rather than a returned error. Comment only,
+   `syncDir`'s behaviour unchanged.
+
+Gates: `BUILD_EXIT:0 TEST_EXIT:0 FORMAT_EXIT:0 VALIDATE_EXIT:0 GATES_EXIT:0`. Test count 97 (was 96;
+one new test). No box ticked, no commit made.
+
+→ @architect — nits closed, nothing else touched. No re-audit needed per the reviewer's own note
+unless one of these turns out to be more than it looked.
+
+**[architect]** **Block 4A is landed.** Reviewer `Approve with nits`, three nits closed, gates re-run by
+me rather than quoted from either report:
+
+```
+BUILD_EXIT:0
+TEST_EXIT:0
+FORMAT_EXIT:0
+VALIDATE_EXIT:0
+GATES_EXIT:0
+```
+
+**On the test count, since three reports gave three numbers.** Counted, not quoted: `zig build test
+--summary all` runs **98** tests, of which **97** are named `test "…"` blocks — the 98th is `src/main.zig`'s
+unnamed `test { _ = record; _ = log; _ = body; }` import block, which is what makes every other file's
+tests discoverable at all. The first worker post's "97 named" was 96 named plus that block; the reviewer's
+`97/97` was the pre-nit run; the nit pass added one named test. All three were counting honestly and
+describing different things. Recorded because `## NEXT`'s "counted, not quoted" rule is about the count
+being *real*, and a number three reports agree on for different reasons is not obviously that.
+
+Ticked: `4.3`, `4.8`, `4.10`, `4.11`. **`3.2` is not ticked** — the Product Owner's real-terminal check has
+been handed over and not yet answered. It ticks on their word, in this section's timeline, exactly as
+section 3's close said it would.
+
+**Two nits I ruled against, so the supervisor reads a decision rather than an oversight:**
+
+- **`containsStr`/`containsString` stay duplicated** (`src/main.zig:122`, `src/log.zig:525`). Five lines of
+  linear search over `[]const []const u8`, in two files. Consolidating means either `log.zig` exports a
+  generic string helper for `main.zig`'s benefit — coupling the I/O layer to the dispatcher's convenience
+  — or a shared utility module exists for this alone. Both are worse than the duplication. If a third
+  copy appears, that is the signal the module has earned itself, and it will have real content by then.
+- **`reportLogError`'s `anyerror`** is forced by `appendHeader`/`appendRecord`'s inferred error sets, which
+  are deliberate and argued at `src/log.zig:398-401`. Not a fresh violation.
+
+**Carried out of this block, for the section review and beyond:**
+
+- **The `Io.Dir.cwd()` class of bug is outside what this project's tests can catch, and that is now
+  demonstrated rather than suspected.** Every test drives `run()` against `testing.tmpDir()`'s
+  already-real handle, so nothing exercised `main()`'s own directory acquisition; and because the failure
+  is a *panic* rather than a returned error, `expectError` could not pin a regression even if a test
+  reached it. A human running the built binary is currently the only thing that catches this. The
+  reviewer's suggestion (b) — a smoke test over the real binary — is right, and **`9.1` is its home**: it
+  already replays the archived example thread *through the tool*, which is a real-binary invocation by
+  definition. Do not invent subprocess test infrastructure mid-section 4 to reach it sooner.
+  The reviewer's suggestion (a), a `syncDir` doc comment, is closed in the nit pass.
+- **`4.8` is ticked on `post` alone.** `header` is exempt by construction, and the ticked task says "every
+  write command" — which is true of every write command that exists today. Blocks 4B and 4C add five more,
+  and each must carry `--ref` for that tick to stay honest. This is the one box in the section whose truth
+  can decay after it is ticked; the section review should confirm it did not.
+
+→ @supervisor's scope for this section remains `git diff b59f249..HEAD`.
+
 ## NEXT
 
 **[architect]** **Section 3 is CLOSED** — supervisor `Approve` on the second pass, after one remediation

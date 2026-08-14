@@ -124,21 +124,33 @@ fn isStaleLock(file: Io.File, io: Io, dir: Io.Dir, sub_path: []const u8) !bool {
     return held.inode != current.inode;
 }
 
+/// Whether `openLocked` may create the log if the path names nothing yet.
+/// `appendHeader` is the only caller that passes `.create_if_missing`
+/// (D13: declaring the role set is what brings a log into existence).
+/// `appendRecord` always passes `.existing_only` (A2, architect ruling,
+/// section 4): a non-header write against a path with no log must never
+/// create one — creating it and *then* failing a later check (no header
+/// declared, an undeclared role) would leave a zero-byte `DEVLOG.jsonl`
+/// behind, the exact hazard `durable-format`'s "no stray files" requirement
+/// and the section-3 supervisor's carried finding C2 both name.
+const OpenMode = enum { create_if_missing, existing_only };
+
 /// Opens `sub_path` under `dir` for read-write, taking an exclusive lock
-/// — creating the file if it does not exist — confirms the lock is not
-/// stale (retrying against whatever the path names now if it is, bounded
-/// by `max_lock_attempts`), then reads and parses the entire file. Nothing
-/// is written yet: this is "lock, then read the tail" — D11's ordering,
-/// with the staleness recheck folded into "lock". If the existing content
-/// fails to parse (durable-format: a corrupt or partial tail from an
-/// earlier interrupted write), this returns the parse error and touches
-/// nothing further — no write is attempted on top of content that cannot
-/// be trusted.
+/// — creating the file if it does not exist **and** `mode` allows it —
+/// confirms the lock is not stale (retrying against whatever the path
+/// names now if it is, bounded by `max_lock_attempts`), then reads and
+/// parses the entire file. Nothing is written yet: this is "lock, then
+/// read the tail" — D11's ordering, with the staleness recheck folded
+/// into "lock". If the existing content fails to parse (durable-format: a
+/// corrupt or partial tail from an earlier interrupted write), this
+/// returns the parse error and touches nothing further — no write is
+/// attempted on top of content that cannot be trusted.
 fn openLocked(
     allocator: Allocator,
     io: Io,
     dir: Io.Dir,
     sub_path: []const u8,
+    mode: OpenMode,
     diag: ?*record.Diagnostics,
 ) !Opened {
     var attempt: usize = 0;
@@ -155,7 +167,13 @@ fn openLocked(
             // record count once parsed, not from which branch opened the
             // file — an existing-but-empty file behaves identically to a
             // brand new one.
-            error.FileNotFound => try dir.createFile(io, sub_path, .{ .read = true, .truncate = false, .lock = .exclusive }),
+            error.FileNotFound => switch (mode) {
+                .create_if_missing => try dir.createFile(io, sub_path, .{ .read = true, .truncate = false, .lock = .exclusive }),
+                .existing_only => {
+                    if (diag) |d| d.set("no log at this path yet — run 'devlog header' first", .{});
+                    return error.NoLog;
+                },
+            },
             else => return err,
         };
         errdefer {
@@ -226,6 +244,11 @@ var test_before_temp_write_hook: if (builtin.is_test) ?*const fn () error{Simula
 /// never `close`d. Correct on this project's whole target matrix (D12:
 /// macOS arm64, Linux x86_64/arm64), where directory `fsync` is
 /// well-defined; not assumed to generalise beyond it.
+///
+/// `dir` must be a genuine directory file descriptor, never the
+/// `AT_FDCWD` sentinel (`Io.Dir.cwd()`): the kernel rejects `fsync` on
+/// that sentinel with `EBADF`, and Zig 0.16's `Io.Threaded` escalates
+/// that failure to a panic rather than returning it as an error.
 fn syncDir(dir: Io.Dir, io: Io) !void {
     const as_file: Io.File = .{ .handle = dir.handle, .flags = .{ .nonblocking = false } };
     try as_file.sync(io);
@@ -307,10 +330,10 @@ fn atomicReplace(io: Io, dir: Io.Dir, sub_path: []const u8, content: []const u8,
 /// buffer. Building this fully in memory before anything reaches
 /// `atomicReplace` means a failure here (allocation, a writer error) never
 /// touches the filesystem at all.
-fn encodeLine(allocator: Allocator, rec: record.Record) ![]u8 {
+fn encodeLine(allocator: Allocator, rec: record.Record, diag: ?*record.Diagnostics) ![]u8 {
     var out: Io.Writer.Allocating = .init(allocator);
     defer out.deinit();
-    try record.write(&out.writer, rec);
+    try record.write(&out.writer, rec, diag);
     try out.writer.writeByte('\n');
     return allocator.dupe(u8, out.written());
 }
@@ -334,8 +357,16 @@ fn concatOwned(allocator: Allocator, prefix: []const u8, suffix: []const u8) ![]
 /// applied once, not reset on every subsequent write), and an existing
 /// log keeps whatever mode it actually has, including one set outside
 /// this tool (e.g. `chmod`) after the fact.
-fn replaceWith(allocator: Allocator, io: Io, dir: Io.Dir, sub_path: []const u8, opened: *const Opened, rec: record.Record) !void {
-    const line = try encodeLine(allocator, rec);
+fn replaceWith(
+    allocator: Allocator,
+    io: Io,
+    dir: Io.Dir,
+    sub_path: []const u8,
+    opened: *const Opened,
+    rec: record.Record,
+    diag: ?*record.Diagnostics,
+) !void {
+    const line = try encodeLine(allocator, rec, diag);
     defer allocator.free(line);
     const full = try concatOwned(allocator, opened.bytes, line);
     defer allocator.free(full);
@@ -406,7 +437,7 @@ pub fn appendHeader(
     decl: HeaderDeclaration,
     diag: ?*record.Diagnostics,
 ) !HeaderResult {
-    var opened = try openLocked(allocator, io, dir, sub_path, diag);
+    var opened = try openLocked(allocator, io, dir, sub_path, .create_if_missing, diag);
     defer opened.close(allocator);
 
     const created = opened.log.records.len == 0;
@@ -430,7 +461,7 @@ pub fn appendHeader(
         .closers = decl.closers,
     } };
 
-    try replaceWith(allocator, io, dir, sub_path, &opened, new_header);
+    try replaceWith(allocator, io, dir, sub_path, &opened, new_header, diag);
 
     return .{ .outcome = if (created) .created else .appended, .seq = next_seq };
 }
@@ -439,6 +470,12 @@ pub fn appendHeader(
 /// `rec.seq` is ignored and overwritten — callers do not need to compute
 /// it, and could not do so safely outside the lock in any case. Returns
 /// the assigned `seq`. `rec` must not be `.header` — see `appendHeader`.
+///
+/// Opens `.existing_only` (A2): a missing log is refused, naming
+/// `devlog header`, rather than created and then possibly left behind by
+/// a later refusal. Validates the writer's role against the **latest**
+/// header before writing anything (A1, D13, `work-items`) — see
+/// `checkRoleAllowed`.
 pub fn appendRecord(
     allocator: Allocator,
     io: Io,
@@ -449,15 +486,72 @@ pub fn appendRecord(
 ) !u64 {
     if (rec == .header) return error.RecordMustNotBeHeader;
 
-    var opened = try openLocked(allocator, io, dir, sub_path, diag);
+    var opened = try openLocked(allocator, io, dir, sub_path, .existing_only, diag);
     defer opened.close(allocator);
+
+    try checkRoleAllowed(opened.log.records, rec, diag);
 
     const next_seq = record.nextSeq(opened.log.records);
     const stamped = withSeq(rec, next_seq);
 
-    try replaceWith(allocator, io, dir, sub_path, &opened, stamped);
+    try replaceWith(allocator, io, dir, sub_path, &opened, stamped, diag);
 
     return next_seq;
+}
+
+/// A1 (architect ruling, DEVLOG `## 4`, settling `## NEXT`'s N1): "is
+/// this writer entitled to write this record" — role ∈ the **latest**
+/// header's declared `roles` for every kind, and role ∈ its declared
+/// `closers` additionally when `rec` is `.close` (D13, the `work-items`
+/// closer guardrail). One place enforces both, under the lock, against
+/// the latest header (D13: "the latest header wins") — so `close` (block
+/// 4C) inherits this rather than re-implementing it. Called only from
+/// `appendRecord`, after `rec == .header` has already been excluded
+/// there, so `rec.role()` is never `null`.
+fn checkRoleAllowed(records: []const record.Record, rec: record.Record, diag: ?*record.Diagnostics) !void {
+    const latest = latestHeader(records) orelse {
+        if (diag) |d| d.set("no header declared for this log yet — run 'devlog header' first", .{});
+        return error.NoHeader;
+    };
+
+    const writer_role = rec.role().?;
+
+    if (!containsString(latest.roles, writer_role)) {
+        setUndeclaredMessage(diag, "role '{s}' is not declared for this project — declared roles: {s}", writer_role, latest.roles);
+        return error.UndeclaredRole;
+    }
+
+    if (rec == .close and !containsString(latest.closers, writer_role)) {
+        setUndeclaredMessage(diag, "role '{s}' is not a declared closer — declared closers: {s}", writer_role, latest.closers);
+        return error.RoleNotCloser;
+    }
+}
+
+fn containsString(haystack: []const []const u8, needle: []const u8) bool {
+    for (haystack) |s| {
+        if (std.mem.eql(u8, s, needle)) return true;
+    }
+    return false;
+}
+
+/// Joins `declared` with `, ` for the diag message so a refusal names the
+/// actual roles rather than merely counting them — the point of `4.11`.
+/// `comptime fmt` takes exactly two `{s}` args: the writer's role, then
+/// the joined list. Falls back to a shorter message on allocation failure
+/// rather than losing the refusal itself.
+fn setUndeclaredMessage(
+    diag: ?*record.Diagnostics,
+    comptime fmt: []const u8,
+    writer_role: []const u8,
+    declared: []const []const u8,
+) void {
+    const d = diag orelse return;
+    const joined = std.mem.join(d.allocator, ", ", declared) catch {
+        d.set("role '{s}' is not declared", .{writer_role});
+        return;
+    };
+    defer d.allocator.free(joined);
+    d.set(fmt, .{ writer_role, joined });
 }
 
 fn withSeq(rec: record.Record, new_seq: u64) record.Record {
@@ -682,6 +776,144 @@ test "appendRecord refuses a header record rather than bypassing the re-append r
 
     const result = appendRecord(allocator, testing.io, tmp.dir, "DEVLOG.jsonl", header, null);
     try testing.expectError(error.RecordMustNotBeHeader, result);
+}
+
+test "appendRecord refuses a write against a log that does not exist yet, naming devlog header, and creates nothing (A2)" {
+    const allocator = testing.allocator;
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    var diag: record.Diagnostics = .init(allocator);
+    defer diag.deinit();
+
+    const post = record.Record{ .post = .{
+        .common = .{ .seq = 0, .ts = "t", .role = "architect", .body = "hi" },
+    } };
+    const result = appendRecord(allocator, testing.io, tmp.dir, "DEVLOG.jsonl", post, &diag);
+    try testing.expectError(error.NoLog, result);
+    try testing.expect(std.mem.indexOf(u8, diag.message, "devlog header") != null);
+
+    var count: usize = 0;
+    var it = tmp.dir.iterate();
+    while (try it.next(testing.io)) |_| count += 1;
+    try testing.expectEqual(@as(usize, 0), count);
+}
+
+test "appendRecord refuses a write when the log exists but has no header, naming devlog header (A1)" {
+    const allocator = testing.allocator;
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    {
+        var f = try tmp.dir.createFile(testing.io, "DEVLOG.jsonl", .{ .truncate = false });
+        defer f.close(testing.io);
+    }
+
+    var diag: record.Diagnostics = .init(allocator);
+    defer diag.deinit();
+    const before = try readAllLog(allocator, tmp.dir, testing.io);
+    defer allocator.free(before);
+
+    const post = record.Record{ .post = .{
+        .common = .{ .seq = 0, .ts = "t", .role = "architect", .body = "hi" },
+    } };
+    const result = appendRecord(allocator, testing.io, tmp.dir, "DEVLOG.jsonl", post, &diag);
+    try testing.expectError(error.NoHeader, result);
+    try testing.expect(std.mem.indexOf(u8, diag.message, "devlog header") != null);
+
+    const after = try readAllLog(allocator, tmp.dir, testing.io);
+    defer allocator.free(after);
+    try testing.expectEqualStrings(before, after);
+}
+
+test "appendRecord refuses a role the latest header did not declare, naming the declared roles (A1, 4.11)" {
+    const allocator = testing.allocator;
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    var diag: record.Diagnostics = .init(allocator);
+    defer diag.deinit();
+    _ = try appendHeader(
+        allocator,
+        testing.io,
+        tmp.dir,
+        "DEVLOG.jsonl",
+        "t1",
+        "devlog 0.1.0",
+        .{ .change = "x", .roles = &.{ "architect", "worker" }, .closers = &.{"architect"} },
+        &diag,
+    );
+    const before = try readAllLog(allocator, tmp.dir, testing.io);
+    defer allocator.free(before);
+
+    const post = record.Record{ .post = .{
+        .common = .{ .seq = 0, .ts = "t2", .role = "reviewr", .body = "typo'd role" },
+    } };
+    const result = appendRecord(allocator, testing.io, tmp.dir, "DEVLOG.jsonl", post, &diag);
+    try testing.expectError(error.UndeclaredRole, result);
+    try testing.expect(std.mem.indexOf(u8, diag.message, "reviewr") != null);
+    try testing.expect(std.mem.indexOf(u8, diag.message, "architect") != null);
+    try testing.expect(std.mem.indexOf(u8, diag.message, "worker") != null);
+
+    const after = try readAllLog(allocator, tmp.dir, testing.io);
+    defer allocator.free(after);
+    try testing.expectEqualStrings(before, after);
+}
+
+test "appendRecord refuses a close from a role not among the declared closers (A1, forward-looking for 4C)" {
+    const allocator = testing.allocator;
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    var diag: record.Diagnostics = .init(allocator);
+    defer diag.deinit();
+    _ = try appendHeader(
+        allocator,
+        testing.io,
+        tmp.dir,
+        "DEVLOG.jsonl",
+        "t1",
+        "devlog 0.1.0",
+        .{ .change = "x", .roles = &.{ "architect", "worker" }, .closers = &.{"architect"} },
+        &diag,
+    );
+
+    const close = record.Record{ .close = .{
+        .common = .{ .seq = 0, .ts = "t2", .role = "worker", .body = "not mine to close" },
+        .item = 1,
+        .state = .resolved,
+    } };
+    const result = appendRecord(allocator, testing.io, tmp.dir, "DEVLOG.jsonl", close, &diag);
+    try testing.expectError(error.RoleNotCloser, result);
+    try testing.expect(std.mem.indexOf(u8, diag.message, "worker") != null);
+    try testing.expect(std.mem.indexOf(u8, diag.message, "architect") != null);
+}
+
+test "appendRecord accepts a close from a declared closer (A1)" {
+    const allocator = testing.allocator;
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    var diag: record.Diagnostics = .init(allocator);
+    defer diag.deinit();
+    _ = try appendHeader(
+        allocator,
+        testing.io,
+        tmp.dir,
+        "DEVLOG.jsonl",
+        "t1",
+        "devlog 0.1.0",
+        .{ .change = "x", .roles = &.{"architect"}, .closers = &.{"architect"} },
+        &diag,
+    );
+
+    const close = record.Record{ .close = .{
+        .common = .{ .seq = 0, .ts = "t2", .role = "architect", .body = "resolved" },
+        .item = 1,
+        .state = .resolved,
+    } };
+    const seq = try appendRecord(allocator, testing.io, tmp.dir, "DEVLOG.jsonl", close, &diag);
+    try testing.expectEqual(@as(u64, 2), seq);
 }
 
 test "a read against a missing log is a plain not-found, and creates nothing" {
