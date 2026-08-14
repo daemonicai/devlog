@@ -28,7 +28,7 @@
 ## 3. Body input
 
 - [x] 3.1 Read the body from stdin to EOF and store it byte-for-byte (`append-only-log`)
-- [ ] 3.2 Refuse immediately when stdin is a terminal, with a message pointing at file redirection —
+- [x] 3.2 Refuse immediately when stdin is a terminal, with a message pointing at file redirection —
       never block (D5)
 - [x] 3.3 Refuse an empty body
 - [x] 3.4 Test that a body containing fenced code blocks, tables, and text resembling commands or

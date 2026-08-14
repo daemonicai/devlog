@@ -6415,6 +6415,31 @@ were code are fixed at the structural level rather than patched. Closed.
 
 → @architect — `3.2` is excluded from this verdict as before; it is the Product Owner's.
 
+**[architect]** **`3.2` is ticked — the Product Owner ran the terminal check and it passed.** Reported
+output:
+
+```
+devlog: refusing to read a body from a terminal — redirect it from a file instead, e.g. `devlog post ... < body.md`
+```
+
+That is the message `body.refusalMessage` produces for `error.StdinIsTerminal`, printed through
+`main.zig`'s `fail()` with a single `devlog: ` prefix — which also retires the last trace of section 3's
+N-a, where the prefix was composed twice and printed `devlog: devlog: refusing…`.
+
+**What this check actually established, since it is the only gate in this change no test could run.** The
+tests prove the `isTty` branch is *reached* before any read; a harness only ever supplies a pipe, so they
+cannot prove what a real terminal does. The pass condition was never the message text — it was that the
+Product Owner got their shell prompt back. A hang would have produced no output at all until they killed
+it, which is the failure `D5` calls worse than any error, because in an agent harness it burns the turn
+with no diagnostic. Recorded plainly: **the non-hang is inferred from the command returning, not from an
+exit code I observed**, and that inference is the whole content of the check.
+
+**`3.2` ticked retroactively inside section 4's timeline, exactly as section 3's close specified.** Section
+3 is not reopened; its supervisor `Approve` stands. This is the parked obligation being discharged where
+it became dischargeable, which is what an append-only thread is for.
+
+**Sections 1–4 are now fully ticked with no outstanding human-in-the-loop items.**
+
 ## NEXT
 
 **[architect]** **Section 4 is CLOSED** — supervisor `Approve` on the second pass, after one remediation
@@ -6425,8 +6450,9 @@ Product Owner's addressee-validation amendment, mid-section), `e8b6fdb` (4C, `4.
 (rulings and the B3 amendments), `c895f23` (remediation, ticks nothing). Gates `GATES_EXIT:0`, **157**
 named tests / **158** run — counted, not quoted. All eleven boxes ticked.
 
-**Sections 1–4 have exactly one unticked box: `3.2`.** Still the Product Owner's real-terminal check,
-handed over during 4A and unanswered. The recipe is in 4A's worker post. It ticks on their word.
+**Sections 1–4 are fully ticked, with no outstanding human-in-the-loop items.** `3.2` was discharged by
+the Product Owner's terminal check and ticked inside section 4's timeline — see the post immediately above
+this `## NEXT` heading for what that check did and did not establish.
 
 **Section 5 is next** — derived state (`5.1`–`5.6`). It needs no new I/O: everything it derives is already
 in the log, and section 4 established the write-side invariants it may rely on. Read `## 4.`'s decisions
