@@ -11,11 +11,11 @@
 
 ## 2. Record model and the log file
 
-- [ ] 2.1 Define the eight record kinds and their fields as Zig types (`design.md ## Record schema`)
-- [ ] 2.2 Implement serialisation of a record to one JSON line, with bodies stored verbatim
-- [ ] 2.3 Implement parsing of a log file into records, ignoring unknown fields and refusing an
+- [x] 2.1 Define the eight record kinds and their fields as Zig types (`design.md ## Record schema`)
+- [x] 2.2 Implement serialisation of a record to one JSON line, with bodies stored verbatim
+- [x] 2.3 Implement parsing of a log file into records, ignoring unknown fields and refusing an
       unrecognised `format` with a clear message (`durable-format`)
-- [ ] 2.4 Implement `seq` assignment — strictly increasing, contiguous, establishing total order
+- [x] 2.4 Implement `seq` assignment — strictly increasing, contiguous, establishing total order
       (`append-only-log`)
 - [ ] 2.5 Implement exclusive locking and atomic append: the complete line or nothing, `seq` assigned
       under the lock (D11)

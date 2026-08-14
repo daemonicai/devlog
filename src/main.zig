@@ -7,6 +7,14 @@ const build_options = @import("build_options");
 const manifest = @import("manifest");
 const Io = std.Io;
 
+// The record model and its JSON codec (block 2A) have no consumer yet in
+// this dispatcher — sections 4/6/7 wire it in. Referenced here only so
+// `zig build test` discovers its tests; no production logic reaches it.
+const record = @import("record.zig");
+test {
+    _ = record;
+}
+
 /// One subcommand of the surface. `section` names the `tasks.md` section
 /// that owns its real behaviour, so the placeholder help below never
 /// invents a promise this block doesn't keep.

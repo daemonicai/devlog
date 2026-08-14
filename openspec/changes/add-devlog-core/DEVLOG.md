@@ -1637,6 +1637,180 @@ Zig 0.16's `std.json` API, not a remembered one.
 **Done-gates:** `make gates` → `GATES_EXIT:0`, quoting each `LABEL_EXIT:<n>`. Post progress to this
 thread as you go, then hand off `→ @reviewer`. Do not commit and do not tick boxes — those are mine.
 
+---
+
+**[worker]** Block 2A (`2.1–2.4`) implemented in a new `src/record.zig`, no filesystem access. Notes:
+
+- **The eight kinds are a `union(Kind)`**, and `header` is its own payload type (`HeaderRecord`) with no
+  `role`/`section`/`block`/`to`/`refs`/`body` fields at all — the "header carries no role" rule (D13)
+  and the header's distinct shape are enforced by the type, not a check a caller has to remember. Every
+  other kind embeds a shared `Attributed` struct (`seq`, `ts`, `role`, optional `section`/`block`/`to`,
+  `refs`, `body`) plus its own extra fields. `section` (the record kind) and `section` (the common field)
+  stay distinct — the kind is `SectionRecord`, the field is `Attributed.section`.
+- **Serialisation** (`record.write`) drives `std.json.Stringify`'s low-level `beginObject`/`objectField`/
+  `write`/`endObject` API directly rather than auto-deriving from a struct — gives explicit field order
+  matching `design.md`'s example (for a readable `git diff`) and lets optional common fields (`section`,
+  `block`, `to`, empty `refs`) be omitted from the line entirely rather than written as `null`. `write()`
+  produces one JSON object with no trailing newline; joining lines is 2B's call. `std.json`'s own string
+  encoding handles escaping, so newline/quote/control-character bodies round-trip byte-for-byte — tested
+  directly.
+- **Parsing** (`record.parseLine` / `record.parseLog`) goes through `std.json.parseFromSlice(Value, ...)`
+  and reads fields by name off the resulting `ObjectMap` — unknown fields are ignored simply by never
+  being looked at, which is the whole mechanism for durable-format's "ignore unknown fields" half. A
+  `header` whose `format` isn't exactly `record.supported_format` (`1`, the only version this build
+  knows) is refused with `error.UnsupportedFormatVersion`, and a `Diagnostics` out-param (stack buffer,
+  no allocation) carries a formatted message — no filesystem/CLI wiring exists yet in this block, so the
+  message is available to whatever calls this module next (later block/section) rather than printed here.
+- **`seq` / total order (2.4):** `nextSeq(records)` derives one past the current max (`1` for an empty
+  log) — the function 2.5's locked-append will call after re-reading the file. `validateSeqOrder` walks a
+  parsed set in file order and requires strict, contiguous, 1-based `seq`; a gap reports
+  `error.NonContiguousSeq`, a repeat/decrease reports `error.SeqOutOfOrder` — **both are reported as
+  faults, not repaired**, per the brief's ruling (no repair policy invented). `parseLog` runs this after
+  parsing every line.
+- **Allocator hygiene:** every `Record` owns every slice it carries (`Record.deinit`); parsing does
+  exactly one deep-copy pass per record via `.dupe()` off data borrowed from the JSON parse arena — a
+  first pass caught a double-dupe leak in `refs`/`roles`/`closers` (helper functions were duping into
+  owned copies *and* the record's own `.dupe()` was duping again, leaking the first copy); fixed by
+  making the field-array helpers return borrowed-content containers that get freed once `.dupe()` has
+  made the one real copy. Every test uses `std.testing.allocator`, which leak-checks.
+- **`main.zig`** gets one addition: `const record = @import("record.zig");` plus `test { _ = record; }`,
+  so `zig build test` discovers this module's tests — no production code references it yet (sections 4/6
+  own that). No other change to `main.zig`.
+- **Exit codes / format-refusal messaging:** not applicable in this block — no CLI surface touches this
+  module yet (no filesystem, no `main.zig` dispatch to it). `Diagnostics.message` is the "clear message"
+  this block can offer; wiring it to stderr and an exit code is 2B/4.x's job when the file and the CLI
+  path exist.
+
+18 new tests in `src/record.zig`, covering: round-trip for all eight kinds, the header's role-exemption,
+verbatim body survival through newlines/quotes/tabs/CRLF/backslash, unknown-field tolerance, format-
+version refusal with message content asserted, missing-role rejection on non-header kinds, unknown-kind
+rejection, malformed-JSON rejection, `nextSeq` on empty/non-empty sets, seq-order validation (contiguous
+pass, gap, repeat/decrease), multi-line `parseLog` with line-number-on-failure, and D10's
+unvalidated/any-namespace `refs`.
+
+Gates: `BUILD_EXIT:0 TEST_EXIT:0 FORMAT_EXIT:0 VALIDATE_EXIT:0 GATES_EXIT:0` (44 tests total, 0 failures,
+0 leaks).
+
+**[worker]** → @reviewer — block 2A (`2.1–2.4`) ready for audit. Files: `src/record.zig` (new),
+`src/main.zig` (4-line addition to reach it from the test binary). Please look hardest at: the
+`Attributed`/`HeaderRecord` type split actually enforcing D13 rather than merely happening to match the
+example; the borrowed-vs-owned split between the parse helpers and `.dupe()` (the leak class I already
+found once); and whether the field-order/omission choices in `write()` are a defensible reading of
+`design.md`'s example rather than an invented convention.
+
+**[reviewer]** Audit of block `2.1–2.4`, working-tree diff against `0a7d8b0` (`src/record.zig` new,
+`src/main.zig` +8 lines). Re-ran the gates myself rather than trusting the report: `BUILD_EXIT:0
+TEST_EXIT:0 FORMAT_EXIT:0 VALIDATE_EXIT:0 GATES_EXIT:0`, and separately `zig build test --summary all` →
+`44/44 tests passed` (matches the 44/18-new claim). All 44 pass under `std.testing.allocator`, which
+leak-checks on `deinit` — a leak would have failed the run, so "0 leaks" is corroborated, not merely
+asserted.
+
+**Verdict: Approve with nits.**
+
+**The three things you asked me to look hardest at:**
+
+1. **`Attributed`/`HeaderRecord` split — the D13 claim holds.** `HeaderRecord` (`record.zig:141-178`) has
+   no field of type `Attributed` and no `role` field of its own — a `header` literal cannot carry a role,
+   full stop, not by omission-and-hope. Every other kind embeds `Attributed`, whose `role: []const u8`
+   (`record.zig:81`) has no default value, so a Zig struct literal for any non-header kind cannot compile
+   without supplying one. At parse time `parseLine` only reads `format`/`tool`/`change`/`roles`/`closers`
+   for `.header` (`record.zig:533-561`) and unconditionally calls `requireString(obj, "role", ...)` for
+   every other kind (`record.zig:564`, tested at `record.zig:910-919`). I don't see a path — construction
+   or parse — that produces an attributed header or a role-less non-header record. Claim verified.
+
+2. **The double-dupe leak — genuinely fixed, and I didn't find a further instance.** Traced every
+   allocation in the module: `requireStringArray` and `parseRefs` now return containers of *borrowed*
+   content (comments at `record.zig:450-453` and `record.zig:468-470` say so and the code matches), and
+   the single deep-copy pass happens once, in `Attributed.dupe`/`HeaderRecord.dupe`/`Ref.dupe`, called
+   exactly once per record in `parseLine`. The borrowed containers are freed with a bare `defer
+   allocator.free(...)` (`record.zig:549,551,572`) *after* the dupe that consumes them — container freed,
+   contents left alone because they're arena-owned. I checked every `try ... .dupe(allocator)` call site
+   in the `switch (kind)` block (`record.zig:591,598-600,610,624,636`) and each is called exactly once per
+   field per record. No second instance of the pattern. The ownership boundary reads as coherent, not
+   merely leak-free on the paths under test: "helpers return borrowed views, `dupe()` is the one owning
+   copy" is applied uniformly, not per-kind.
+
+3. **`write()`'s field order/omission — the omission choice is well supported, the order claim is
+   slightly overstated.** Omitting absent optional fields rather than emitting `null` is directly
+   supported by `design.md`'s own example: the `section` record at `design.md:238` has no `block`, `to`,
+   or `refs` key at all — not a `null`-valued one — so "omit" is what the example itself does, not an
+   invented convention. The *order* claim in the doc comment (`record.zig:240-242`, "Field order matches
+   `design.md`'s example") is not quite true for `item`: the example at `design.md:240` orders
+   `item, type, to, blocking, refs` (a common field, `to`, interleaved before the kind field `blocking`),
+   while `write()`'s `.item` branch (`record.zig:282-291`) writes `item, type, blocking` (both kind
+   fields) via `writeAttributedHead`/kind-fields/`writeAttributedTail`, then `to` inside the tail —
+   producing `item, type, blocking, to, refs, body`. `blocking` and `to` are transposed relative to the
+   example. JSON field order isn't semantically significant so this isn't a functional bug, but the
+   comment's claim is inaccurate as written — see nit below.
+
+**Everything else checked:**
+
+- **Bodies verbatim (D5)** — actually tested, not just asserted: `record.zig:867-885` round-trips a body
+  containing newlines, quotes, a tab, CRLF, and a backslash, and asserts byte-for-byte equality after
+  parse. Good.
+- **Forward-compat asymmetry** — both halves have real tests: unknown field ignored
+  (`record.zig:887-896`), unsupported `format` refused with a message asserted to name both the offending
+  value and the word "format" (`record.zig:898-908`).
+- **`refs` unvalidated (D10)** — tested with an arbitrary namespace (`record.zig:1017-1027`), no
+  namespace check anywhere in `parseRefs`.
+- **`seq` faults reported, not repaired** — `validateSeqOrder` (`record.zig:666-680`) only ever returns
+  `error.NonContiguousSeq`/`error.SeqOutOfOrder`; no code path renumbers or rewrites a record. Gap,
+  repeat/decrease, and the whole-file `parseLog` propagation are each tested
+  (`record.zig:956-973,1006-1015`).
+- **MPL header** — present verbatim at the top of `record.zig:1-3`.
+- **Version single-source** — `record.zig` contains no version literal in production code; `"devlog
+  0.1.0"` only appears inside test fixture JSON strings representing example log lines, which is correct
+  for this block (2.6 owns stamping `build_options.version` into a real `header`).
+- **`section` collision** — `Attributed.section` (the common field) and `SectionRecord` (the kind) stay
+  distinct in both naming and JSON output; no collapse.
+- **Scope boundary** — no filesystem call anywhere in `record.zig`; `main.zig`'s 8-line addition is
+  purely `@import` + `test { _ = record; }`, no dispatch wiring, no I/O. Correctly deferred to 2B/4/6.
+- **`@intCast` safety** — the one use, `requireU64` (`record.zig:410-417`), checks `n < 0` before casting;
+  no silent truncation.
+- **Makefile** — untouched (`git diff HEAD --stat` confirms only `src/main.zig` and the DEVLOG changed;
+  `record.zig` is new).
+- **Exit codes / stderr wiring** — correctly out of scope; `Diagnostics.message` is available for the CLI
+  layer to consume later, nothing printed or exited from this module.
+
+**Nits (non-blocking):**
+
+- `record.zig:240-242` — the doc comment's claim "Field order matches `design.md`'s example" is not
+  accurate for `.item` (see point 3 above: `to`/`blocking` are transposed vs. the example). Either match
+  the example's order (move the `to` write into the `.item`/`.close`/`.verdict` branches before the
+  kind-specific fields, or move `blocking` after the tail) or soften the comment to something like
+  "field order is stable and readable, not a byte-for-byte match of the example." Since JSON field order
+  carries no semantic weight, either fix is fine — just make the comment true.
+- `record.zig:230` region (n/a) — none further; the module is tight.
+
+**Architectural note (non-blocking, for 2B/4.x):** `Diagnostics` uses a 200-byte stack buffer
+(`record.zig:358`) truncated via `bufPrint(...) catch self.buf[0..]` on overflow — fine for today's
+messages (all comfortably under 200 bytes, including the longest one at `record.zig:537`), but a future
+message that names a long field list, a long path, or a long unrecognised value could silently truncate
+rather than degrade a specific way. Not a finding against this block; worth a glance whenever 2B/4.x
+compose these into longer stderr text.
+
+Blockers: none. Findings above are nits only — clear to commit once the one comment-accuracy nit is
+addressed or judged not worth a fix by the Architect.
+
+---
+
+**[worker]** Nit fixed by changing the code, not the comment. `.item`'s emission in `record.write()`
+(`src/record.zig`) now matches `design.md:240` exactly: `item, type, to, blocking, refs, body` — `to` is
+now written inline between `type` and `blocking` (only when present), and the shared tail helper was
+split so `item` pulls in just `refs`/`body` (`writeRefsAndBody`) while every other kind still gets the
+full `to, refs, body` tail (`writeAttributedTail`, now built on top of `writeRefsAndBody`).
+
+Checked the other seven kinds against `design.md:237–243` line by line as asked, so this closes once:
+`header`, `section`, `brief`, `close`, `verdict`, `next` (and `post`, not in the example but sharing
+`brief`/`next`'s code path) already matched field-for-field — no changes needed there.
+
+`make gates`: `BUILD_EXIT:0 TEST_EXIT:0 FORMAT_EXIT:0 VALIDATE_EXIT:0 GATES_EXIT:0`.
+
+Noted, not touched: the `Diagnostics` 200-byte buffer truncation — carried forward for 2B/4.x as the
+architect flagged.
+
+**[worker]** → @architect — nit addressed, gates green, ready to commit.
+
 ## NEXT
 
 **[architect]** **Section 2 is OPEN** at base `0a7d8b0`, carved into two blocks — **2A (`2.1–2.4`)** the
