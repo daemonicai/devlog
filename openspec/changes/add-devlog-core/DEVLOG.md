@@ -4432,20 +4432,168 @@ writer-based shape — how the two combine through `fail()`) goes in section 4's
 
 → @architect
 
+---
+
+**[supervisor]** **Section 3 review, second pass — `Approve`.** Scope `git diff 5d2e805..HEAD`
+(`46a0913`, `6db3d5c`, `8094e32`, `dbbb62d`). Gates re-run: `BUILD_EXIT:0 TEST_EXIT:0 FORMAT_EXIT:0
+VALIDATE_EXIT:0 GATES_EXIT:0`, 77 tests (12 `body.zig` / 22 `record.zig` / 18 `log.zig` / 25 `main.zig`,
+counted). Working tree clean. Section 3 is closed.
+
+**B1 is genuinely closed, and closed at the right altitude.** I re-derived it rather than taking the
+report:
+
+- `src/record.zig:333-334` — `validateStrings` is `write`'s first statement, before `std.json.Stringify`
+  is even constructed. `src/record.zig:288-316` switches over all eight kinds with **no `else`**, so a
+  ninth kind cannot be added without the compiler demanding its arm. I checked the validated set against
+  what `write` actually emits, field by field: `validateAttributed` (`:267-278`) covers `ts`, `role`,
+  `section`, `block`, `to`, every `refs[].ns`/`.id`, and `body` — exactly what `writeAttributedHead`,
+  `writeAttributedTail` and `writeRefsAndBody` put on the wire — plus `title`/`base` for `section`,
+  `commit` for `verdict`, and `tool`/`change`/`roles[]`/`closers[]` for `header`. Nothing emitted is
+  unvalidated. Everything else on the wire is an enum tag or an integer.
+- One production caller: `src/log.zig:313` (`encodeLine`). One enforcement point, as D14 says.
+- `src/log.zig:337-343` — `encodeLine` fails at `:338`, so `atomicReplace` at `:343` is never reached and
+  no temporary file is ever created. The refusal genuinely writes nothing.
+- The tests assert the property rather than the error. `src/record.zig:1013-1029` pins that the writer
+  received **zero bytes**, not merely that the call failed; `:1031-1045` pins a non-`body` field (`to`),
+  so the check cannot silently regress to body-only; `src/body.zig:377-436` runs the whole
+  `readBody` → `record` → `log` → `parseLog` path and asserts the log's bytes are identical afterwards
+  *and* that no `.tmp-` file was left behind.
+- The positive class is now covered end to end too — `src/body.zig:438-481` carries
+  `"Café review — 日本語のプロジェクト — 🎉🚀 done."` through the full path, and `src/record.zig:1047-1066`
+  through `write`/`parseLine`. That was the untested common case, not just the exotic one.
+
+So, to your question 1: yes. Both input classes now hold through the real path — the accepted class
+reproduced byte-for-byte, the refused class rejected with the log untouched. `append-only-log`'s body
+requirements are satisfied end to end, not merely ticked.
+
+**Question 2 — the remediation introduced nothing, and the module set is more coherent than it found it.**
+`fail()` (`src/main.zig:65-68`) is private, and `"devlog: "` now appears **exactly once** in `src/` — I
+grepped, it is that line and nothing else. Eight call sites route through it. `writeRefusalMessage`
+dropped its prefix (`src/body.zig:137-146`), so the double-prefix is structurally gone rather than
+remembered. `readAllLog` made `pub` (`src/log.zig:487`) removes the second copy and the 3.4 round-trip
+test now uses it; a `pub` test-only helper in a production module is a mild wart, but Zig has no
+test-scoped visibility and the doc comment says plainly what it is. `ReadBodyError` no longer advertises
+`StreamTooLong`. The `log.zig` inferred-error-set argument I accept: an unused declared type that had
+already gone stale is worse than an inferred set, and what I asked for was that the asymmetry be
+*settled with a reason* rather than left accidental — it now is, in `src/log.zig:369-384`. N-b through
+N-g all close.
+
+**Question 3 — D14, the amended D5, the amended spec and the code agree.** I checked each claim against
+the code rather than reading them as a set: `Stringify`'s content-dependent representation switch
+(verified against the pinned `std/json/Stringify.zig:506`), "no error is raised and the write succeeds",
+"the reader requires a string" (`src/record.zig:623`), "every command parses the whole log before doing
+anything" (`src/log.zig:141-164`), "enforced in serialisation, not per command", "eight commands", and
+D5's narrowing to exactly one property with trimming, CRLF and BOM handling untouched — all true of the
+code as written. The D5 amendment codifying whitespace-only as "empty" matches `isBlank`
+(`src/body.zig:112-118`) and its "the bytes returned are always the untrimmed original" matches
+`src/body.zig:103`. `src/body.zig:5-23` no longer makes the claim that caused B1. This is the first
+amendment in this change where the prose and the code came out saying the same thing on the first pass.
+
+**Four things carried forward. None of them blocks, and I am saying that plainly rather than leaving you
+to weigh it.**
+
+**C1 — your section-4 item is bigger than two shapes; it is three, and the third is the new one.** The
+message sources a section-4 command must compose through `fail()` are `record.Diagnostics.message` (a
+plain `[]const u8`, no prefix), `body.writeRefusalMessage` (writer-based, no prefix) — and
+**`error.InvalidUtf8`, which has neither.** `validateStrings` (`src/record.zig:288`) and `write`
+(`src/record.zig:333`) take no `diag`, so this is the one failure path in `record.zig` that sets no
+`Diagnostics` and never says *which field* failed. `specs/append-only-log/spec.md` now says the write is
+"refused with a clear message"; nothing in the tool can currently produce one. That is correct for
+section 3 — `write` is a pure codec and no command exists to print anything — but section 4's brief must
+settle all three together, not the two you named. Two of the three are already plain strings; the
+cheapest reconciliation is a `refusalMessage(err) []const u8` alongside the writer-based one, and a
+decision on whether `write` gains a `diag` or section 4 composes a generic message naming no field.
+
+**C2 — the refusal is inside the lock, after `openLocked` may have created the log.** `src/log.zig:162`
+creates a missing log; the D14 refusal happens later, via `encodeLine`. For an existing log the spec's
+"unchanged, byte for byte" holds exactly and is tested. For a **missing** log, an `appendRecord` refusal
+leaves a zero-byte `DEVLOG.jsonl` that did not exist before. Not reachable in the finished tool — `4.11`
+forces a header to exist before any attributed write — and it is pre-existing `openLocked` behaviour, not
+something the remediation introduced. It is the second instance of the seam I raised last round:
+**refusals must precede any filesystem effect.** That seam now has two instances and belongs in the first
+section-4 write block's brief as a done-gate, alongside `readBody`-before-`openLocked` and the fact that
+`devlog header` must not call `readBody` at all.
+
+**C3 — the N-a fix is held by discipline, not by structure.** Neither `writeRefusalMessage` test
+(`src/body.zig:291-307`) asserts the *absence* of the prefix; both check for substrings that would still
+pass if someone re-added `devlog: `. One `expectEqual(null, indexOf(msg, "devlog:"))` pins it. A nit, for
+`## NEXT`.
+
+**C4 — for `8.4`, and this one is easy to lose.** The spec scopes the UTF-8 `SHALL` to `body`; the code
+validates every string field a record carries. The broader "the tool SHALL NOT write a record it cannot
+read back" sentence covers it and D14 states the breadth explicitly, so the documents agree — but when
+`8.4` writes the record-format specification, the **field-level breadth has to appear there**, or a
+reimplementer validates `body` alone and reintroduces B1 through `--to`.
+
+**One architectural note for the Product Owner, not for a block.** When I tried to read the diff of the
+three `.claude/agents/` files your amendment swept, the guard blocked me — correctly, and I stopped. But
+that means the half of an amendment sweep with the worst track record in this change is the half **no
+auditor in this workflow can see**: `## NEXT`'s standing rule already records that every time an agent
+definition drifted from a decision this session, it was invisible to the audit that should have owned it.
+That is now structural rather than accidental. The only thing that can verify agent-file consistency is
+your own repo-wide grep before you commit. Worth recording as a known limit of the workflow rather than
+solved here.
+
+**On `3.2`** — your resolution is the one I recommended and I have nothing to add: the done-gate lives in
+the first section-4 block's brief, `## NEXT` carries the pointer, and the thread states the retroactive
+tick so the next cold start does not re-open a closed section.
+
+→ @architect
+
 ## NEXT
 
-**[architect]** **Section 3 is OPEN** at base `5d2e805`, as a single block `3.1–3.4` — the stdin read
-path, the terminal and empty refusals, and the verbatim round-trip test. Briefed and with @worker.
-Supervisor scope at section end is `git diff 5d2e805..HEAD`.
+**[architect]** **Section 3 is CLOSED** — supervisor `Approve` on the second pass, after one remediation
+round. Base was `5d2e805`.
 
-**`3.2` will not tick on gates.** Confirming the binary refuses rather than hangs against a *real*
-terminal is a `CLAUDE.md §4` human-in-the-loop task — a test harness only ever supplies a pipe. The
-Product Owner gets a copy-pasteable check and 3.2 waits for their confirmation; 3.1, 3.3 and 3.4 tick
-normally.
+Landed: `6db3d5c` (block `3.1–3.4`), `8094e32` (D14 and the `append-only-log` amendment), `dbbb62d`
+(remediation, ticks nothing). Gates `GATES_EXIT:0`, **77** named tests — counted, not quoted.
 
-**The workflow moved between sections 2 and 3** — `dmons` 0.5.0, `5d2e805`. Boundaries are hook-enforced
-now; see the post above section 3's heading. Section 3's worker is the first agent to run under it, so a
-`BLOCKED by the OpenSpec Apply Workflow` in its report is the guard working, not a fault.
+**`3.2` is implemented, audited, and deliberately unticked.** Confirming the binary refuses rather than
+*hangs* against a real terminal is a `CLAUDE.md §4` human-in-the-loop task: a test harness only ever
+supplies a pipe, so the tests prove the `isTty` branch runs before any read and nothing more. Its
+verification depends on an artefact section 4 produces, so **the Product Owner's TTY check is a done-gate
+in the brief of the first section-4 block that wires a command to `readBody`** — a brief is append-only
+and is read exactly when the obligation becomes dischargeable, which this block is not. **3.2 ticks
+retroactively, inside section 4's timeline.** It is not an unfinished section-3 task, and `CLAUDE.md §1.4`
+should not re-open section 3 over it on a cold start.
+
+**Section 4's first write block must settle three things the section-3 supervisor named. All three are
+already-known consequences, not discoveries to be made again:**
+
+- **C1 — failure reporting has three shapes, not two.** `Diagnostics.message` is a plain string;
+  `writeRefusalMessage` is writer-based; and `error.InvalidUtf8` from D14's check has **no message at all**
+  and names no field, because `validateStrings`/`write` take no `diag`. The spec now promises "refused
+  with a clear message" and nothing can currently produce one. Correct for section 3 — `write` is a pure
+  codec that prints nothing — but the brief must settle all three together. Shape: a
+  `refusalMessage(err) []const u8`, plus a decision on whether `write` gains a `diag`.
+- **C2 — refusals must precede any filesystem effect.** `openLocked` creates the log (`log.zig:162`), so a
+  refusal *after* it leaves a zero-byte `DEVLOG.jsonl` and breaks 1.5. Unreachable in the finished tool
+  (4.11 forces a header first) and pre-existing rather than introduced — but this is the **second**
+  instance of the same seam. So: `readBody` before `openLocked`, and `devlog header` never calls
+  `readBody` at all, since `HeaderRecord` has no body.
+- **C4 — for 8.4:** the spec scopes the UTF-8 `SHALL` to `body`, while the code validates **every** string
+  field. They agree through "never write a record it cannot read back", but the record-format
+  specification must carry the field-level breadth explicitly, or a reimplementer validates `body` alone
+  and reintroduces B1 through `--to`.
+
+**C3 (nit)** — neither `writeRefusalMessage` test (`body.zig:291–307`) asserts the *absence* of the
+`devlog: ` prefix; both would still pass if it were re-added. One assertion pins it.
+
+**Two workflow facts worth knowing before trusting the enforcement, both discovered this session:**
+
+- **The `dmons` 0.5.0 tripwire is inert here.** Its `PreToolUse`/`PostToolUse` pair on Agent calls assumes
+  the tool returns when the agent *finishes*; in this harness agents run in the background and the call
+  returns on *launch*. Measured: snapshot written at `14:17:35`, compared and deleted at `14:17:37`, with
+  the agent still running minutes later. So the **detection** half reports "all clear" unconditionally,
+  which is worse than absent — silence reads as verification. The **prevention** half (`dmons-guard.sh`,
+  `PreToolUse` on each agent's own calls) is unaffected and is doing the real work. Written up for
+  `dmon-dev` at `notes/dmons-0.5.0-tripwire-async-gap.md`.
+- **No auditor can check the `.claude/agents/` half of an amendment sweep** — the guard confines them, and
+  correctly. But that is precisely the half with the worst record in this change: agent definitions have
+  drifted from a decision **three** times (D11, D13, D14), and each time it was invisible to the audit that
+  should logically have owned it. **The architect's own repo-wide grep before committing is the only
+  control that covers it.** A known limit of the workflow, not a gap to be fixed by asking an auditor to
+  look harder.
 
 **[architect]** **Section 2 is CLOSED** — supervisor `Approve` on the second pass, no findings, after one
 remediation round. Base was `0a7d8b0`.
