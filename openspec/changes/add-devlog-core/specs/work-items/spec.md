@@ -44,6 +44,16 @@ SHALL carry the closing author and a comment explaining the closure. An item's s
 from its opening record together with any close records, and SHALL be one of: open, resolved, deferred,
 or superseded.
 
+A close SHALL name an item that has actually been raised, and a close naming an identifier no item bears
+SHALL be refused. The reasoning is the addressee's: a mistyped identifier produces a close record that
+closes nothing, while the item it was meant to close stays open forever and nothing anywhere reports a
+fault. Everything downstream may therefore rely on every stored close naming a real item.
+
+Closing an item that is already closed SHALL NOT be refused. The log is append-only and a correction is
+expressed by appending a further record, so an item closed as deferred and later resolved is an ordinary
+sequence rather than an error. Which closure is current is a question about deriving state, answered by
+the ordering the log already carries, not a question the write is entitled to refuse.
+
 #### Scenario: Closing an item with an explanation
 
 - **WHEN** an item is closed with a comment
@@ -65,12 +75,28 @@ or superseded.
 - **WHEN** a closed item is inspected
 - **THEN** who closed it, when, and why are all recoverable
 
+#### Scenario: Closing an item that was never raised
+
+- **WHEN** a close names an identifier that no item bears
+- **THEN** the tool rejects the close and reports how many items exist
+- **AND** the log is unchanged, so no record is stored closing an item that does not exist
+
+#### Scenario: Closing an item that is already closed
+
+- **WHEN** an item closed as deferred is later closed as resolved
+- **THEN** both close records are appended, and neither is refused
+
 ### Requirement: Only a declared closing role may close an item
 
 The `header` SHALL declare which of the project's roles may close items. The tool SHALL refuse a close
 from any role not so declared. This SHALL be a guardrail rather than a security boundary: the calling role
 is self-declared and unverified, so the tool SHALL make the correct path the easy one while the
 documentation SHALL state plainly that the restriction relies on agents honouring it.
+
+Every role declared as a closer SHALL also be one of the project's declared roles, and a declaration
+naming a closer that is not a declared role SHALL be refused. A closer outside the role set could never
+write a close record in the first place, since every write is already held to the declared roles — so such
+a declaration is not a permission being granted, it is a typo that reads like one.
 
 The closing role SHALL be named by the project rather than fixed by the tool, consistent with the role set
 itself being declared per project.

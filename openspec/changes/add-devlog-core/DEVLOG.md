@@ -5882,6 +5882,271 @@ and a stale comment I noticed and left would be the same fault with my name on i
 
 → @supervisor — section 4 is ready for review. Scope is `git diff b59f249..HEAD`.
 
+---
+
+**[supervisor]** **Section 4 review — `Request changes`.**
+
+Scope `git diff b59f249..HEAD` — seven commits, `ca9fddc` … `e8b6fdb`, read in landing order rather than
+as one cumulative diff. Gates re-run by me, not quoted from the thread:
+
+```
+BUILD_EXIT:0
+TEST_EXIT:0
+FORMAT_EXIT:0
+VALIDATE_EXIT:0
+GATES_EXIT:0
+```
+
+`grep -c '^test "' src/*.zig` → `body.zig` 12, `log.zig` 30, `main.zig` 86, `record.zig` 22 = **150**
+named, **151** run. Matches every report in this section.
+
+I also drove all eight commands end to end through the built binary into one log — the one thing in this
+section nothing automated does (`src/log.zig:1547`'s eight-kind round-trip is at the `log.append*` layer,
+not through `run`). All eight kinds land, `seq` 1–8 contiguous, field order matches `design.md`'s
+record-schema example line for line, `refs` and `to` omitted rather than nulled when absent, and the
+directory afterwards contains nothing but `DEVLOG.jsonl`. Two of the three blockers below came out of that
+run, not out of reading.
+
+### Blockers
+
+**B1 — a stray positional token is silently accepted by every write command this section built, and 4C
+made that reachable by a natural mistake.** `parseArgs`'s final `else` (`src/main.zig:579-587`) assigns the
+first bare token as the command and then leaves every later bare token untouched. That was right in 4A's
+first half, when no section-4 command was real and a trailing word might have been a future positional.
+As of 4C every one of the eight takes **zero** positional arguments, and the branch now swallows them:
+
+```
+devlog --log L --role worker post stray-token < b.md     → exit 0, record written
+devlog --log L --role worker item --blocking true --type note < b.md  → exit 0, prints #1, `true` dropped
+```
+
+Both verified against the built binary. `--blocking` (`src/main.zig:561-562`) is this section's first and
+only bare boolean flag, and `--blocking true` is the single most likely way an agent writes it — that
+invocation raises an item, exits `0`, and reports nothing. Meanwhile the *mistyped-flag* form of the same
+mistake is refused: `strict` (`src/main.zig:519-520, 581`) rejects `post --bogus` with exit 1. Two shapes
+of one error, two opposite outcomes.
+
+This contradicts the axiom this dispatcher states about itself twelve lines from the branch
+(`src/main.zig:1143-1150`): *"Silent success on an unparseable line … is the one outcome this tool must
+never produce."* No block review could see it: 4A introduced `strict` and the `else` together and the
+`else` was correct that morning; 4B extended `strict` to three more commands without touching it; 4C added
+the bare bool that makes it bite. No test pins the current behaviour, so nothing has to be weakened —
+`"flags after the subcommand are left for its own section"` (`src/main.zig:1527`) now points at `show`.
+The fix must stay command-scoped exactly as `strict` is: `search <query>` (7.2) genuinely takes a
+positional.
+
+**B2 — `devlog header` treats a re-ordered or duplicated declaration as a changed one, appending a
+redundant header to an append-only file.** Verified:
+
+```
+header --role architect --role worker --role reviewer --closer architect   → created
+header --role worker --role architect --role reviewer --closer architect   → appended   (same set)
+header --role architect --role architect --closer architect                → appended   roles:["architect","architect"]
+```
+
+`4.10` and D13 both say a header is appended when *the declaration* differs from the latest one; a set
+listed in a different order is not a different declaration, and `["architect","architect"]` is not a
+declaration of two participants. `runHeader` (`src/main.zig:718-725`) validates `--closer ⊆ --role` but
+never that the values are distinct, and `headerUnchanged` compares positionally. The consequence is
+permanent: a spurious header in a log with no repair path, and a `checkRoleAllowed` refusal that reports
+`declared roles: architect, architect`. `headerUnchanged` is section 2's code, but `4.10` is this
+section's ticked box and this section is where a command line first supplies the ordering. I am not
+asserting which rule is right — order-insensitive comparison, or explicitly order-sensitive and documented
+— only that neither the code nor any document currently says, and the box was ticked on wording the
+behaviour does not match.
+
+**B3 — two write-refusal rules this section invented have no spec or design home, in the section that
+twice declared that they must.** The standard is yours, stated twice here and acted on twice: the D10
+sweep ("*'the code and the document disagree, and the code is right' is an amendment. It is *always* an
+amendment*") and the Product Owner's `--to` decision ("*Confirmed behaviour with no spec home is exactly
+what `8.4` cannot be written from*"). Two refusals landed either side of those posts and got neither:
+
+- `checkItemExists` (`src/log.zig:600-608`, block 4C) — `close --item <n>` naming a number no `item`
+  record raised is refused. Nothing in `specs/work-items/spec.md` or `design.md` D6 mentions it. This is
+  not merely a validation nicety: it establishes the invariant *every `close` in a tool-written log
+  targets an item that exists*, which is precisely as load-bearing for `5.1`'s state fold as the `--to`
+  invariant you flagged for `5.5`/`6.1` — and you wrote that one down.
+- `--closer` must also be given as `--role` (`src/main.zig:721-725`, block 4A) — refused at declaration
+  time. `work-items`' "which of the project's roles may close items" implies it at best; `4.10` and D13
+  are silent.
+
+Both were authorised by a brief, so both block reviews correctly passed them; only the whole-section view
+shows the standard being set in the middle and not applied at the end.
+
+### Suggested remediation shape — one block
+
+1. Refuse an unexpected positional token per command, gated the way `strict` is, leaving room for `search
+   <query>`. A test per command, plus `item --blocking true` specifically, since that is the case that
+   turns a silent drop into a written record.
+2. Decide `header`'s declaration-identity rule and write it into D13 or `4.10`'s wording; at minimum
+   refuse a duplicate `--role`/`--closer` value in `runHeader`.
+3. Give B3's two refusals a home — a scenario each in `specs/work-items/spec.md`, and the `checkItemExists`
+   invariant stated where `5.1` will read it — then sweep as the standing rule requires.
+4. While in `main.zig`: `src/main.zig:220` and `src/main.zig:503` both still say the built commands are
+   "`header`, `post`, `section`, `brief`, `next` … as of blocks 4A/4B". 4C made both false, and `:503`
+   describes `strict`'s membership, which is the branch B1 is about.
+
+### Architectural notes — `## NEXT`, not the fix block
+
+- **`value_taking_flags` (`src/main.zig:306-310`) is a hand-maintained mirror of `parseArgs`'s flag arms**,
+  extended separately by all three blocks (4A eight, 4B `--title`/`--base`, 4C five more). They agree today
+  — I checked all fifteen — and nothing links them. A flag added to phase 2 and forgotten in phase 1 makes
+  `findCommandToken` mistake that flag's value for the command token and report `unknown command 'abc'`.
+  Worth a comptime derivation or one test.
+- **`close` and `next` cannot carry `--section`/`--block`.** Deliberate, briefed, and defensible — but
+  `append-only-log`'s "Reading one section" scenario then omits every close from a section view unless
+  `6.3` joins a close back to its item. Section 6's problem; better named now than discovered there.
+- **`brief` is the only one of the seven `--ref`-carrying commands with no assertion that the ref was
+  *stored*** — `src/main.zig:2159` passes `--ref S:4` and asserts nothing about `refs`. The other six do.
+- **`error.RecordMustBeItem` (`src/log.zig:574`) is the one structural guard in the write path with no
+  test**; its two siblings on `appendRecord` have one each.
+- **Line-number citations into prose are decaying.** `src/record.zig:403` and `:461` cite `design.md:240`,
+  which is D13's argument text, not the schema example they mean; `src/main.zig:1181` cites
+  `durable-format/spec.md:56`, now the no-stray-files scenario. Both predate this section, but this section
+  amended `design.md` twice and swept only prose. Cite by name, not by line.
+- **No test drives all eight kinds through `run()` into one log.** `9.1` is the right home and you already
+  parked it there; recording that I did it by hand this once and it was clean.
+
+### On the two non-consolidations, judged rather than noted
+
+**`containsStr`/`containsString` staying duplicated: right, and for a better reason than "not yet a third
+copy".** They answer different questions — `main.zig:285` asks whether a declared closer appears in the
+declaration being written, `log.zig:657` asks whether a writer appears in the latest header already on
+disk. They would not stay one function under change even if they were one today.
+
+**Not pushing `checkRoleAllowed` into `replaceWith`: right, and the reason given is the load-bearing one.**
+D13's header exemption is currently expressed by `HeaderRecord` simply not having the field, which cannot
+be forgotten; re-expressing it as `if (rec != .header)` in the lowest function in the file makes it
+forgeable. The residual is that the guarantee reads "unavoidable for the two public write paths", which
+stays true only while every write path is a caller of `appendLocked` — one line on `replaceWith` saying so
+would make that visible in the file rather than only in this thread.
+
+### The carve, and what I checked and found clean
+
+**The three-block carve held, and 4B's `parseArgs` reshaping was a generalisation, not a new mechanism —
+4C is the evidence.** 4C extended the same `wants_*` membership pattern a third time without touching
+`setOnce`, `takeFlagValue`, `appendRef`, or the strict branch. A new mechanism does not absorb a third
+extension that cheaply. The one thing 4A got wrong that the carve's premise did not catch is B1, and it is
+not the kind of wrongness 4B was briefed to look for: the `else` branch was correct when written and was
+falsified later, by 4C, not by 4B.
+
+Checked specifically, and clean:
+
+- **D14's serialisation boundary was extended to every string field this section added** — `title`/`base`
+  (`src/record.zig:317-321`), `commit` (`:331-334`), `header`'s `change`/`tool`/`roles[]`/`closers[]`
+  (`:310-316`). This was the most likely silent cross-block regression in the section — a section-3
+  invariant against fields that did not exist yet — and it is not there.
+- **`4.8`'s tick is true of the finished section, not just of the moment it was ticked.** `wants_ref_flag`
+  (`src/main.zig:532-533`) covers all seven attributed write commands; `header` is exempt by construction
+  and by the amended D10; six of the seven round-trip a ref in a test (see the `brief` note above).
+- **One derivation each, one write path.** Item numbering exists once (`src/log.zig:517`, under the lock,
+  after `openLocked` parsed the log); `seq` once (`record.nextSeq`); role/addressee/closer membership once
+  (`checkRoleAllowed`); `latestHeader` once. `replaceWith` has exactly two call sites.
+- **No new state.** Eight commands run for real produced one file. No lock file, no cache, no scratch file,
+  no repair/compact/migrate path, no rewrite or truncate anywhere in the diff. ADR-0002 intact by sum, not
+  just per block.
+- **`build.zig.zon` untouched; no MCP, JSON-RPC, daemon, embedding, or model path appeared.** Bodies still
+  reach the log byte-for-byte with UTF-8 validity as the only inspection. Identifiers are the neutral `#n`.
+  The close guardrail checks the latest header's `closers`, never a literal role, and `close --help`
+  (`src/main.zig:152-155`) describes it as a guardrail with the role self-declared and unverified — not
+  hardened into a security boundary.
+- **Gate coverage.** `make fmt` was added correctly as a fixer outside `gates`; nothing this section shipped
+  falls outside a gate target.
+
+**Two rounds, then it is the Product Owner's.** All three blockers are narrow and, I think, one block's
+work. B1 is the one that matters — the other two are paperwork and a comparison rule.
+
+→ @architect — findings are yours to carve. `3.2` is deliberately not mentioned above; it is the Product
+Owner's and is not part of this verdict.
+
+---
+
+**[architect]** **Section 4 supervisor: `Request changes`. All three blockers stand — I am contesting
+none of them, and B1 is the most valuable finding this change has produced.**
+
+**On B1, plainly: this is a correctness bug and the audits that should have caught it are mine and the
+reviewer's, not the supervisor's.** `devlog post stray-token` exits `0` and writes a record. `devlog item
+--blocking true --type note` exits `0`, prints `#1`, and silently drops `true`. Meanwhile `post --bogus`
+is correctly refused. So the tool refuses a mistyped *flag* and accepts a mistyped *argument*, twelve lines
+from a comment of mine asserting that "silent success on an unparseable line … is the one outcome this
+tool must never produce." Three block reviews looked at that parser — one of them byte-diffing its test
+suite — and none caught it, because **no test pins the behaviour and the bug is in the branch that does
+nothing.** An absent refusal has no line to review. That is precisely what section-level review is for,
+and it is worth writing down as the strongest evidence this change has for why the outer loop exists.
+
+Note also that 4C is what made it *reachable*: `--blocking` is the section's only bare boolean, so
+`--blocking true` is the natural agent mistake, and it now silently succeeds. The seam was 4A's; the
+loaded gun is 4C's.
+
+**Two rulings, then a remediation block.**
+
+**Ruling on B2 — the declaration is a set.** Reordering is not a change and appends nothing; a repeated
+`--role`/`--closer` value is refused rather than stored or silently deduplicated. Refused rather than
+deduplicated because silent normalisation is a transformation of the caller's input, and this tool's whole
+posture is that it stores what it is given or refuses it. The rule that makes this matter is that
+re-declaring **appends to an append-only file**: an agent defensively re-running `devlog header` must be
+able to rely on an unchanged declaration writing nothing, and a positional comparison made that guarantee
+depend on argument order. Amended into `specs/append-only-log/spec.md` (two scenarios) and `design.md`
+D13.
+
+**Ruling on B3 — the supervisor is right, and it caught me failing my own standard twice.** I spent this
+section holding D10 and then the `--to` decision to "confirmed behaviour with no spec home is exactly what
+`8.4` cannot be written from", and two write-refusal rules invented in this very section had no home
+either: `checkItemExists` (4C) and `--closer ⊆ --role` (4A). The first is the sharper miss — it establishes
+*every stored close names a real item*, which is as load-bearing for `5.1` as the `--to` invariant is for
+`5.5`/`6.1`, and I wrote that one down while missing this one. Both are now in
+`specs/work-items/spec.md`, with the already-ruled "closing an already-closed item is allowed" recorded
+alongside them, since a rule deliberately *not* implemented needs a home as much as one that is.
+
+`VALIDATE_EXIT:0` after all amendments.
+
+---
+
+**[architect]** **Brief — remediation block, section 4 → @worker.** Supervisor findings **B1** and **B2**.
+**No new `N.M` numbers and nothing ticks** — every box in section 4 is already ticked, and this block's
+record is this thread. B3 is closed already: it was a documentation gap and I have amended the specs; read
+them as they now stand, because your code must match them.
+
+**B1 — a bare positional token after the command must be refused.** `parseArgs`'s final `else`
+(`src/main.zig:579-587`) drops any token that is neither a known flag nor the command word. Make it a
+parse fault, reported through the single `?ParseFault` first-fault-wins structure **A6** established — not
+a new ad-hoc branch beside it. Message should name the token, in the shape the unknown-flag message uses.
+
+**This must be command-scoped, and that is the whole difficulty.** `devlog search <query>` (task 7.2)
+takes a positional argument, so a blanket refusal would build a wall section 7 has to knock down. Give the
+command spec a "takes a positional" property; every one of the eight write commands is `false`, and
+`search` will set it `true` when section 7 builds it. Do not special-case `search` by name now — it has no
+behaviour yet, and a name-based exception is the kind of thing that survives long after the reason for it
+does.
+
+Tests: for at least `post` and `item`, a stray token is refused with exit 1 and **the log is unchanged**;
+and `--blocking true` specifically, since that is the natural mistake 4C's bare boolean invites. Also pin
+that `post --bogus` still refuses — that behaviour is correct today and must not regress while you are in
+this branch.
+
+**B2 — `devlog header`'s declaration is a set.** Per my ruling above, now specified in
+`specs/append-only-log/spec.md` ("The declaration SHALL be a set…", plus two scenarios) and `design.md`
+D13. Two changes:
+
+- `headerUnchanged` (`src/log.zig`) compares `roles` and `closers` **set-wise**, so the same roles in a
+  different order is `unchanged` and appends nothing. It currently compares positionally via
+  `stringSlicesEqual`.
+- `runHeader` (`src/main.zig:718-725`) already checks `--closer ⊆ --role`; add the distinctness check —
+  a repeated `--role` or `--closer` value is **refused**, naming the repeated value. Do not deduplicate
+  silently. Store what remains in the order given.
+
+Tests: same roles reordered → `unchanged`, nothing appended, log byte-identical; a repeated `--role`
+refused with the log unchanged; and confirm the existing `created`/`appended`/`unchanged` tests still
+pass, since B2 changes when `appended` happens.
+
+**Do not fix anything else.** The supervisor's architectural notes (the `value_taking_flags` mirror,
+`close`/`next` carrying no section, `brief`'s unasserted `--ref`, the untested `error.RecordMustBeItem`,
+decaying `file:line` citations) are for `## NEXT`, not for this block. A remediation block that grows
+extra scope is how a second supervisor round gets earned.
+
+**Done-gates:** `make gates` → `GATES_EXIT:0`, exit lines verbatim, test count both ways. `make fmt` if
+`FORMAT_EXIT` is red. Post to the DEVLOG and `→ @reviewer` when green.
+
 ## NEXT
 
 **[architect]** **Section 3 is CLOSED** — supervisor `Approve` on the second pass, after one remediation

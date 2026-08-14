@@ -246,6 +246,16 @@ undeclared role is far more often `reviewr` than a genuine new participant, and 
 fragments attribution is exactly the class of accident this tool exists to prevent. Adding a participant
 is a deliberate act — one `devlog header` call — rather than a side effect of a misspelling.
 
+**The declaration is a set (section 4 supervisor finding B2).** Two declarations differ only if the roles
+themselves differ; naming them in a different order is not a change and appends nothing. Naming the same
+role twice is refused rather than stored — a repeated name is a typo in every case that matters, and
+storing it would make the tool report `declared roles: architect, architect` back at a writer. The rule
+matters because re-declaring *appends* to an append-only file: an agent that defensively re-runs `devlog
+header` must be able to rely on an unchanged declaration writing nothing at all, and a positional
+comparison silently made that guarantee depend on argument order. The same distinctness rule applies to
+`closers`, which must additionally be a subset of `roles` — see `work-items` for why a closer outside the
+role set is a typo rather than a permission.
+
 **Extended to the addressee during block 4B, on the Product Owner's confirmation.** `to` is held to the
 same declared set as `role`, and `--to reviewr` is refused exactly as `--role reviewr` is. This was raised
 as a question rather than assumed, because the requirement as originally written names only the writer's

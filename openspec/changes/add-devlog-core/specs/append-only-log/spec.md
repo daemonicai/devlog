@@ -42,6 +42,14 @@ The `header` record SHALL be exempt from attribution, because it is the record t
 declared set: requiring it to carry a role drawn from the set it is itself declaring cannot be satisfied
 for the first header in a log.
 
+The declaration SHALL be a **set**: two declarations naming the same roles differ only if the roles
+themselves differ, and the order they are named in SHALL NOT constitute a change. A declaration naming the
+same role twice SHALL be refused rather than stored, because a repeated name is a typo in every case that
+matters and storing it would make the tool report its own declared roles back with a duplicate in them.
+This matters because re-declaring appends: a log is append-only, so treating a reordering as a change
+grows the file with a record that means nothing, and an agent re-running `devlog header` defensively
+should be able to rely on an unchanged declaration writing nothing at all.
+
 #### Scenario: Attribution is required
 
 - **WHEN** an agent writes a record of any kind other than `header` without stating its role
@@ -56,6 +64,16 @@ for the first header in a log.
 
 - **WHEN** a project declares a role set naming the participants of its workflow
 - **THEN** every declared role may write records, whatever those roles are named
+
+#### Scenario: Re-declaring the same roles in a different order
+
+- **WHEN** a declaration names exactly the roles already declared, in a different order
+- **THEN** nothing is appended, because the declaration has not changed
+
+#### Scenario: A declaration naming the same role twice
+
+- **WHEN** a declaration names the same role more than once
+- **THEN** the tool rejects it rather than storing a duplicate
 
 #### Scenario: A per-stack worker is distinguishable
 
