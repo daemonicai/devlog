@@ -1811,6 +1811,95 @@ architect flagged.
 
 **[worker]** → @architect — nit addressed, gates green, ready to commit.
 
+---
+
+**[architect]** **Block 2A is landed as `eb01909`** — reviewer `approve-with-nits`, its one nit fixed,
+boxes 2.1–2.4 ticked. I re-ran the gates rather than quoting the worker's: `BUILD_EXIT:0 TEST_EXIT:0
+FORMAT_EXIT:0 VALIDATE_EXIT:0 GATES_EXIT:0`, 44 tests.
+
+Worth recording *how* the nit was fixed, because it is the better precedent: rather than reordering
+`.item`'s fields in place, the worker split the shared tail helper into `writeRefsAndBody` and
+`writeAttributedTail`, then checked the remaining seven kinds against `design.md:237–243` line by line.
+`design.md`'s example is now the single reference for field order and the doc comment saying so is true.
+
+---
+
+**[architect]** **Brief — block 2B (`2.5–2.7`) → @worker.** The I/O layer: take the lock, append
+atomically, write and re-append the `header`, and prove the whole model round-trips. 2A's `src/record.zig`
+is your model and codec — **use it, don't re-implement it**. If 2B needs a change to it, that is a finding
+worth stating, not a quiet edit.
+
+**Tasks:**
+
+- **2.5** Exclusive locking and atomic append: the complete line or nothing, `seq` assigned under the lock
+  (D11).
+- **2.6** The `header` record — carrying `format`, `tool`, `change`, the declared `roles` and `closers`
+  (D13) and no `role` of its own; written on file creation, and appended again whenever the writing tool
+  version or the declaration differs from the last header.
+- **2.7** Round-trip test: write a log of every record kind, re-read it, assert every field and the
+  ordering survive.
+
+**D11 verbatim (`design.md:167–171`):** *"A write takes an exclusive lock on the log for its duration,
+assigns `seq` under that lock, and appends the complete line or nothing. An interrupted write must never
+leave a partial record."* The ordering matters and is the whole point: lock, **then** read the tail to
+learn the next `seq`, **then** append, **then** unlock. Computing `seq` before taking the lock is the
+exact bug the decision exists to prevent, and it will pass every test that runs one writer at a time.
+
+**This is where 1.5's "nothing partial written" stops being free.** Section 1's claim held only
+*structurally* — nothing touched the filesystem, so nothing could be left half-done. From this block on it
+is a real property that needs real evidence. `durable-format`'s "A write interrupted part-way → the file
+does not contain a partial record" needs a test that actually exercises the failure, not one asserting the
+happy path. Concurrency is likewise specified (*"Two writers at once"*) and agents run in series **today**
+— the requirement exists precisely so that ceasing to does not corrupt a log, so test the lock, don't
+reason that it cannot happen.
+
+**The `header` re-append rule (2.6) — state the predicate explicitly in code.** A header is appended when
+the file is created, and again when *either* the writing tool version *or* the declaration (`roles`,
+`closers`) differs from the **last header in the file** — not from the first, and not from any other
+record. Two consequences to get right: a log accumulates a history of headers, so "the declared roles"
+always means the latest header's, and an unchanged tool writing an unchanged declaration appends **no**
+header at all. `format` is the format version, `tool` is the writing tool's version string.
+
+**Scope boundary — no CLI in this block.** The `devlog header` command and its `--closer`/`--role` flags
+are 4.10; the write commands are section 4. 2B builds the append path those will call. Equally: **writes
+may create the log file, reads never do** (`durable-format` — a read against a missing path reports plainly
+that the change has no log yet). You are not building reads here; just don't build a creation side effect
+into a path a read will later take.
+
+**Settling the `Diagnostics` note now rather than deferring it again.** The reviewer flagged
+(non-blocking) that `Diagnostics`'s 200-byte stack buffer silently truncates via
+`bufPrint(...) catch self.buf[0..]` (`src/record.zig:358`). 2B is the block that starts composing real
+error messages — paths, roles, the declared-role list — so it is the right moment. **Ruling: a diagnostic
+must never silently truncate.** A message that says "unsupported format version 7, this build understands
+1" is the whole interface when every failure exits `1`; a truncated one is worse than a generic one,
+because it looks complete. Preferred fix is an allocator-backed message — the allocator is already
+threaded everywhere and the error path exits immediately, so lifetime is trivial. If you would rather stay
+allocation-free, the buffer must be sized to the worst case **and** the overflow path must be an explicit
+error, never a silent fallback. Either is acceptable; say which you chose and why.
+
+**Carried constraints (unchanged from 2A):** bodies verbatim (D5); `refs` unvalidated, any namespace
+(D10); item ids the neutral `#n` sequence (D9); no persisted state but the log (D2) — **no lockfile, index,
+temp file or dotfile left behind**, and `durable-format`'s "no stray files are produced" scenario says *no
+file other than `DEVLOG.jsonl` has been created, modified, or deleted* **whether the command succeeded or
+failed**, so mind what an atomic-write strategy leaves on the failure path; MPL 2.0 header (D12); version
+single-source at `build.zig.zon:3` via `build_options`. Every failure exits `1`.
+
+**2.7 is the section's proof, not a formality.** Write a log containing **every one of the eight kinds**,
+re-read it, and assert every field and the ordering survive — including bodies with newlines, quotes and
+fenced code blocks, records carrying `refs` in several namespaces, and the optional fields both present and
+absent. If it only round-trips the kinds that are easy to construct, it is not the test the task asks for.
+
+**Watch for:** Zig 0.16's filesystem and locking API, not a remembered one — check `std.fs.File`'s lock
+support rather than assuming `flock`; allocator hygiene under `std.testing.allocator`; and tests that
+create files must clean up after themselves (`std.testing.tmpDir`), since a stray artefact would violate
+the very requirement this block implements.
+
+**Stop and ask** if the specs turn out not to settle something — in particular, anything about what a
+*reader* should do with a log whose headers conflict. Report it; don't improvise.
+
+**Done-gates:** `make gates` → `GATES_EXIT:0`, quoting each `LABEL_EXIT:<n>`. Post progress to this thread
+as you go, then hand off `→ @reviewer`. Do not commit and do not tick boxes — those are mine.
+
 ## NEXT
 
 **[architect]** **Section 2 is OPEN** at base `0a7d8b0`, carved into two blocks — **2A (`2.1–2.4`)** the
