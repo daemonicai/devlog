@@ -5359,6 +5359,39 @@ flag was wrong is worse than one that says less** — it sends the reader to the
 confidence. Fixed by having each call site supply its own fallback, without allocating, since the branch
 exists precisely because allocation just failed.
 
+**[architect]** **Product Owner decision: `--to` validation is confirmed — and it is now specified, not
+just implemented.** I flagged it in my landing note as an architect ruling a supervisor could fairly read
+as scope creep, because the spec's words name only the writer's role. The Product Owner has confirmed the
+behaviour is wanted, so the paperwork follows, and by the same standard I held D10 to earlier this
+section: **the code and the document disagreeing is an amendment, always.** Confirmed behaviour with no
+spec home is exactly what `8.4` cannot be written from.
+
+Amended, and swept for first (case-insensitively, broad terms):
+
+- **`specs/append-only-log/spec.md`** — "Every record is attributed to a role" gains a paragraph holding
+  the addressee to the same declared set, plus a scenario, "An undeclared addressee is refused", asserting
+  the refusal *and* that the log is unchanged.
+- **`design.md` D13** — the extension recorded with the argument, not just the outcome.
+- **`.claude/agents/`** — checked, not assumed. No agent definition restates the role rule at all, so
+  nothing there to drift. Recorded because this is the fourth sweep this change and the agent files have
+  been the miss three times.
+
+`VALIDATE_EXIT:0` after the amendment.
+
+**The argument, written down once so it is not re-derived:** the case for validating the addressee is
+*stronger* than the case for validating the author, not weaker. A record attributed to a misspelt author
+is visibly misattributed and someone eventually notices. A record addressed to a misspelt role is
+addressed to **nobody** — stored correctly, reads correctly, and silently absent from every derived
+per-role view: `resume --role <r>`'s open items and its latest brief (D8, task 6.1), and the addressee
+index (5.5). The participant it was written for never sees it, and nothing reports a fault. Same
+silent-fragmentation failure D13 already exists to prevent, one field over, with a worse blast radius.
+
+**Consequence for section 5, flagged now rather than discovered there:** `5.5` builds the addressee index
+and `6.1` reads it. Both may now assume every stored `to` names a declared role — that is a real
+invariant, established at the write boundary, and worth relying on rather than re-checking. It holds for
+records this tool wrote. It does **not** hold for a hand-written log, which is out of scope for this
+change and worth exactly one sentence in `8.4`.
+
 ## NEXT
 
 **[architect]** **Section 3 is CLOSED** — supervisor `Approve` on the second pass, after one remediation

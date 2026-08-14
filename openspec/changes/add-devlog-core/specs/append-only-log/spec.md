@@ -29,6 +29,15 @@ flexibility is in what a project may declare, not in whether a writer may invent
 writing — an undeclared role is far more often a typo that would silently fragment attribution than a
 genuine new participant.
 
+A record's **addressee** SHALL be held to the same declared set as its author, and a write naming an
+addressee the header never declared SHALL be rejected in the same way. The reasoning is the writer's
+reasoning one field over: an addressee is a role name, a mistyped one is far more often a typo than a new
+participant, and the failure it produces is worse than a mistyped author's rather than better. A record
+attributed to a misspelt author is at least visibly misattributed; a record *addressed* to a misspelt role
+is addressed to nobody, and every derived per-role view — the open items a role must act on, the latest
+brief for its block — silently omits it. The record is in the log, correctly stored, and invisible to the
+one participant it was written for.
+
 The `header` record SHALL be exempt from attribution, because it is the record that establishes the
 declared set: requiring it to carry a role drawn from the set it is itself declaring cannot be satisfied
 for the first header in a log.
@@ -57,6 +66,12 @@ for the first header in a log.
 
 - **WHEN** an agent writes a record with a role the header never declared
 - **THEN** the tool rejects the write and reports which roles are declared
+
+#### Scenario: An undeclared addressee is refused
+
+- **WHEN** an agent writes a record addressed to a role the header never declared
+- **THEN** the tool rejects the write and reports which roles are declared
+- **AND** the log is unchanged, so no record is stored addressed to a role that does not exist
 
 ### Requirement: Records reference the work they concern
 

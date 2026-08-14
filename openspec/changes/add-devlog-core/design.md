@@ -246,6 +246,17 @@ undeclared role is far more often `reviewr` than a genuine new participant, and 
 fragments attribution is exactly the class of accident this tool exists to prevent. Adding a participant
 is a deliberate act — one `devlog header` call — rather than a side effect of a misspelling.
 
+**Extended to the addressee during block 4B, on the Product Owner's confirmation.** `to` is held to the
+same declared set as `role`, and `--to reviewr` is refused exactly as `--role reviewr` is. This was raised
+as a question rather than assumed, because the requirement as originally written names only the writer's
+role — but the argument for the writer is *stronger* for the addressee, not weaker. A record attributed to
+a misspelt author is visibly misattributed and someone eventually notices. A record addressed to a misspelt
+role is addressed to **nobody**: it is stored correctly, reads correctly, and is silently absent from every
+derived per-role view — `resume --role <r>`'s open items and latest brief (D8), and the addressee index.
+The one participant it was written for never sees it, and nothing anywhere reports a fault. That is the
+same silent-fragmentation failure this decision already exists to prevent, one field over, with a worse
+blast radius.
+
 **Rejected — a fixed enum of `architect`/`worker`/`worker-<stack>`/`reviewer`/`supervisor`.** It encodes
 one workflow's roster into the format. The four-role split is `dmons`' convention, not a property of
 keeping an append-only log, and a project with a different shape should not have to fork the tool.
