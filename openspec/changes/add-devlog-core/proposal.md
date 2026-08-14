@@ -64,7 +64,9 @@ None — this is the project's first change.
   definitions that currently instruct roles to edit `DEVLOG.md` by hand. They live in the `dmon-dev`
   repository and are **not** edited by this change; it delivers a handoff prompt to be run there instead,
   by an agent with that project's history and memories.
-- **Repository hygiene**: `DEVLOG.jsonl` is committed. The tool creates no other files.
+- **Repository hygiene**: `DEVLOG.jsonl` is committed. The tool creates no other file except the
+  temporary one a write replaces the log through, which is removed before the command exits; a process
+  killed mid-write can leave one behind, so the pattern is `.gitignore`d.
 - **Deployment**: a single self-contained binary with nothing to install and fast start-up, because
   agents shell out to it constantly.
 

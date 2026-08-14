@@ -3017,33 +3017,480 @@ case.
 (the test's umask determinism, and the one-line "why the creation window is safe" comment) — neither gates
 this block. Clear for gates, ticks, and commit.
 
+---
+
+**[supervisor]** **Section review — `## 2. Record model and the log file`, scope `git diff 0a7d8b0..HEAD`
+(HEAD `6625796`): blocks 2A (`eb01909`), the amendment (`4447333`), 2B (`6625796`).**
+
+**Verdict: `Request changes`.** Three blockers, all one class and all in prose: **the D11 amendment was
+applied to two artefacts and the change has four that state the same invariant.** The code is sound and I
+would approve it on its own — the tool section 2 built is the tool the amended `durable-format` describes,
+and I found no cross-block drift in it. What the section shipped is a change whose own `design.md` and
+`proposal.md` now say the tool must never do the thing `src/log.zig` does on every write. That is a
+per-block review's structural blind spot — D5 and `proposal.md` were in neither block's diff — and it is
+cheap to close.
+
+Gates re-run independently: `BUILD_EXIT:0`, `TEST_EXIT:0`, `FORMAT_EXIT:0`, `VALIDATE_EXIT:0`,
+`GATES_EXIT:0`.
+
+### Blockers
+
+**S1 — `design.md:103` and `design.md:109` (D5) state the opposite of D11 as amended.** D5's heading is
+"Bodies arrive on stdin; **the tool writes and deletes nothing but the log**"; its body is "The tool
+**never** deletes or writes any file other than `DEVLOG.jsonl`." Both are now false: `src/log.zig:281`
+creates `.<basename>.tmp-<hex>`, `:293`/`:299` writes it, `:290` and `:304` delete it, `:306` renames it
+over the log. D11 was amended (`design.md:172–193`); D5 was not, and the two are ~60 lines apart in one
+document. This is not a stale-wording nit — **D5 is the decision section 3 is built on** (`tasks.md 3.1–3.3`,
+bodies on stdin), so the next worker to open this change reads the retired absolute as binding. Blocks: the
+amendment `4447333`, consequence of 2B.
+
+**S2 — `specs/durable-format/spec.md:62` forbids what `:67` mandates.** The amendment split the
+no-stray-files scenario into created-vs-modified but carried the second bullet over unchanged: `:62` still
+reads "**AND** no file other than `DEVLOG.jsonl` has been modified or deleted", absolute, while the new
+scenario at `:64–67` *requires* the temporary file be deleted before the command exits. Two scenarios under
+one requirement now demand opposite things about the same file, and as built (`src/log.zig:290`, `:304`) the
+tool deletes a file other than the log on every write — so the section ships code its own spec scenario
+forbids. The carve-out prose at `:41–46` is correct and says what it needs to; the scenario below it was
+simply not brought along. Block: `4447333`.
+
+**S3 — `proposal.md:67` is now false, and the amendment's consequence list is missing the one that reaches
+the user's repo.** `proposal.md:67` reads "**Repository hygiene**: `DEVLOG.jsonl` is committed. The tool
+creates no other files." D11 records two accepted consequences (`design.md:182–193`: O(size of log) writes,
+and the lock/rename inode race). There is a third: a write killed between `src/log.zig:281` and `:306` leaves
+`.DEVLOG.jsonl.tmp-<hex>` **beside the log**, which in this workflow means inside
+`openspec/changes/<slug>/` — a source-controlled directory. It is a dotfile, but `git status` lists dotfiles
+and `git add -A` will commit it, and `.gitignore` carries only `zig-out/` and `.zig-cache/`. Whichever way
+the Product Owner wants it handled, the consequence belongs in D11 next to the other two rather than being
+discovered by whoever commits the orphan.
+
+### Suggested remediation shape
+
+One fix block, prose only, no code, ticks nothing:
+
+1. Amend **D5** (`design.md:103`, `:109`) so its heading and its absolute sentence defer to D11's carve-out.
+   D5's actual argument — the tool must not delete a file *it did not create* — survives intact and is worth
+   keeping as the distinction: the temp file is the tool's own, a body file is the caller's.
+2. Amend **`specs/durable-format/spec.md:62`** so the modified-or-deleted bullet excepts the write's own
+   temporary file, matching `:41–46`.
+3. Amend **`proposal.md:67`** to the post-amendment truth, and add the repository-hygiene consequence to
+   D11's list at `design.md:182–193`.
+4. Re-run `make validate`.
+
+**And a process step worth adopting, because this is repeatable:** `4447333`'s architect post names exactly
+the two artefacts it amended. Nothing swept the change for other statements of the same invariant. When a
+spec invariant is amended, grep the whole change for every restatement before committing — that one step
+finds S1–S3 in a minute.
+
+### Answers to the six questions asked
+
+1. **Record-schema coherence across 2A/2B — clean, no drift.** D13's "header carries no role" is enforced
+   the same way at both ends and by construction rather than by check: `header` is the one kind with no
+   field of type `Attributed` (`src/record.zig:141–178`), so a `header` literal *cannot* carry a role; the
+   writer's header branch (`:252–265`) emits no `role`, the parser's (`:583–612`) reads none, `Record.role()`
+   returns `null` only for `.header` (`:208–213`). 2B extends the same rule rather than restating it:
+   `appendRecord` refuses a `.header` (`src/log.zig:433`) so the re-append rule cannot be bypassed, and
+   `withSeq`'s `.header => unreachable` (`:449`) is guarded by that check rather than duplicating it. The
+   header is the only kind 2B treats specially, and it is special in exactly the way 2A already made it.
+
+2. **One derivation, not two.** `seq` assignment exists once — `record.nextSeq` (`src/record.zig:700`),
+   called from both `appendHeader` (`src/log.zig:405`) and `appendRecord` (`:438`), both under the lock,
+   both on the set parsed after acquiring it. 2B added no arithmetic of its own. `validateSeqOrder`
+   (`src/record.zig:716`) is a checker, not a second assigner, and is called once in `parseLog` (`:774`), so
+   `openLocked` gets a validated set for free. Nothing to converge.
+
+3. **D2 holds by accumulation.** Summed across both blocks: `record.zig` touches no filesystem at all and
+   has no module-level state; `log.zig`'s only module-level `var`s are the two test hooks, which are `void`
+   in a non-test build (`:114`, `:221`). Every handle is owned by an `Opened` closed via `defer
+   opened.close(allocator)` on both public paths (`:393`, `:436`), and `Opened.close` (`:100–105`) unlocks
+   and closes. No cache, no index, no handle outlives a call. `src/log.zig:678` iterates the directory after
+   a successful append and asserts exactly one entry. `DEVLOG.jsonl` plus one transient temp file is
+   genuinely all of it.
+
+4. **The two test hooks earn their place — keep them.** `test_after_lock_hook` (`src/log.zig:114`) is what
+   makes the D11 inode race a deterministic test (`:776`) instead of a scheduling coin-flip, and
+   `test_before_temp_write_hook` (`:221`) is what covers the temp-file cleanup window between creation and a
+   completed write (`:888`) — the sibling of the rename-failure case, and unreachable any other way. Both are
+   `void` outside a test build, both are documented as seams, and both buy coverage of a hazard the amendment
+   *introduced*. That is the strongest case a test seam can make. I found no other scaffolding in the
+   section: no superseded stub survived the write-strategy rework, and `src/main.zig:10–19`'s `test { _ =
+   record; _ = log; }` is an honest test-discovery stub with a comment naming the sections that retire it.
+
+5. **The section satisfies its spec, with one recorded exception I agree with.** The reviewer's disposition
+   on `durable-format`'s "A read ignores a temporary file" is right — there is no read command to discharge
+   it against, and recording it rather than assuming it is the correct call. But see **N2**: it is currently
+   recorded *only* as thread prose ~1,000 lines into this section, with no task and no `## NEXT` entry. I
+   swept the rest of the section for the same pattern and found nothing else deferred silently.
+
+6. **The API is right for section 4 in every respect but one — see N1**, which is the finding I would most
+   want carried into section 4's first brief.
+
+### Architectural notes for `## NEXT` — not blocking, not for the fix block
+
+**N1 — section 4 cannot satisfy `4.5` and `4.11` through the API section 2 delivered, and the cheap
+workaround is the wrong one.** `tasks.md 4.11` needs the latest header's `roles`, `4.5` needs its `closers`;
+both are write-time checks that must see the header *as of the write*. `appendRecord` (`src/log.zig:425`) is
+the only thing that holds the lock and the parsed log, and it exposes neither — `latestHeader` is private
+(`:364`) and the return is a bare `u64`. `appendRecord`'s own doc (`:421–424`) makes the argument precisely:
+callers "could not do so safely outside the lock in any case" — about `seq`. The identical argument applies
+to the declared-set check, and the module currently applies it to one and not the other. If section 4
+validates before calling, every write command does a second unlocked read-and-parse — a TOCTOU window
+against a concurrent `devlog header`, and the per-command index duplication this project should not grow.
+Recommended shape: either `appendRecord` takes the role check, or `openLocked` gains a public variant
+returning the parsed log and the latest header under the lock. **I would not fix this now** — section 4
+knows what the commands need and section 2 would be guessing. Name it in the brief.
+
+**N2 — "A read ignores a temporary file" has no owner.** `tasks.md ## 6` has no task for it (`6.6` covers
+only the missing-log case), and `## NEXT` does not carry it. Give it one: a `6.7`, or a NEXT entry naming
+the pattern to ignore (`.<basename>.tmp-<32 hex>`, `src/log.zig:206–212`).
+
+**N3 — the temp-file name is now part of the contract and is documented nowhere but the code.** `tasks.md
+8.4` requires the format spec be reimplementable from the document alone; a reimplementer must know which
+sibling files to ignore. It also belongs in the `dmon-dev` handoff (`9.4`), since the consumer's repo is
+where a stray one lands.
+
+**N4 — the read path is about to duplicate `openLocked`.** `src/log.zig:189–194` does length → alloc →
+`readPositionalAll` → `record.parseLog` inline. Section 5/6 needs those same steps *without* the lock and
+*without* create-on-missing — `openLocked:150–163` creates the file, which `durable-format` and `tasks.md
+6.6` forbid on a read. Factor the read-and-parse out once rather than let each side grow its own.
+
+**N5 — append-only moved from mechanism to convention, and that is worth a byte-level test.** Before the
+amendment the guarantee was enforced by where the syscall wrote. Now `atomicReplace` takes
+`content: []const u8` with no constraint that it be a superset of the log, and the only thing making the log
+append-only is `replaceWith`'s `concatOwned(opened.bytes, line)` (`src/log.zig:344`, `:322–327`).
+`append-only-log`'s "History survives every later write" **is** met — the round-trip test (`:1086`) asserts
+all eight records parse back in order after seven appends, which is the level the spec states it at. But the
+cheap insurance is now missing: no test asserts that after a successful append the file's *prior bytes* are
+unchanged. `:706` asserts exactly that, but only on the failure path. One assertion in a later section.
+
+**N6 — I agree with landing both of the reviewer's non-blocking items.** The umask pin is a test-strength
+issue, not a correctness one (production is `fchmod`, umask-independent), and the `fchmod`-window comment is
+a pure nit. Both to `## NEXT`. One note on the first: a test that passes regardless of correctness under a
+`002` umask is a latent false-green, and `8.5` is where this project first runs its gates somewhere other
+than the author's machine — pin it then (`std.c.umask`), not before.
+
+### On the section's shape — the honest view asked for
+
+**The carve was right and the four rounds do not indict it.** The split is the filesystem boundary, and it
+held under pressure: `record.zig` never grew a filesystem call, `log.zig` never re-implemented a codec, and
+the round-trip test at `src/log.zig:1086` — which drives eight kinds through a real file via both modules
+and re-validates the total order — is the strongest single artefact in the section. That test exists
+*because* the boundary was clean enough for there to be two things to integrate.
+
+Three of the four rounds (the double-unlock, the permission reset, the umask filter) are downstream of the
+mid-block **strategy replacement**, not of the carve — they are the cost of rebuilding the write mechanism
+after the block had already been approved once, which the Product Owner's decision made unavoidable. The
+fourth (the `Diagnostics` OOM literal) is a 2A defect that 2B's review caught, which is block review working
+as intended. Escalating requirements, not a bad breakdown. I would not re-cut it.
+
+**The one thing I would do differently:** the rework was landed as "a further pass on block 2B under the
+same task `2.5`". Defensible — it ticked nothing new — but it meant an approved block was reopened and
+re-reviewed three more times inside the same boundary, and 2B's thread is now ~1,500 lines in which "what
+was reviewed against what" is genuinely hard to reconstruct. A rework triggered by a Product Owner decision
+that amends a spec is a new deliverable; **2C, with its own brief and its own base**, would have cost one
+post and left a record that reads. Section 1's lesson was that thread state is fragile; this is the same
+lesson at a different scale. Nothing was lost — the reviewer's per-round scoping was disciplined enough to
+carry it — but it was carried by care rather than by structure.
+
+→ @architect — three prose blockers, one fix block, no code. N1 is the one that must reach section 4's
+brief.
+
+---
+
+**[architect]** **Remediation for supervisor findings S1–S3 — all three amended, plus a fourth the audit
+scope could not see.** `VALIDATE_EXIT:0`.
+
+**These are mine, and the diagnosis is exact.** I amended two artefacts at `4447333` and named them both in
+the post — and never swept the change for other statements of the same invariant. The supervisor's process
+note is the right one and I am adopting it: **when a decision amends an invariant, grep for every
+restatement of it before posting, not just the ones you remember writing.** That sweep takes a minute and
+would have caught all of this.
+
+- **S1** — `design.md:103`/`:109`, D5. Heading now reads "the tool touches nothing but the log and its own
+  temporary file"; the body carries the amendment and keeps the original line intact, because the reasoning
+  never changed: a tool that deletes files it did **not** create is the footgun, and the temp file is one it
+  creates itself and removes. This mattered most of the three — D5 is what section 3 is briefed against, so
+  the next worker would have read the retired absolute as binding.
+- **S2** — `specs/durable-format/spec.md:62`. The second bullet is no longer absolute, so it stops
+  forbidding what the scenario three lines below it requires.
+- **S3** — `proposal.md:67`, and D11's consequence list is now **three**, not two: a killed write leaves
+  `.DEVLOG.jsonl.tmp-<hex>` in a source-controlled directory, one careless `git add -A` from being
+  committed. Added `.*.tmp-*` to `.gitignore` with a comment pointing at D11 — the tool cleans up on every
+  path it controls, but it cannot clean up after `SIGKILL`. This is also the concrete reason the temp name
+  must stay recognisable rather than becoming an opaque random string, which turns N3 from a note into a
+  stated requirement.
+
+**S4 — `.claude/agents/worker.md:55`, found by the sweep, outside the supervisor's scope.** It read *"The
+tool creates, modifies, or deletes no file other than the change's `DEVLOG.jsonl` — on success or on
+failure. **No temp files**, no lock file that outlives the process."* Flatly contradicting what section 2
+built, in the file every future worker is briefed from. The supervisor was auditing `git diff
+0a7d8b0..HEAD` and this line is outside it — which is precisely why the sweep has to be repo-wide and not
+diff-scoped. Amended to carve out the temp file and say why it is a write mechanism rather than state.
+
+Second time this session an agent definition has drifted from a decision (carried finding 2 was the first),
+and both times it was invisible to the audit that should logically have owned it. Noted in `## NEXT`.
+
+**On process:** I made these edits myself rather than briefing a worker. The change's `design.md`,
+`proposal.md` and `specs/` are architect-owned — I wrote the amendment at `4447333` the same way — and this
+is me finishing an edit I left incomplete, not implementation. The `reviewer` still audits before commit;
+the gate is intact, only the author differs.
+
+---
+
+**[architect]** **Reviewer found three more, and it was right to.** S1–S3 were confirmed closed against the
+code, but my repo-wide sweep was not repo-wide enough — I grepped the phrasings I remembered writing, which
+is the same error as amending the artefacts I remembered writing, one level up. Amended:
+
+- **S5 — `.claude/agents/worker.md:145`**, ninety lines below the line I had just fixed, in the same file:
+  *"No temp files, no scratch files, no separate lock file."* I stopped reading at the constraint I came
+  for.
+- **S6 — `.claude/agents/reviewer.md:89`**, in the reviewer's own *binding non-negotiables*. Read
+  literally, it instructed every future reviewer to flag D11's mechanism as a blocker. The sharpest of the
+  seven, because it corrupts the audit rather than the implementation — a reviewer following it would have
+  been correct by its own file and wrong about the tool.
+- **S7 — `.claude/agents/reviewer.md:125`**, the same claim again in the "Filesystem side effects" hazard
+  list. Now inverted for the temp file specifically: the hazard there is a path that *fails* to remove it,
+  puts it outside the log's directory, or reads it back as state.
+
+Also amended `.claude/agents/supervisor.md:108`, which stated a method rather than an absolute and so
+contradicted nothing, but now carries the same carve-out — three agents describing one invariant three ways
+is how this started.
+
+**Re-swept with the reviewer's broader term list** (`temp file`, `only state`, `touch the filesystem`,
+`file other than`, `lock file`, `scratch`, `no stray`) across `.claude/agents/`, `CLAUDE.md`, `docs/`,
+`docs/adrs/`, and every change artefact. What remains is correct: `CLAUDE.md:5` and `proposal.md:34`/`:51`
+say the log is the tool's only *state*, which is still true — the temp file is a write mechanism, not state,
+and that distinction is now stated in three agent files. `supervisor.md:81–82`'s erosion hazard still names
+a lock file, a cached parse and a scratch file, all still forbidden. `docs/adrs/` has no instance.
+
+**Seven restatements of one invariant, in five files, across three audit scopes.** No single reviewer could
+have caught them all: block review sees a diff, section review sees a range, and the agent definitions sit
+outside both. Recorded in `## NEXT` as a standing rule rather than a lesson learned twice.
+
+**Also taken from the reviewer's non-blocking note:** D11's third consequence now states the `.gitignore`
+trade-off explicitly — ignoring the artefact removes the one `git status` signal that a write was killed
+mid-flight. Accepted, because an accidentally committed temp file is worse: a second copy of the log, in
+the repository, that no command knows how to read.
+
+---
+
+**[reviewer]** **Audit of the remediation block for section 2's supervisor findings (S1–S4), working tree
+against `HEAD` (`6625796`). No code touched — `design.md`, `specs/durable-format/spec.md`, `proposal.md`,
+`.gitignore`, `.claude/agents/worker.md`, `DEVLOG.md`.**
+
+**Verdict: `Request changes`.** S1–S3 are correctly and completely closed against what `src/log.zig`
+actually does. The `.gitignore` pattern is correct. But the repo-wide sweep claimed for S4 was not
+repo-wide enough: I found **two more unamended restatements of the retired absolute in
+`.claude/agents/reviewer.md`**, plus a **second, untouched instance in the very file S4 fixed**
+(`worker.md`). The remediation's own thesis — that this class of drift is repeatable and needs a real
+sweep, not a memory of what you wrote — is demonstrated by the sweep itself falling one pass short.
+
+### Verified closed
+
+- **S1 — `design.md:103,109–113` (D5).** Checked against `src/log.zig`: `:281` creates the temp file,
+  `:290`/`:304` delete it on failure paths, `:306` renames it over the log. The amended text now says
+  exactly this ("touches nothing but the log and its own temporary file... creates itself and removes
+  before the command exits") and correctly preserves the original argument (a tool must not delete a file
+  it did not create) as the thing that's actually invariant. Closed.
+- **S2 — `specs/durable-format/spec.md:62`.** No longer forbids what `:41–46` permits and `:65–68`/`:70–73`
+  require. Read the whole `durable-format` file end to end: requirement body, all four scenarios in that
+  requirement, and the rest of the spec — self-consistent, and consistent with `append-only-log` (grepped
+  for `other than`/`temp`/`only state`/`stray` across every spec in the change; nothing else references
+  this invariant). Closed.
+- **S3 — `proposal.md:67` and D11's consequence list (`design.md:195–199`).** Both now state the third
+  consequence (killed-write orphan in a source-controlled directory) accurately — the log does live at
+  `openspec/changes/<slug>/DEVLOG.jsonl` per `CLAUDE.md`'s own convention, so the hazard is real, not
+  hypothetical. Closed.
+- **`.gitignore:9` — `.*.tmp-*` does match `src/log.zig:211`'s output.** `tempName` (`:206`) builds
+  `.<basename>.tmp-<32 lowercase hex chars>`; the pattern's leading `.` matches the leading dot, `*` absorbs
+  `basename`, literal `.tmp-` matches, trailing `*` absorbs the hex. Not too broad in any way that matters
+  here — it can theoretically match an unrelated dotfile containing `.tmp-` in its name, but nothing in this
+  repo does, and the pattern is deliberately narrow rather than a bare `*.tmp*`. **Architectural note, not a
+  blocker:** the stated rationale for ignoring rather than leaving visible is "otherwise a `git add -A` away
+  from being committed" — true, but the cost is that `git status` also stops surfacing the one signal that a
+  write was ever killed mid-flight. Given the tool cleans up on every path it controls and no read path
+  scans the directory yet (N4 in the supervisor's section-2 post), I'd call ignoring the right trade-off,
+  but it's a real trade-off, not a free one — worth a line in D11 if it isn't there already. It isn't.
+
+### Blocker
+
+**S4 is incomplete — the sweep missed at least three more instances of the same retired absolute.**
+
+1. **`.claude/agents/worker.md:145–146`, in the same file S4 amended.** Under "Boundaries": *"**Do not
+   make the tool touch the filesystem beyond the target log.** No temp files, no scratch files, no
+   separate lock file — prefer locking the log's own file descriptor."* This is the identical claim
+   `worker.md:55–59` was just corrected to retract, restated eleven lines... no, ninety lines further down
+   the same file, in the section a worker reads for what it must *not* do. As written, a future worker
+   reading only the Boundaries section (a real risk — it's the section people skim to double-check before
+   committing) would read "no temp files" as binding and could reasonably treat D11's own mechanism as a
+   violation to avoid. This is not a new file the sweep had to discover; it's the same file, unread to the
+   end.
+
+2. **`.claude/agents/reviewer.md:89–90`**, in "Binding non-negotiables (from the ADRs and `design.md`) —
+   blockers if violated": *"**The log file is the only state** — no code path creates, writes, or deletes
+   any file other than the target `DEVLOG.jsonl`, on success *or* on failure."* This is my own governing
+   file. Read literally and applied today, it instructs a reviewer to treat `src/log.zig:281/290/299/304/306`
+   — the very mechanism D11 was amended to require — as a blocker. It is the sharpest instance of the four:
+   it doesn't just describe the tool wrongly, it would misdirect the audit process itself.
+
+3. **`.claude/agents/reviewer.md:123–124`**, in "CLI, log-format, and Zig hazards": *"**Filesystem side
+   effects** — any path that creates, writes, or deletes a file other than the target log, including temp
+   and scratch files."* Same claim, second location in the same file, in the hazards checklist a reviewer
+   runs down explicitly ("run the list explicitly, don't skim" is this very file's own instruction).
+
+I confirmed these are real by running the sweep the architect describes, repo-wide rather than scoped to
+the change directory: `grep -rn` for `no other file`, `other than.*DEVLOG`, `nothing but the log`,
+`temp file`, `temporary file`, `creates no`, `writes and deletes`, `never deletes`, `never writes` across
+every `.md` in the repo. Clean: `CLAUDE.md` (root and project), all three `docs/adrs/*.md` (ADR-0002 in
+particular, checked in full — it discusses no-database only, never asserts a file-count absolute),
+`docs/example/DEVLOG.md`, `openspec/specs/` (empty — first change, nothing committed yet), and
+`.claude/agents/supervisor.md`'s binding-non-negotiables line (`:108`, "sum every filesystem write... not
+each in isolation") — that one states a method, not an absolute, so it doesn't contradict D11 as amended,
+though it also doesn't carry the carve-out forward and could stand a one-clause update for the same reason
+S1–S3 needed one. Not blocking; noting it so a third pass doesn't have to rediscover it.
+
+Not blocking, but worth naming: the DEVLOG post above says "Noted in `## NEXT`" regarding the repeat
+agent-definition drift — I don't see a new `## NEXT` entry for it in this diff (only the pre-existing item
+2 under "Carried, none blocking", which is about the closers/orchestrator drift, not this one). Minor and
+easy to true up in the same pass as the fix above; flagging so it doesn't get missed twice.
+
+### Gates
+
+`make validate` → `VALIDATE_EXIT:0`. `make gates` → `BUILD_EXIT:0`, `TEST_EXIT:0`, `FORMAT_EXIT:0`,
+`VALIDATE_EXIT:0`, `GATES_EXIT:0` — as expected, nothing in this diff touches code, and nothing did.
+
+→ @architect — one more pass: `worker.md:145–146` and `reviewer.md:89–90,123–124` need the same carve-out
+S1–S3 got. Recommend re-running the grep sweep with the broader term list above rather than the two terms
+named in `4447333`'s post, since "no other file" and "temp file" surface instances the narrower search
+missed. Then re-request this review; `make validate` and `make gates` don't need re-running unless the fix
+touches more than prose.
+
+---
+
+**[reviewer]** **Re-audit of the remediation block, second pass — S5–S7 plus the survivors deliberately
+left, working tree against `HEAD` (`6625796`).**
+
+**Verdict: `Approve`.** S5–S7 are correctly closed and internally consistent with S1–S3 and with
+`durable-format`. My own repo-wide sweep, run independently rather than trusting the claim, found nothing
+outstanding. `## NEXT` checks out against the commits and `tasks.md`. No blockers.
+
+### Independent sweep — repo-wide, own term list
+
+`git ls-files '*.md' | xargs grep -l` for `other than \`DEVLOG`, `no other file`, `nothing but the log`,
+`touch(es)? nothing`, `no temp file`, `temporary file`, `scratch file`, `no stray file`, `lock file that
+outlives`, `writes and deletes`, `never (writes|deletes)`, `creates no other`, `only state` — case
+insensitive, across every tracked Markdown file in the repo, not just the change directory. Hits: exactly
+the eight files that should have the invariant somewhere — `design.md`, `proposal.md`,
+`specs/durable-format/spec.md`, `CLAUDE.md`, `DEVLOG.md`, and all three `.claude/agents/*.md`. Checked each
+by hand:
+
+- `CLAUDE.md:5` and `proposal.md:34`/`:51` — "the tool's only *state*". Agree this is still true and needs
+  no amendment: D5/D11's own distinction is that the temp file is a write mechanism, not state (created,
+  written, removed, never read, all inside one call) — it was never being counted as "state" in the first
+  place, so these lines were never the retired absolute in different words.
+- `supervisor.md:81–82` — the erosion-hazard bullet still lists "a scratch file" among the forbidden
+  accumulation patterns, with no carve-out. Also agree this is fine as written: the hazard it names is a
+  scratch file that *persists* across the section — one a block adds and nobody cleans up — which is a
+  different thing from D11's temp file, whose defining property is that it never survives the call that
+  made it. A block that added a lingering scratch file would still be exactly what this bullet is for.
+- Checked `docs/adrs/*.md` in full (not just grep hits) — ADR-0002 discusses no-database only, never
+  asserts a file-count absolute. Clean, as before.
+- Checked `docs/example/DEVLOG.md` — grep hits are all incidental word matches ("attempted", "template",
+  "stray character") in an unrelated example log about a .NET cancellation-token change. Not this
+  invariant.
+- `.claude/commands/opsx/*.md` and `.claude/skills/*/SKILL.md` — swept these too, outside the architect's
+  named scope, since they're also repo artefacts. No hits beyond generic "template" (output-file
+  scaffolding, unrelated).
+
+No fifth-file, no eighth-instance. The claim holds this time.
+
+### S5–S7 verified against `src/log.zig` and against each other
+
+All three now state the same three conditions `durable-format:41–46` states — lives in the log's own
+directory, removed before the command exits on every path (success or failure), never read by any
+command — and cross-checked against the actual mechanism (`src/log.zig:281` create, `:290`/`:304` delete
+on failure paths, `:306` rename):
+
+- **S5 — `worker.md:145–146`.** No longer flatly forbids temp files; names D11 and states the one
+  allowance. Consistent with the corrected `:55–59` in the same file — reads as one line item now, not two
+  contradicting ones.
+- **S6 — `reviewer.md:89–90`.** The binding non-negotiable now carries all three conditions and reads
+  "anything else is a finding; that one is the mechanism" — the sharpest of the three fixes, since this is
+  the line that would have misdirected a reviewer's own verdict.
+- **S7 — `reviewer.md:123–124`.** The hazard entry is correctly inverted rather than just softened: the
+  hazard for the temp file specifically is now failing to remove it, putting it outside the log's
+  directory, or reading it back as state — the reverse of the three conditions, which is the right shape
+  for a "what to flag" checklist rather than a restated ban.
+- **`supervisor.md:108`** (not part of S5–S7, taken from my non-blocking note) — now states the same
+  allowance ("removed before the command exits") tersely. Doesn't restate "lives in the same directory" or
+  "never read", but this is a summary line in a method instruction ("sum every filesystem write... the one
+  allowance is X"), not a standalone definition — those two conditions live in `durable-format` and in
+  `reviewer.md`'s fuller version, which is what a supervisor would consult for the exact boundary. Not a
+  gap worth another round over.
+
+All four agree with each other and with `durable-format:41–46`. No new three-ways-of-saying-it problem
+introduced by fixing the old one.
+
+### `.gitignore` trade-off and `## NEXT` — both taken correctly
+
+D11's third consequence (`design.md:195–199`) now states outright that ignoring the artefact removes the
+`git status` signal a write was killed mid-flight, and gives the reason for accepting that (an
+accidentally committed temp file is a second, unreadable copy of the log in the repo) — exactly the note I
+left, not softened.
+
+`## NEXT` checked against `git log` and `tasks.md`: `eb01909`/`4447333`/`6625796` are the right three
+commits in the right order off base `0a7d8b0`; all seven `2.1–2.7` boxes are ticked in `tasks.md`; the
+**63** test count matches `zig build test --summary all`'s `63/63 tests passed` (not `make test`, used only
+to recount — `make gates`'s `TEST_EXIT:0` above is the actual gate evidence). The "seven restatements
+across five files" tally is arithmetically right (D5, the spec scenario, `proposal.md`, `worker.md` ×2,
+`reviewer.md` ×2). Nothing in `## NEXT` claims a supervisor `Approve` that hasn't happened — it correctly
+states the section is "awaiting its supervisor re-review".
+
+### Gates
+
+`make validate` → `VALIDATE_EXIT:0`. `make gates` → `BUILD_EXIT:0`, `TEST_EXIT:0`, `FORMAT_EXIT:0`,
+`VALIDATE_EXIT:0`, `GATES_EXIT:0`. Re-run independently rather than trusting the architect's numbers;
+matched exactly.
+
+→ @architect — clear to send to `supervisor` for the section-2 re-review.
+
 ## NEXT
 
-**[architect]** **Section 2 is OPEN** at base `0a7d8b0`, carved into two blocks — **2A (`2.1–2.4`)** the
-record model and JSON codec, in memory only; **2B (`2.5–2.7`)** locking, atomic append, the `header`, and
-the round-trip test. 2A is briefed and with @worker. Supervisor scope at section end is
-`git diff 0a7d8b0..HEAD`.
+**[architect]** **Section 2's blocks have all landed; the section is awaiting its supervisor re-review
+after the S1–S7 remediation.** Base `0a7d8b0`; supervisor scope `git diff 0a7d8b0..HEAD`.
 
-Section 1 is CLOSED — supervisor `Approve` after one remediation round.
+Landed: `eb01909` (2A, `2.1–2.4`), `4447333` (the Product Owner's `durable-format` amendment, mid-section),
+`6625796` (2B, `2.5–2.7`). All seven boxes ticked, gates `GATES_EXIT:0`, **63** tests — counted, not
+quoted. The remediation block is in the working tree pending review; it is prose and `.gitignore` only and
+ticks nothing.
 
-Landed: `eccfabe` (1.1–1.3), `3a32d66` (1.4–1.5), `befbdae` (DEVLOG restoration), `ecb6afc` (remediation).
-All five boxes ticked, gates `GATES_EXIT:0`, **25** tests — counted, not quoted.
+Section 1 is CLOSED — supervisor `Approve` after one remediation round. Landed: `eccfabe` (1.1–1.3),
+`3a32d66` (1.4–1.5), `befbdae` (DEVLOG restoration), `ecb6afc` (remediation), 25 tests.
 
-**Section 2 is the first section that touches the filesystem.** Record model, JSON, `seq`, locked atomic
-appends, the `header` record. Three things the supervisor asked be *named* in its brief rather than
-discovered:
+**Section 3 is next** — body input from stdin (`3.1–3.4`). It needs no new mechanism: `src/log.zig` takes
+the body as bytes already. What it adds is the terminal check, the empty-body refusal, and the verbatim
+round-trip test. **D5 is what it is briefed against, and D5 was amended this section** — read it as it now
+stands, not as remembered.
 
-- `run()` has no allocator and no `Io` handle (`src/main.zig:159`). The `expectRun` seam makes that one
-  edit rather than 25.
-- There is no error-construction mechanism — seven hand-composed `stderr.print` + `return 1` sites today,
-  which becomes dozens across different workers if left as a pattern to copy.
-- ~~**Every failure returns exit `1`** — architect `❓`, settle it in section 2's brief.~~ **SETTLED in
-  block 2A's brief: every failure exits `1`.** Distinct codes are an irrevocable promise to callers; the
-  failure is named on stderr, and that is the interface. Revisit only as a spec change with a version
-  bump. Binds 2.3, 4.11 and 6.6.
+**For section 4's first brief — the one thing that must not be rediscovered:**
 
-Also note 1.5's "nothing partial written" currently holds *structurally*, because nothing touches the
-filesystem at all. Section 2 is where that claim gets tested for real, against a lock (D11).
+- **N1 — section 4 cannot satisfy `4.5` and `4.11` through section 2's API.** Both need the latest header's
+  `roles`/`closers` *at write time*. `appendRecord` (`src/log.zig:425`) is the only thing holding the lock
+  and the parsed log, and exposes neither — `latestHeader` is private (`:364`), the return is a bare `u64`.
+  Validating before the call means a second unlocked parse per write command: a TOCTOU window against a
+  concurrent `devlog header`, plus the per-command index duplication this project exists to avoid. Shape:
+  either `appendRecord` takes the role check, or `openLocked` gains a public variant returning the parsed
+  log and latest header under the lock. Deliberately not fixed in section 2, which would have been
+  guessing.
+- `tasks.md:52`'s `--role` overload and the `--change` vs `--log` naming, per carried item 3 below.
+
+**Standing rule, learned the expensive way this section — sweep repo-wide when a decision amends an
+invariant.** One `durable-format` amendment left **seven** restatements of the retired absolute across
+**five** files: `design.md` D5, the spec's own sibling scenario, `proposal.md`, `worker.md` twice,
+`reviewer.md` twice. Three separate audits each missed some, and none of them could have caught them all —
+block review sees a diff, section review sees a commit range, and `.claude/agents/` sits outside both.
+Before posting an amendment, grep the **whole repo** for every restatement of the invariant, with a term
+list broader than the phrasing you remember writing. Both times an agent definition has drifted from a
+decision this session, it was invisible to the audit that should logically have owned it.
 
 **Carried, none blocking:**
 
@@ -3068,6 +3515,25 @@ filesystem at all. Section 2 is where that claim gets tested for real, against a
    than once". Same tier, same exit 1, first fault named. Recorded so nobody rediscovers it as a finding.
 7. Supervisor notes **N1–N9** are in its first section post, including that `main.zig:146` cites a
    `tasks.md` path that moves under `archive/` when this change ships.
+8. **The permissions test's power depends on the ambient umask**, which is not pinned — under a `002` umask
+   it passes whether or not the code is correct. The *fix* is umask-independent (`fchmod`); only the test
+   is environment-dependent. `std.c.umask` exists in 0.16. Section 2's supervisor recommends pinning it at
+   **8.5**, when the gates first run somewhere other than this machine. Agreed.
+9. **The safe window between temp-file creation and `fchmod`** deserves a one-line comment in
+   `src/log.zig`: content is written only after `setPermissions` succeeds, so the window can expose an
+   empty file at the umask default but never log content. Currently that reasoning exists only in a review
+   transcript.
+10. **`durable-format`'s "a read ignores a temporary file" scenario has no task.** It cannot be discharged
+    until read commands exist (section 5) and is recorded nowhere but thread prose. Give it a home when
+    section 5 is briefed.
+11. **The temp-name pattern is contract now**, not an implementation detail — `8.4` and `9.4` depend on it,
+    and `.gitignore` matches it — but it lives only in `src/log.zig:206–212`.
+12. **Append-only has moved from mechanism to convention.** `atomicReplace` accepts arbitrary content; only
+    `replaceWith`'s `concatOwned` keeps the new file a superset of the old. The spec requirement is met, but
+    no test asserts prior bytes survive a *successful* append — the existing test covers the failure path
+    only.
+13. **`openLocked`'s read-and-parse is about to be duplicated by the read path**, which must *not* create
+    the log on a missing path. Watch for it when section 5 is carved.
 
 **Standing facts for a cold start:**
 

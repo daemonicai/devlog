@@ -100,15 +100,17 @@ costs an agent no context until actually used.
 schemas occupy every agent's context permanently, and these subagents already have shell access. An MCP
 surface can be added later over the same core if a harness ever needs it.
 
-### D5 — Bodies arrive on stdin; the tool writes and deletes nothing but the log
+### D5 — Bodies arrive on stdin; the tool touches nothing but the log and its own temporary file
 
 Bodies are Markdown containing fenced code blocks, so composing them inline in a shell heredoc is a
 quoting accident waiting to happen — in a tool whose purpose is preventing format accidents. Agents write
 the body to a file in their own ephemeral scratch directory and redirect it in.
 
-The tool **never** deletes or writes any file other than `DEVLOG.jsonl`. A tool that deletes files it did
-not create is a footgun: one mistyped path destroys real work, and there is no good answer to whether it
-should also delete on failure.
+The tool writes and deletes no file other than `DEVLOG.jsonl` and — **amended with D11 during block 2B** —
+the single temporary file a write replaces the log through, which it creates itself and removes before the
+command exits. A tool that deletes files it did **not** create is a footgun: one mistyped path destroys
+real work, and there is no good answer to whether it should also delete on failure. That is the line, and
+it is unchanged: the tool cleans up after itself and touches nothing else.
 
 **Guard against hanging:** if stdin is a terminal, or empty, the tool fails immediately with a clear
 message. A hung invocation is worse than an error in an agent harness — it burns the turn with no
@@ -179,7 +181,7 @@ therefore stages the new content in a temporary file alongside the log and `rena
 `durable-format`'s no-stray-files requirement is amended to carve out exactly this one temporary file,
 which must not outlive the write that made it.
 
-Two consequences, both accepted deliberately:
+Three consequences, all accepted deliberately:
 
 - **A write is O(size of log), not O(size of record)**, because atomic replacement means writing the whole
   file. DEVLOGs are small — a long-running change is hundreds of kilobytes — and a write happens once per
@@ -190,6 +192,14 @@ Two consequences, both accepted deliberately:
   replaced, and would silently write its record into an orphan. After taking the lock, a writer must
   confirm the path still resolves to the inode it holds open, and start over if it does not. This is the
   hazard the strategy introduces; it is not optional.
+- **A killed write leaves its temporary file in a source-controlled directory.** The log lives in
+  `openspec/changes/<slug>/`, so an abandoned `.DEVLOG.jsonl.tmp-<hex>` shows up in `git status` and is
+  one careless `git add -A` away from being committed. The tool cleans up on every path it controls, but
+  it cannot clean up after `SIGKILL`, so the pattern is `.gitignore`d. This is also why the temp name must
+  stay recognisable rather than becoming an opaque random string. The trade-off is real and accepted:
+  ignoring the artefact also removes the `git status` line that would otherwise be the only signal a write
+  was ever killed mid-flight. An accidentally committed temp file is the worse outcome — it would be a
+  second copy of the log, in the repository, that no command knows how to interpret.
 
 ### D12 — MPL 2.0, static tarballs, no support burden
 

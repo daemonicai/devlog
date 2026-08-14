@@ -59,7 +59,8 @@ it buys — that no reader ever sees a torn record — is worth more than the in
 
 - **WHEN** any command completes, successfully or not
 - **THEN** no file other than `DEVLOG.jsonl` exists that the command created
-- **AND** no file other than `DEVLOG.jsonl` has been modified or deleted
+- **AND** no file other than `DEVLOG.jsonl`, and the write's own temporary file, has been modified or
+  deleted
 
 #### Scenario: A write's temporary file does not outlive it
 

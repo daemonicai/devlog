@@ -106,7 +106,8 @@ DEVLOG, ask the Architect for it (`❓ @architect`) rather than guessing a range
   get linked across the section?
 - **No database, no persisted index** (ADR-0002) — see the accumulation hazard above.
 - **The log file is the only state** — sum every filesystem write across the section's blocks, not each
-  in isolation.
+  in isolation. The one allowance is the temporary file a write replaces the log through (D11), removed
+  before the command exits; anything else accumulating is the finding.
 - **Append-only** — did any block introduce a path that rewrites, truncates, or deletes a record?
 - **CLI only** (ADR-0003) — no MCP surface, JSON-RPC, or daemon crept in.
 - **Bodies verbatim from stdin** — did any block start parsing, trimming, or normalising a body?

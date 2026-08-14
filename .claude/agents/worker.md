@@ -53,8 +53,10 @@ If a task seems to require breaking one of these, **stop and surface it** — do
 - **No database and no persisted index** (ADR-0002). The log is parsed and indexed in memory on every
   invocation and the index is discarded on exit. No `DEVLOG.db`, no cache file, no index file.
 - **The log file is the only state** (D5, `durable-format`). The tool creates, modifies, or deletes no
-  file other than the change's `DEVLOG.jsonl` — on success *or* on failure. No temp files, no lock file
-  that outlives the process.
+  file other than the change's `DEVLOG.jsonl` and the single temporary file a write replaces it through —
+  on success *or* on failure. That temp file is a write mechanism, not state: it lives in the log's own
+  directory, is removed before the command exits, and is never read by any command. Nothing else. No lock
+  file that outlives the process, no cache, no index.
 - **Append-only** (D6, `append-only-log`). No command may rewrite, truncate, or delete an existing
   record. Every state change is a new record.
 - **CLI only** (ADR-0003). No MCP server surface, no JSON-RPC, no daemon.
@@ -140,8 +142,9 @@ respond in the same thread. Keep posts terse.
   that's expected, not a scope breach.
 - **Do not add a dependency.** Nothing in `build.zig.zon`'s `.dependencies`, no linked C library —
   ADR-0002 makes this a zero-dependency binary.
-- **Do not make the tool touch the filesystem beyond the target log.** No temp files, no scratch files,
-  no separate lock file — prefer locking the log's own file descriptor.
+- **Do not make the tool touch the filesystem beyond the target log and the write's own temporary file.**
+  A write stages the new log alongside it and renames it into place (D11); that one file is the whole
+  allowance. No scratch files, no separate lock file — lock the log's own file descriptor.
 - **Do not weaken a test or suppress a compile error to go green.**
 - **Do not modify an accepted ADR.** Write a superseding ADR and stop.
 

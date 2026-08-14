@@ -87,7 +87,9 @@ section, prefixed **`[reviewer]`**:
 - **No database, no persisted index** (ADR-0002) — no `DEVLOG.db`, no cache file, no index written to
   disk. Indexes are built in memory and discarded on exit.
 - **The log file is the only state** — no code path creates, writes, or deletes any file other than the
-  target `DEVLOG.jsonl`, on success *or* on failure.
+  target `DEVLOG.jsonl` and the single temporary file a write replaces it through (D11), on success *or*
+  on failure. That temp file must live in the log's own directory, be removed before the command exits on
+  every path, and never be read by any command. Anything else is a finding; that one is the mechanism.
 - **Append-only** — nothing rewrites, truncates, or deletes an existing record.
 - **CLI only** (ADR-0003) — no MCP surface, no JSON-RPC, no daemon.
 - **Bodies from stdin, stored verbatim** — never parsed, reformatted, or interpreted; refuses a terminal
@@ -121,7 +123,9 @@ section, prefixed **`[reviewer]`**:
 - **stdin handling** — blocking when stdin is a terminal; not reading to EOF; accepting an empty body;
   mangling bytes on the way in.
 - **Filesystem side effects** — any path that creates, writes, or deletes a file other than the target
-  log, including temp and scratch files.
+  log and the write's own temporary file, including scratch files. For the temp file itself the hazard is
+  the opposite one: a path that *fails* to remove it, leaves it outside the log's directory, or reads it
+  back as though it were state.
 - **Validation gaps** — `type`, `state`, `outcome`, or role values accepted outside their permitted
   sets; `--ref` accepted without a `ns:id` shape check; a `format` version higher than supported guessed
   at rather than refused.

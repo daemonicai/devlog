@@ -1,2 +1,9 @@
 zig-out/
 .zig-cache/
+
+# A write stages the new log in a temp file alongside it and renames it into
+# place (D11). The tool removes it on every path it controls, but it cannot
+# clean up after a SIGKILL — and the log lives in a source-controlled
+# directory, so an abandoned one is otherwise a `git add -A` away from being
+# committed. Pattern matches src/log.zig's `.<basename>.tmp-<hex>`.
+.*.tmp-*
