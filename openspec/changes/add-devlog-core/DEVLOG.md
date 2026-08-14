@@ -3608,7 +3608,126 @@ caught, the seven-restatement sweep, and now this. The standing rule in `## NEXT
 term list broader than the phrasing you remember; it now also says **case-insensitive**, and that
 overturning an audit's finding needs better evidence than one grep.
 
+---
+
+## 3. Body input
+
+**[architect]** Base: `5d2e805` — bodies read from stdin to EOF and stored byte-for-byte, with immediate
+refusal of a terminal or an empty body.
+
+---
+
+**[architect]** **Section 3 is one block, `3.1–3.4`.** Four tasks, one deliverable: the read path, its two
+refusals, and the test that the bytes survive. Splitting it would mean reviewing a reader without its
+refusals, or refusals without a reader.
+
+It also needs no new mechanism. `src/log.zig` already takes the body as bytes and `src/record.zig` already
+round-trips them — section 2 proved that with fenced code blocks and quotes. What section 3 adds is
+**where the bytes come from** and **when to refuse them**.
+
+**One task in this block cannot be closed by the gates: `3.2`.** Confirming the binary refuses rather than
+hangs when stdin is a *real terminal* is exactly the human-in-the-loop case `CLAUDE.md §4` names — a test
+harness gives the process a pipe, never a TTY, so the automated check verifies the branch and not the
+behaviour. The worker implements and self-tests as far as it can; I hand the Product Owner a
+copy-pasteable check and **wait for their confirmation before ticking `3.2`**. The other three tick on
+gates as normal.
+
+---
+
+**[architect]** **Brief — block 3 (`3.1–3.4`) → @worker.** Read the body from stdin, refuse a terminal and
+refuse empty, and prove the bytes are untouched.
+
+**Tasks:**
+
+- **3.1** Read the body from stdin to EOF and store it byte-for-byte (`append-only-log`).
+- **3.2** Refuse immediately when stdin is a terminal, with a message pointing at file redirection —
+  **never block** (D5).
+- **3.3** Refuse an empty body.
+- **3.4** Test that a body containing fenced code blocks, tables, and text resembling commands or
+  identifiers round-trips unchanged and changes no behaviour.
+
+**D5 was amended during section 2 — read it as it now stands** (`design.md:103`), not as you may remember
+it. The half that binds this block is unchanged and is the reason the block exists:
+
+> **Guard against hanging:** if stdin is a terminal, or empty, the tool fails immediately with a clear
+> message. A hung invocation is worse than an error in an agent harness — it burns the turn with no
+> diagnostic.
+
+That is the whole point. **A hang is a worse failure than any error message**, because the caller is an
+agent whose turn dies with nothing to report. Every design choice in this block resolves that way when in
+doubt.
+
+**Why the tool takes stdin at all**, so you don't propose the alternatives that were already rejected:
+bodies are Markdown containing fenced code blocks, so composing them inline in a shell heredoc is a
+quoting accident waiting to happen — in a tool whose purpose is preventing format accidents. Agents write
+the body to a file in their own scratch directory and redirect it in. `--body-file <path>` with the tool
+deleting the file afterwards was **rejected** (the tool must never delete a file it did not create), as was
+a `devlog draft` handshake.
+
+**Binding constraints:**
+
+- **Verbatim, byte-for-byte** (D5, `append-only-log`). Never parse, reformat, normalise, or interpret.
+  **No trailing-newline trimming, no CRLF translation, no BOM stripping, no encoding validation.** A body
+  is bytes. If it happens to be invalid UTF-8, that is the caller's business, not yours — say so in a
+  comment so the next reader doesn't "fix" it.
+- **Read to EOF**, not to a line, not to a size cap, and not with a fixed buffer. Bodies are long: a real
+  DEVLOG post runs to dozens of lines.
+- **Body content never changes behaviour** (`append-only-log`). Text resembling a command, a flag, an
+  identifier, or a status marker is prose.
+- **Every failure exits `1`** with the message on stderr and **nothing partial written** — the section 1
+  convention, which now means the log genuinely untouched.
+- MPL 2.0 header (D12); version single-source via `build_options`; no new dependency (ADR-0001/2).
+
+**`3.3` — decide what "empty" means and say why in the DEVLOG.** Zero bytes is obviously empty. Is a body
+of only whitespace empty? My call: **yes, refuse it** — an accidentally-empty heredoc usually arrives as a
+lone newline, and a record whose body is `"\n"` is noise in a permanent log. But refusing whitespace is
+the *one* place this block inspects content, so keep it strictly at the refusal boundary: the check
+decides whether to refuse, and the bytes that get stored are **always** the original ones, never a trimmed
+copy. If you think that is wrong, say so before implementing rather than after.
+
+**`3.2` — the terminal check.** Use Zig 0.16's actual TTY detection; check what `std.fs.File` offers in
+0.16 rather than assuming `isatty` or a remembered helper. The message must point at file redirection —
+the caller is an agent that needs to know *what to do*, not merely that it was wrong. Something in the
+shape of `devlog post ... < body.md`, naming the real fix.
+
+**Testing `3.2` honestly is the interesting part, and I want your judgment in the DEVLOG.** A test harness
+hands the process a pipe, so the automated test proves the *branch* works, not that a real TTY is refused.
+State plainly what your test covers and what it cannot, the way block 2B's interrupted-write question was
+stated — that honesty is what turned a passing test into a real finding last section. **Do not** build a
+TTY-allocating test harness to close the gap; the Product Owner verifies this one by hand and I have
+already carved that out.
+
+**`3.4` is coverage, not ceremony:** fenced code blocks (with backticks *inside* them), tables, text that
+looks like a flag (`--role architect`), text that looks like a `## N.` heading, a body containing what
+appears to be JSON, CRLF line endings, and a trailing newline both present and absent. Assert
+byte-for-byte equality through the full write→read path, not just that parsing succeeded.
+
+**Where this plugs in:** section 4 builds the write commands that call this. Build the read path as
+something they can call; do not build the commands themselves, and do not wire up a subcommand that
+`tasks.md` assigns to section 4.
+
+**Note for your first tool calls:** the workflow's boundaries are now hook-enforced (`dmons` 0.5.0). If you
+hit `BLOCKED by the OpenSpec Apply Workflow`, that is by design — stop, post the reason to the DEVLOG, and
+hand back to me. It is not a flaky tool and not something to route around. Ticking boxes and committing
+were never yours; now they are also not possible.
+
+**Done-gates:** `make gates` → `GATES_EXIT:0`, quoting each `LABEL_EXIT:<n>`. Post to this thread as you
+go, then hand off `→ @reviewer`.
+
 ## NEXT
+
+**[architect]** **Section 3 is OPEN** at base `5d2e805`, as a single block `3.1–3.4` — the stdin read
+path, the terminal and empty refusals, and the verbatim round-trip test. Briefed and with @worker.
+Supervisor scope at section end is `git diff 5d2e805..HEAD`.
+
+**`3.2` will not tick on gates.** Confirming the binary refuses rather than hangs against a *real*
+terminal is a `CLAUDE.md §4` human-in-the-loop task — a test harness only ever supplies a pipe. The
+Product Owner gets a copy-pasteable check and 3.2 waits for their confirmation; 3.1, 3.3 and 3.4 tick
+normally.
+
+**The workflow moved between sections 2 and 3** — `dmons` 0.5.0, `5d2e805`. Boundaries are hook-enforced
+now; see the post above section 3's heading. Section 3's worker is the first agent to run under it, so a
+`BLOCKED by the OpenSpec Apply Workflow` in its report is the guard working, not a fault.
 
 **[architect]** **Section 2 is CLOSED** — supervisor `Approve` on the second pass, no findings, after one
 remediation round. Base was `0a7d8b0`.
