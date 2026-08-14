@@ -2340,6 +2340,683 @@ The reviewer's re-audit landed `Approve` before this decision and is unaffected 
 concern. The write-strategy rework is a further pass on block 2B under the same task `2.5`; it ticks
 nothing new, and 2B does not commit until it lands and is re-reviewed.
 
+---
+
+**[worker]** Write-strategy rework landed in `src/log.zig`, on top of the previously-approved version.
+D11's ordering (lock → confirm not stale → read → assign `seq` → write → unlock), no-truncation,
+writes-create/reads-never, the header re-append predicate, and 2.7's coverage are all unchanged — this is
+the write mechanism only, as scoped.
+
+**The new shape.** `openLocked` now loops: open-or-create the file with an exclusive lock, then
+immediately call `isStaleLock` (re-`stat` the path, compare its inode against the held handle's own
+`stat`) before trusting anything about it. A mismatch means the lock is on an inode the path no longer
+names — unlock, close, retry against whatever the path currently resolves to, bounded by
+`max_lock_attempts = 64` (generous on purpose: the only way to exhaust it is a concurrent writer
+completing a full replace on every single attempt, which the bound only needs to rule out, not make
+tight). Once confirmed live, the read/parse proceeds exactly as before.
+
+Both `appendHeader` and `appendRecord` now build the record line, concatenate it onto `opened.bytes`
+(the existing content, already in memory from `openLocked`) into one owned buffer, and hand that whole
+buffer to `atomicReplace`, which: picks a temp name (`tempName` — `.` + basename + `.tmp-` + 16 random
+bytes from `io.random` as lowercase hex, recognisable and collision-resistant per the amended spec's
+requirement that a reader be able to ignore one left behind), creates it `exclusive` (retried up to
+`max_temp_name_attempts = 8` on a name collision, which 128 bits of randomness makes practically
+unreachable but not unbounded), writes the full content in one `writePositionalAll`, closes it, and
+`rename`s it over the log. `errdefer`s cover both gaps that can leak a temp file: between its creation
+and the write/rename (deletes it), and between a successful write/close and a failed `rename` (deletes
+it too) — the "no file other than `DEVLOG.jsonl`" invariant now holds on every failure path between temp
+creation and completion, not just structurally.
+
+**The inode hazard — tested three ways, not reasoned about.**
+
+1. **`isStaleLock` in isolation, single-threaded, fully deterministic.** Hold a lock, rename a
+   replacement over the path from the same test (no threading needed — the lock doesn't prevent a
+   *different* inode from taking the path's name), assert `isStaleLock` flips from `false` to `true`.
+   Proves the detection primitive itself, with nothing else in the way.
+2. **The real hazard through the real `appendRecord` path, still deterministic.** Added a test-only seam
+   — `test_after_lock_hook`, a nullable fn pointer, compiled out entirely in non-test builds via
+   `if (builtin.is_test)` — called once right after `openLocked` acquires a lock, before the staleness
+   check. A test sets it to a closure-substitute (a small file-scoped struct with static fields, since
+   plain fn pointers can't close over state) that performs exactly the rename a fully-completed
+   concurrent writer would have left behind, then asserts the real `appendRecord` call's own record still
+   lands in the final file, alongside the concurrent content, with the correct `seq`. This is deterministic
+   because it doesn't depend on real OS thread-scheduling luck to land the race — it walks straight into
+   the exact window the recheck exists to catch, every run. I checked what a version without the recheck
+   would do here: it would build its new content from the pre-hook bytes and write it into the inode the
+   hook just orphaned, and the test's own assertions (record count, the specific body string) would catch
+   that as a silent loss, not a crash — matching the coordinator's framing of this as the worst failure
+   mode, not merely an error case.
+3. **Real concurrency, real OS locks, kept from the earlier round.** The existing 4-threads-×-5-writes test
+   is unchanged in intent but now exercises the full replace-and-rename path under genuine contention —
+   every write after the first necessarily encounters the exact race the hook simulates deterministically
+   above, just without control over timing. Its assertions (record count, `validateSeqOrder` succeeding
+   on re-parse) would fail the same way a broken recheck would fail test 2, so it remains real evidence,
+   not merely a survived happy path.
+
+**Left untouched, as instructed:** nothing about D11's lock→read→assign-seq→write→unlock ordering,
+no-truncation, writes-create/reads-never, or the header predicate changed — only the mechanism inside
+"write" did.
+
+**Gates, full set:**
+```
+BUILD_EXIT:0
+TEST_EXIT:0
+FORMAT_EXIT:0
+Change 'add-devlog-core' is valid
+VALIDATE_EXIT:0
+GATES_EXIT:0
+```
+60/60 tests (57 + 3 new: `isStaleLock` unit test, the hook-based stale-retry integration test, and
+`atomicReplace`'s cleanup-on-rename-failure test), `std.testing.allocator` leak-checked throughout. Files
+touched: `src/log.zig` only. No commits, no `tasks.md` ticks.
+
+**[worker]** → @reviewer — write-strategy rework ready for audit. Please look hardest at: whether the
+`test_after_lock_hook` seam is a legitimate test-only mechanism (compiled out via `if (builtin.is_test)`,
+never reachable from production code) or whether it crosses into weakening the module for testability;
+the `isStaleLock`/retry loop's `errdefer`/`continue` interaction in `openLocked` (a stale-path retry does
+its own manual unlock+close+`continue` rather than relying on the iteration's `errdefer`, specifically so
+the same cleanup doesn't fire twice — worth confirming that reasoning against the actual Zig semantics
+rather than my say-so); and `atomicReplace`'s temp-file cleanup on every failure branch between creation
+and rename.
+
+**[reviewer]** Audit of the write-strategy rework, block `2.5–2.7`, working-tree diff against `4447333` —
+`src/log.zig` only, as reported (`git diff 4447333 -- src/record.zig src/main.zig` shows only the
+already-approved Diagnostics/import diffs, unchanged since the last round). Re-ran the gates myself:
+`BUILD_EXIT:0 TEST_EXIT:0 FORMAT_EXIT:0`, `Change 'add-devlog-core' is valid`, `VALIDATE_EXIT:0
+GATES_EXIT:0`. Separately, `zig build test --summary all` → `60/60 tests passed`; `grep -c '^test "'
+src/*.zig` → `log.zig 15, main.zig 25, record.zig 19` (59) + the anonymous `test { _ = record; _ = log;
+}` re-export = 60. Matches the report exactly.
+
+**Verdict: Request changes** — two blockers, both concrete and reproduced, not hypothesised. This is
+substantial and mostly well-built new work; my prior findings on the header predicate, 2.7's coverage,
+and the `Diagnostics` fix stand and are not revisited here.
+
+---
+
+**Blocker 1 — `openLocked`'s stale-lock-exhausted return path double-unlocks and double-closes the file,
+and I reproduced the crash.** `log.zig:174–179`:
+
+```zig
+if (try isStaleLock(file, io, dir, sub_path)) {
+    file.unlock(io);
+    file.close(io);
+    if (attempt + 1 >= max_lock_attempts) return error.StaleLockRetriesExceeded;
+    continue;
+}
+```
+
+The `errdefer { file.unlock(io); file.close(io); }` registered at `log.zig:165–168` is still armed for
+this iteration. On the `continue` path this is fine — I confirmed empirically (see below) that `continue`
+does **not** trigger an `errdefer` registered earlier in the same loop body, so the manual cleanup there
+is correct and doesn't double up. But on the `return error.StaleLockRetriesExceeded` path, the function is
+returning an error from *within the same block* where that `errdefer` is still registered — which does
+trigger it, on top of the manual cleanup two lines above. The result is `file.unlock(io)` and
+`file.close(io)` each called twice on an already-closed handle.
+
+I didn't take this on the general Zig-semantics rule alone — I isolated the exact shape (open a real file,
+register the identical `errdefer`, manually unlock+close, then `return error.X` from the same scope) and
+ran it against Zig 0.16.0 directly. It aborts:
+
+```
+thread ... panic: reached unreachable code
+.../std/debug.zig:420:14: in assert
+.../std/Io/Threaded.zig:9340:35: in fileUnlock
+            .BADF => return assert(!is_debug), // File descriptor used after closed.
+.../std/Io/File.zig:646:32: in unlock
+```
+
+`fileUnlock`'s POSIX path treats `EBADF` from the second `flock()` call as a programmer bug and asserts in
+debug builds — exactly the build mode `make gates`/`zig build test` run in. So the retry-exhaustion path
+doesn't return `error.StaleLockRetriesExceeded` to the caller as intended — it aborts the process. For a
+tool whose entire premise is "every failure exits `1` with a clear message, never a crash," a path that
+panics instead of erroring is a real defect, and it's the one path in this rework nothing exercises: I
+grepped the test file and neither `StaleLockRetriesExceeded` nor any reduced `max_lock_attempts` appears
+anywhere, so this is untested for the same reason the last two bugs I found were untested — it's the
+retry-exhaustion tail, not the happy path or the single-retry path the new tests target. Reaching it in
+practice needs 64 consecutive concurrent renames beating every attempt, which is why it's a blocker on
+correctness rather than a live incident, but it is a real, deterministic bug, not a theoretical one — I
+have a passing repro of the crash sitting in scratch, not just a reading of the assert.
+
+Concrete fix: move the bound check before the manual cleanup, so the `errdefer` — already registered and
+already correct — is the *only* thing that runs on the error-return path, and the manual unlock+close
+stays solely on the `continue` path where `errdefer` doesn't fire:
+```zig
+if (try isStaleLock(file, io, dir, sub_path)) {
+    if (attempt + 1 >= max_lock_attempts) return error.StaleLockRetriesExceeded;
+    file.unlock(io);
+    file.close(io);
+    continue;
+}
+```
+Worth a test that shrinks `max_lock_attempts` (or otherwise forces exhaustion) and asserts a clean
+`error.StaleLockRetriesExceeded` rather than a crash — this bug's whole nature is that nothing today would
+catch a regression back into it.
+
+**Blocker 2 — every atomic replace silently resets `DEVLOG.jsonl`'s permission bits to the process's
+current umask default, discarding whatever mode the file actually had.** `log.zig:220`
+(`dir.createFile(io, name, .{ .exclusive = true })`, inside `atomicReplace`) and `log.zig:162`
+(`openLocked`'s own first-creation call) both omit `CreateFileOptions.permissions`, so both take its
+default — I checked `Dir.zig:619` (`permissions: Permissions = .default_file`) and `File.zig:368`
+(`default_file = 0o666`, masked by the process's umask at the `open()` syscall, standard POSIX behaviour).
+Under a *stable* umask this is invisible, because every temp file gets the same default the log itself
+got on first creation. It stops being invisible the moment the log's actual mode diverges from that
+default — a user `chmod`s it more restrictive, it's checked out with different bits, or a later write runs
+under a different umask (a different user, a different CI runner, a cron job with `umask 077`) — because
+`atomicReplace` never reads the existing file's mode before creating its replacement, and never applies it
+to the temp file before the `rename`. Every subsequent write silently overwrites whatever permissions were
+actually on the file with the current process's default, with nothing announcing it. This is exactly the
+class of defect the brief asked me to look for regardless of whether a test would catch it, and no test
+does — `stat`ing the file's mode after a write and asserting it's unchanged from a deliberately-`chmod`'d
+starting mode would catch this directly. Concrete fix: `stat` (or reuse `openLocked`'s already-open
+`file.stat(io)`) the existing file's `permissions` before building the replacement, and pass them through
+`CreateFileOptions.permissions` when creating the temp file in `atomicReplace` — falling back to
+`.default_file` only on first creation, when there is no existing mode to preserve.
+
+---
+
+**Verified independently — the three things asked for hardest scrutiny**
+
+1. **`test_after_lock_hook` compiles out entirely — confirmed against the actual built binary, not just
+   the type-system argument.** `log.zig:114–115`'s conditional-type declaration
+   (`if (builtin.is_test) ?*const fn () void else void`) resolves to `void` when `builtin.is_test` is
+   `false`, and the guard at `log.zig:170–172` is itself `if (builtin.is_test) { ... }` on a comptime-known
+   condition, so the whole block is eliminated at compile time in a non-test build — standard Zig
+   conditional compilation, not a runtime check. I didn't stop at reading the types: I ran `zig build`
+   (producing the real release-path `exe`, not the test binary) and grepped the resulting
+   `zig-out/bin/devlog` for `hook`/`test_after`/`sim-concurrent` — nothing. The symbol and every string
+   associated with the test-only path are genuinely absent from what ships. **Judgment on whether the seam
+   earns its place**: yes. The alternative is relying on real OS thread-scheduling to land a rename in the
+   handful-of-instructions window between lock acquisition and the staleness check — possible in principle
+   (the existing 4-thread concurrency test does exercise the real path under real contention), but not
+   reliably, and a race this narrow could pass thousands of CI runs and still regress silently. A
+   zero-cost, fully-compiled-out test seam that deterministically walks straight into the exact window is
+   the right trade for a bug class this severe (silent data loss) and this hard to hit by chance. I'd want
+   the same standard applied if a similar seam shows up again: compiled out completely, and earning its
+   place against a hazard that can't otherwise be tested deterministically — not reached for by default.
+
+2. **The `errdefer`/manual-cleanup/`continue` interaction — checked every path, not just the two named,
+   and this is where blocker 1 was found.** I verified the specific claim in the handoff (manual cleanup +
+   `continue` doesn't double-fire the `errdefer`) empirically rather than trusting it: a minimal repro with
+   the identical shape (`errdefer` registered, manual cleanup, then `continue` in the same while-loop body)
+   confirms `continue` does not trigger it. That part of the reasoning is correct. What the handoff's own
+   framing didn't cover is the *other* exit from that same `if`-block — `return error.StaleLockRetriesExceeded`
+   — which I also isolated and confirmed *does* trigger the `errdefer`, on top of the manual cleanp already
+   run: that's blocker 1. I also checked the loop's other `try`-propagation paths (a real `isStaleLock`
+   error other than staleness itself, and every `try` after the staleness check succeeds) — those are clean,
+   because nothing manually cleans up before them; the `errdefer` fires exactly once. The bug is isolated to
+   the one branch that mixes manual cleanup with an in-scope `return error`.
+
+3. **`atomicReplace`'s cleanup coverage — covers one member of the class, not the whole class.** The added
+   test (`log.zig:788–807`, forcing `rename` to fail via a missing target directory) exercises the *second*
+   `errdefer` (`log.zig:236`, between a successful write/close and a failed `rename`) and does it well —
+   it asserts zero stray files afterward, not just that the call returns an error. It does **not** exercise
+   the *first* `errdefer` (`log.zig:227–230`, between the temp file's creation and its write completing) —
+   there's no test that forces `writePositionalAll` to fail after the temp file exists and checks the temp
+   file is gone afterward. I read both `errdefer` blocks and they're structurally identical and I found no
+   reason to expect the first behaves differently — but "reads the same" is exactly the standard this
+   project has been holding itself to all block, and by that standard this is a real, if narrow, coverage
+   gap: the class has two members, one is tested, one is argued from symmetry. Worth a test that forces a
+   write failure (e.g. a read-only temp file swapped in after creation, or a Writer that errors after N
+   bytes) between creation and `writePositionalAll` completing, so the first `errdefer` gets the same
+   direct proof the second one already has. Not blocking on its own, but landing alongside blocker 1's
+   fix would be the moment to also add the retry-exhaustion test for `openLocked` — same shape of gap in
+   both places.
+
+**The additional checks asked for regardless of whether the worker raised them**
+
+- **File mode** — see blocker 2.
+- **Durability ordering — the code's own claim is honest, but there's a real gap between "no torn record"
+  and "survives a power loss," and it's worth stating plainly rather than leaving implicit.** Neither
+  `atomicReplace` nor anything upstream of it calls `File.sync` (confirmed the API exists at
+  `File.zig:241` and is unused anywhere in `log.zig` — `grep -n sync src/log.zig` returns nothing). The
+  module doc comment (`log.zig:14–19`) only claims `rename` is atomic "so a reader sees either the log's
+  previous content or all of the new content — never a torn record" — that's a claim about atomicity with
+  respect to concurrent *readers*, and it's true without any `fsync` at all, since `rename()`'s
+  directory-entry swap is what a reader observes, independent of whether the new file's data blocks have
+  reached stable storage. That narrower claim is not overstated anywhere I found. But `durable-format`'s
+  own scenario language — "a write does not complete → the file does not contain a partial record" — is the
+  kind of sentence a future reader could plausibly read as "survives a real interruption," and a real
+  interruption includes power loss, not only a killed process. Without an `fsync` of the temp file before
+  `rename` and (on most POSIX filesystems, for the metadata update itself to be durable) an `fsync` of the
+  containing directory after it, a power failure at the wrong moment can still lose the write entirely —
+  the log reverting to its pre-write content on reboot — even though no *reader* would ever have seen a
+  torn record while the system was up. That's a real gap between what a maximal reading of D11's language
+  could imply and what the code delivers, and I'd rather say so now than have it discovered the way the
+  in-place-append gap was: by someone reading the syscall docs after the fact. This isn't a blocker — I
+  don't think this tool needs database-grade fsync discipline, and the Product Owner may well judge
+  "survives a killed process, not a power failure" to be exactly the right scope for a devlog — but that
+  should be a stated decision, not an implicit one. Recommend either adding the two `sync` calls, or adding
+  one sentence to D11 scoping the guarantee to process-kill rather than power-loss, so the words match what
+  ships either way.
+- **The temp file name** — genuinely recognisable and collision-resistant, confirmed rather than assumed.
+  `tempName` (`log.zig:198–204`) produces `.<basename>.tmp-<32 hex chars>`: a leading dot (won't show in a
+  plain directory listing, per its own doc comment), the log's own basename (so it reads as *this file's*
+  temp, not a generic one), and 16 bytes from `io.random` — I checked `Io.random`'s signature
+  (`Io.zig:2468`, `void`-returning, no error path) against `Io.randomSecure` (`Io.zig:2472–2483`,
+  explicitly documented as the fallible one, `error.EntropyUnavailable`) to confirm the module picked the
+  infallible source deliberately, not by omission — there's no unhandled failure mode here. 128 bits is
+  more than enough that `max_temp_name_attempts = 8`'s bound is really about defending against a
+  programming bug, not a plausible collision.
+- **`durable-format`'s "A read ignores a temporary file" scenario — correctly not discharged here, and I
+  want that stated rather than assumed.** Nothing in `log.zig`'s production code enumerates the directory
+  at all (`Io.Dir.iterate` appears only in this file's tests, never in `openLocked`/`appendHeader`/
+  `appendRecord`/`atomicReplace`), and every write/read in this tool takes an explicit `--log <path>`
+  (`durable-format`'s own "the change is named explicitly" requirement) rather than discovering it by
+  scanning a directory — so nothing in this block *could* accidentally open a stray temp file, and nothing
+  in this block contradicts the scenario. But it isn't proven here either: proving it means a read command
+  exists and demonstrably skips or is indifferent to a leftover `.DEVLOG.jsonl.tmp-*` file sitting next to
+  the log, and read commands are section 5/6's. Recording explicitly, as asked: **this scenario carries
+  forward unaddressed to section 5/6, not silently assumed satisfied.**
+- **No stray files on failure, including the write-failure gap** — covered above (finding 3): the rename
+  failure path is proven with a test; the write-failure path is argued from code symmetry, not proven the
+  same way. Every other failure path I walked (bad JSON on the pre-existing tail, `appendRecord`'s
+  `rec == .header` guard, `openLocked`'s ordinary `try`-propagation once past the staleness check) correctly
+  leaves nothing behind — the corrupted-tail test (unchanged from the prior round) still proves
+  `atomicReplace` is never reached at all when the existing content can't be trusted, which remains the
+  strongest evidence in this block.
+
+**Everything else re-checked against the rework specifically:**
+
+- **D11's ordering still holds with staleness folded into "lock."** Traced `appendRecord`/`appendHeader`:
+  lock is acquired inside `openLocked` (`dir.openFile`/`createFile` with `.lock = .exclusive`), the
+  staleness recheck happens immediately after and before anything is read (`log.zig:174`), `seq` is
+  computed from content read only after that check passes, the whole replacement happens before the lock
+  is released via the caller's `defer opened.close(...)`. Same ordering the prior round verified, now with
+  one more link (staleness) correctly inserted at the front, not the back.
+- **`isStaleLock`'s inode comparison is sound against the stdlib's own caveat, not just against the happy
+  case.** `File.Stat.inode`'s doc comment (`File.zig:58–68`) warns inode numbers can be reused after
+  deletion — I checked whether that undermines this primitive and it doesn't: POSIX keeps an inode
+  allocated as long as *any* process holds an open descriptor to it, even after every directory entry
+  referencing it is gone (the classic unlink-while-open guarantee), and `openLocked` never closes `held`
+  before comparing — so the inode `isStaleLock` compares against cannot have been reused out from under it
+  during the comparison. The primitive is correct, not merely lucky in testing.
+- **Allocator hygiene in the new code.** `encodeLine`, `concatOwned`, and `replaceWith`'s intermediate
+  buffers are each freed via `defer` on every path (success or error) — traced independently, no leaks
+  beyond what the leak-checking `std.testing.allocator` already would have caught across 60 passing tests.
+- **Makefile untouched**, MPL header present, no version literal introduced, no third-party dependency —
+  unaffected by this rework and re-confirmed.
+
+Block `2.5–2.7` is not clear to commit yet — two blockers above, one worth reproducing before trusting
+the fix given how narrow blocker 1's window is.
+
+→ @worker for both blockers; re-audit once they land.
+
+---
+
+**[worker]** Both blockers fixed, the coverage gap filled, and durability (architect ruling) closed. All
+in `src/log.zig` only.
+
+**Blocker 1 — the retry-exhaustion double-release/panic.** `openLocked`'s stale branch
+(`src/log.zig:174–186`) now checks `attempt + 1 >= max_lock_attempts` **before** any manual
+unlock/close, not after. On the last allowed attempt it now just `return error.StaleLockRetriesExceeded`
+with no manual cleanup — the iteration's already-armed `errdefer` handles that release exactly once. Every
+other attempt still does the manual unlock/close/`continue` exactly as before, which is the path that was
+already correct (a `continue` doesn't retrigger the same-scope `errdefer`). A comment at the check states
+the ordering constraint and cites the reviewer's finding so it isn't reordered by accident later.
+
+**Test that actually reaches exhaustion:** `"openLocked gives up after max_lock_attempts with a clean
+error, not a crash"` uses the existing `test_after_lock_hook` seam with a hook that replaces the log's
+inode on **every** call (not just once, unlike the earlier hazard test), so `isStaleLock` never clears and
+`openLocked` is forced through all `max_lock_attempts` (64) iterations. Asserts
+`error.StaleLockRetriesExceeded` (not a crash — the old code would have aborted the process outright
+before this assertion ever ran, so the test reaching it at all is part of what it proves) and that the
+hook fired exactly 64 times, pinning the bound itself.
+
+**Blocker 2 — permissions silently reset on every write.** `atomicReplace` gained a `permissions:
+Io.File.Permissions` parameter, passed through to the temp file's `CreateFileOptions`. `replaceWith`
+supplies it via `(try opened.file.stat(io)).permissions` — reading `opened.file`'s own current mode
+rather than a fresh path `stat`, since `opened.file` already *is* the log's current state whether freshly
+created or pre-existing. This handles the creation case without a separate branch: a brand-new log's temp
+file gets the mode the log was just created with (umask applied once), and an existing log's temp file
+gets whatever mode it actually has right now, including one set outside the tool. Test: `chmod`s the log
+to a distinctive `0o640` (not producible by any default umask, so surviving the next write is real
+evidence) after creation, does one `appendRecord`, asserts the mode survived exactly.
+
+**Coverage gap — the write-failure sibling.** Added a second test-only seam,
+`test_before_temp_write_hook`, same shape and same compiled-out-via-`if (builtin.is_test)` treatment as
+`test_after_lock_hook`, called inside `atomicReplace` right after the temp file is created and before it's
+written. A test sets it to return `error.SimulatedTestFailure` and asserts `atomicReplace` propagates that
+error with the temp file already cleaned up (directory iteration finds zero entries) — the sibling of the
+existing rename-failure test, now covering the other gap between temp-file creation and completion. I
+didn't find a portable, deterministic way to force a real `writePositionalAll` failure (permission bits on
+an already-open fd don't gate subsequent writes on POSIX, and disk-full/quota tricks aren't reliable in a
+test environment), so this exercises the same `errdefer` block via injected failure rather than a
+naturally-occurring one — same reasoning as the already-approved hook.
+
+**Durability — synced, per the ruling.** `atomicReplace` now calls `tmp_file.sync(io)` after the write and
+before `close`, and a new `syncDir` helper syncs the containing directory after a successful `rename`.
+`Io.Dir` has no direct `sync`; `Dir.handle` is already an open POSIX descriptor for the directory, so
+`syncDir` wraps it as an `Io.File{ .handle = dir.handle, .flags = .{ .nonblocking = false } }` and calls
+the existing `File.sync` on it — no new fd opened or leaked, since the wrapper is never `close`d (it
+doesn't own the handle). Verified this actually works before writing it into the module (a scratch repro
+syncing a `std.testing.tmpDir`'s directory fd this way, on the toolchain here). Scoped explicitly to this
+project's target matrix in the doc comment (macOS arm64, Linux x86_64/arm64, per D12) rather than assumed
+to generalise — didn't hit any awkwardness or unavailability on 0.16 for either target, so nothing to
+escalate.
+
+**Everything else untouched, as instructed** — D11's ordering, no-truncation, writes-create/reads-never,
+the header re-append predicate, and the inode-recheck mechanism itself (including `test_after_lock_hook`,
+confirmed by the reviewer to stay).
+
+**Gates, full set:**
+```
+BUILD_EXIT:0
+TEST_EXIT:0
+FORMAT_EXIT:0
+Change 'add-devlog-core' is valid
+VALIDATE_EXIT:0
+GATES_EXIT:0
+```
+63/63 tests (60 + 3 new: retry-exhaustion, permissions-preserved, write-failure-sibling),
+`std.testing.allocator` leak-checked. Files touched: `src/log.zig` only. No commits, no `tasks.md` ticks.
+
+**[worker]** → @reviewer — both blockers, the coverage gap, and durability sync ready for audit. Please
+look hardest at: the reordered bound-check in `openLocked` against the exact abort you reproduced (a
+second independent repro would be the strongest evidence, if you're able); whether `syncDir`'s
+handle-wrapping approach is sound rather than merely working by luck on this toolchain; and whether
+`replaceWith` reading permissions from `opened.file` (rather than a fresh path `stat`) is the right source
+of truth given the file could — vanishingly rarely — already be mid-replacement by another writer at that
+exact instant (the same class of race the inode recheck exists for, one layer up).
+
+**[reviewer]** Re-audit of the blocker fixes, coverage gap, and durability sync, block `2.5–2.7`,
+working-tree diff against `4447333` — `src/log.zig` only, confirmed (`git diff 4447333 -- src/record.zig
+src/main.zig` is the same already-approved Diagnostics/import diff as last round, byte-identical). Re-ran
+the gates myself: `BUILD_EXIT:0 TEST_EXIT:0 FORMAT_EXIT:0`, `Change 'add-devlog-core' is valid`,
+`VALIDATE_EXIT:0 GATES_EXIT:0`. `zig build test --summary all` → `63/63 tests passed`; `grep -c '^test "'
+src/*.zig` → `log.zig 18, main.zig 25, record.zig 19` (62) + the anonymous re-export = 63. Matches.
+
+**Verdict: Request changes** — one blocker remains, a real residual of blocker 2, not a new class of bug.
+Blocker 1 and the coverage gap are genuinely closed; durability and `syncDir` are sound. Standing findings
+from prior rounds are unaffected.
+
+---
+
+**Blocker 1 (double-unlock/close on retry exhaustion) — closed. Verified against my own repro, not just
+read.** `log.zig:174–187` now checks `attempt + 1 >= max_lock_attempts` and returns
+`error.StaleLockRetriesExceeded` **before** any manual `unlock`/`close` — exactly the fix I suggested. I
+didn't take the reordering on inspection alone: I rebuilt the identical shape (errdefer registered, then
+either "bound check → return" or "manual cleanup → continue", matching the real control flow line for
+line) and ran it. With a 3-attempt bound, always-stale: two iterations went through manual-cleanup-then-
+`continue` (`errdefer` correctly silent both times), and the third hit the bound and returned via the
+still-armed `errdefer` alone — exactly one release, not zero, not two. Then I checked the *real* new test
+(`log.zig:941–995`) reaches exhaustion for the right reason, not by accident: `PerpetuallyStale.run()`
+replaces the log's inode on **every** call via `test_after_lock_hook`, so every one of `openLocked`'s
+attempts finds itself stale immediately after the hook fires — forcing all the way to the bound rather
+than resolving after one retry. The test asserts both `error.StaleLockRetriesExceeded` **and**
+`PerpetuallyStale.calls == max_lock_attempts` (64), which pins the loop iterated the full, correct number
+of times rather than exiting early or looping past the bound. Its own comment states the strongest
+evidence directly: under the old order, this exact test would have **aborted the test binary**, not failed
+an assertion — I confirmed that's true, since it's the same shape as my original repro. Fully closed.
+
+**Coverage gap (write-before-rename failure) — closed.** `test_before_temp_write_hook`
+(`log.zig:221–222`) is the same compiled-out-in-non-test-builds shape as the first hook, called at
+`log.zig:280–282` immediately after temp-file creation and before `writePositionalAll`. The new test
+(`log.zig:873–902`) forces it to return an error deterministically and asserts the directory is left with
+**zero** files afterward — genuinely exercising the first `errdefer` (`log.zig:275–278`), the sibling of
+the already-tested rename-failure path. This is the right fix for what I flagged as "argued from symmetry,
+not proven" — now proven.
+
+---
+
+**Blocker 2 (file mode) — the fix is real but incomplete, and I can reproduce the gap it leaves.**
+`replaceWith` (`log.zig:326–333`) now reads `permissions = (try opened.file.stat(io)).permissions` from
+the held, locked handle and threads it through `atomicReplace` to the temp file's `createFile(...,
+.permissions = permissions)` (`log.zig:268`). This is a genuine improvement — before, no attempt at all was
+made, so every write reset the mode to `.default_file`. But `createFile`'s `.permissions` option does not
+apply the requested mode verbatim: I traced it into `dirCreateFilePosix`
+(`Threaded.zig:4219–4257`), which passes `options.permissions.toMode()` straight into `openat()`'s `mode`
+argument — and POSIX `open()`/`openat()`'s mode argument is **always** filtered through the calling
+process's current umask by the kernel, regardless of what value is requested. There is no `fchmod` call
+anywhere in this path to apply the mode verbatim. I reproduced this directly rather than reasoning about
+it in the abstract: in this sandbox (`umask` → `022`), requesting `.permissions = 0o664` via `createFile`
+produces `0o644` on disk — the group-write bit is silently stripped, confirmed with a standalone test
+against the real 0.16.0 API. So the fix genuinely preserves a mode **only when that mode is already a
+subset of what the writing process's current umask allows** — it does not preserve a mode that was set
+*more permissive* than the umask default (the case a `chmod` to enable group-write on a shared team log
+would produce), because the umask re-applies on every single subsequent write.
+
+The added test (`log.zig:904–939`) doesn't catch this, and I think that's worth naming plainly: it picks
+`0o640` specifically because — per its own comment — "umask never yields group-write-but-not-group-read on
+a freshly created file," which is exactly why it's the wrong shape to expose the gap. `0o640` (owner rw,
+group r, other none) is a **strict subset** of `0o666 & ~0o022 = 0o644` — it only *removes* the
+other-read bit that the default already has, so re-masking by the same umask is a no-op and the test
+passes regardless of whether the fix is "genuinely preserve the exact mode" or merely "genuinely preserve
+a mode no more permissive than the default." A test with a mode that **adds** a bit beyond the umask
+default (e.g. `0o664`, matching my repro) would have caught this.
+
+This is the same class of defect blocker 2 was raised for — a write silently changing the tracked file's
+mode with nothing announcing it — just narrowed to inputs the fix doesn't yet cover, so I'm keeping it a
+blocker rather than downgrading it to a nit. Concrete fix: apply the mode via `Io.File.setPermissions`
+(→ `fchmod`, confirmed at `Threaded.zig:8947–8950` to bypass umask entirely, unlike `createFile`'s mode
+argument) on the temp file **after** creation, rather than relying solely on `createFile`'s `.permissions`
+option — the worker's own test fixture already uses exactly this mechanism
+(`f.setPermissions(testing.io, distinctive)` at `log.zig:929`) to set up the scenario, which makes the gap
+easy to miss: the test *sets* the distinctive mode via the umask-bypassing call and *checks* it via
+`createFile`'s umask-filtered one. Worth a test with a mode that adds a bit beyond the sandbox's `022`
+default once this lands.
+
+---
+
+**Verified independently — the three things asked for hardest scrutiny**
+
+1. **Blocker 1's fix — closed, with an independent repro of my own** (above), not a re-read of the same
+   one. No path releases the handle twice or zero times across error-return, `continue`, or success.
+
+2. **`syncDir`'s handle-wrapping — sound and verified against the actual syscall dispatch, but resting on
+   an implementation detail rather than a documented contract, and I think that distinction is worth
+   stating plainly rather than calling it either "fine" or "broken."** `Io.Dir.handle` and `Io.File.handle`
+   are both literally `std.posix.fd_t` (`Dir.zig:13,15`; `File.zig:26`) — constructing `Io.File{ .handle =
+   dir.handle, .flags = .{ .nonblocking = false } }` is a type-correct literal of a fully public struct
+   with public fields, not a cast through anything opaque or private. I traced what `.sync()` actually does
+   with it: `fileSyncPosix` (`Threaded.zig:8519–8544`) calls `posix.system.fsync(file.handle)` directly —
+   no reference to `.flags`, no `.kind` check, nothing that treats a directory fd any differently from a
+   regular file's. On POSIX, `fsync()` on a directory fd is exactly the standard, well-documented mechanism
+   for persisting a directory's metadata (the classic "fsync-the-parent-dir-after-rename" idiom this
+   function exists to implement) — so this isn't a trick that happens to compile, it's the textbook
+   technique, correctly reached through Zig's public API. `File.sync`'s own doc comment
+   (`File.zig:235–237`, "This does not ensure that metadata for the directory containing the file has also
+   reached disk") all but points at needing exactly this. **Where I'd push back on calling it simply
+   "sound," though:** nothing in `Io.File`'s or `Io.Dir`'s documentation *promises* that a `Dir.handle` is
+   interchangeable with a `File.handle`, or that `fileSync`'s POSIX path will forever remain a bare
+   `fsync()` call with no handle-kind validation — it works today because both types happen to be thin,
+   honest wrappers around a raw fd with no internal bookkeeping, not because the API contract says so. This
+   project already treats the whole `Io` module as pre-1.0 and churning (ADR-0001's own framing, applied
+   throughout this block). My judgment: legitimate and correct for the current toolchain and this project's
+   whole target matrix (D12: macOS arm64, Linux x86_64/arm64), verified rather than assumed — not a
+   blocker. But it's a fragile-by-nature technique, not a stable one, and the existing doc comment
+   (`log.zig:224–232`) already scopes the claim honestly ("not assumed to generalise beyond it") — worth
+   leaving exactly as recorded here rather than either stripping the caveat or treating it as disqualifying.
+   If this project ever moves off Zig 0.16, `syncDir` is one of the first things that wants re-verifying
+   against the new version, not assumed to still hold.
+
+3. **The permissions source of truth — the worker's own reasoning is correct, and I traced why.** Reading
+   from `opened.file.stat(io)` (the held, locked handle) rather than a fresh `dir.statFile(path)` is the
+   right call, and for exactly the stated reason: while the lock is held, no *cooperating* writer can rename
+   over the path, because doing so requires first winning the same exclusive lock on the same live inode —
+   which blocks for as long as we hold it. So during our own held-lock window the two sources would agree
+   in practice. But the lock is advisory (the API's own doc comment says so — "a process that does not
+   respect the locking API can still get access to the file, despite the lock"), so an uncooperating process
+   (a shell `mv`, an unrelated tool) could still rename the path out from under us regardless of what we
+   hold — and in that scenario, only the open handle still refers to the exact inode whose content we read
+   and are about to replace; a fresh path stat could silently read a *different* file's mode. This is the
+   same reasoning `isStaleLock` itself is built on, one layer up, applied consistently. **On the
+   file-creation case specifically:** traced it too — `openLocked`'s creation branch still omits
+   `.permissions` (so a brand-new log gets `.default_file` masked by whatever umask is in effect at that
+   moment, unchanged from before), and `replaceWith` then reads that *actual, already-umask-applied* result
+   back via `.stat()` rather than re-deriving or guessing it — so the first write's mode is genuinely
+   whatever the OS actually assigned, not a second, possibly-divergent default. Confirmed handled, not
+   incidental. (This is also exactly where blocker 2's residual gap lives, though: the mode read back here
+   is correct, it's the *next* write's `createFile(.permissions=...)` call that re-applies umask on top of
+   it.)
+
+**Everything else re-checked:**
+
+- **Sync ordering matches what was asked, and both failures propagate rather than being swallowed.**
+  `atomicReplace` (`log.zig:263–293`): `try tmp_file.writePositionalAll(...)` → `try tmp_file.sync(io)` →
+  close → `break` → `rename` → `try syncDir(dir, io)` — content is synced before the name that points to it
+  changes, and the directory is synced after the rename that changed it, exactly the order D11's
+  durability ruling states. Both `try`s propagate a real error rather than a `catch {}`; I checked what
+  happens if `syncDir` fails *after* a successful rename specifically, since that's the one path where the
+  write has already landed but the function still reports failure — the errdefer registered before the
+  loop's `break` (`log.zig:289`, `dir.deleteFile(io, tmp_name) catch {}`) would fire on that error too, but
+  harmlessly: `tmp_name` no longer exists post-rename, so the delete attempt fails with `FileNotFound` and
+  is correctly swallowed by its own `catch {}` — it never touches `sub_path`, so there's no risk of the
+  real log being affected by this cleanup attempt. Not a bug, just confirmed rather than assumed.
+- **No leaks across the 64-attempt exhaustion test or either new hook's test** — all under
+  `std.testing.allocator`, and the full suite passing at 63/63 is corroborating evidence, not the whole of
+  it: I traced `openLocked`'s attempt loop specifically and confirmed the `bytes` allocation only ever
+  happens *after* the staleness check passes, so none of the 64 discarded attempts allocate anything to
+  leak in the first place.
+- **Both new hooks compile out identically to the first — checked against the actual built binary again,
+  not assumed from the shared pattern.** Ran a fresh `zig build` (the real `exe`, not the test binary) and
+  grepped `zig-out/bin/devlog` for `hook`, `test_after`, `test_before`, `sim-concurrent`, `perpetual`, and
+  `SimulatedTestFailure` — nothing. Same standard I applied to the first hook, applied again rather than
+  taken as given because the pattern matched.
+- **Makefile untouched, only `src/log.zig` changed**, MPL header intact, no version literal introduced —
+  unaffected by this round, reconfirmed.
+
+→ @worker for the one blocker; re-audit once it lands.
+
+---
+
+**[worker]** Remaining blocker fixed in `src/log.zig` only.
+
+**The fix.** `atomicReplace` no longer passes `permissions` through `createFile`'s `.permissions` option
+(that argument goes straight into `open()`'s mode and is always filtered through the process umask, per
+the reviewer's trace). It now creates the temp file with default options, then calls
+`tmp_file.setPermissions(io, permissions)` — a separate `fchmod`, not subject to umask — immediately
+after creation, before the write-failure test hook and the actual write. `replaceWith`'s side (reading
+the mode from `opened.file.stat(io)`) is unchanged; only where that mode gets applied moved.
+
+**Fixed the test, the more important half, as asked.** The permissions test now runs over two modes,
+`0o664` then `0o640`, not `0o640` alone. `0o664` is the discriminating case — it has the group-write bit a
+typical `022` umask always strips, so it can only survive if the mode is actually applied via `fchmod`
+rather than filtered through `open()`. `0o640` is a strict subset of that umask default and stays only as
+a second data point, explicitly commented as not load-bearing.
+
+**Confirmed the test actually discriminates, both directions, before calling this done:**
+1. Temporarily reverted just the fix (`createFile`'s `.permissions = permissions` restored, the
+   `setPermissions` call removed) with the new two-mode test in place. `zig build test` failed exactly as
+   expected: `expected 436, found 420` — `0o664` requested, `0o644` landed on disk, the umask-masking bug
+   reproduced directly by the test rather than argued about.
+2. Restored the fix from a saved copy, confirmed the diff matched byte-for-byte
+   (`diff -q` clean), reran: `63/63` pass.
+
+**Checked for the rest of the class, as asked.** Grepped every `createFile`/`.permissions`/
+`setPermissions` call in `src/log.zig`. The only other production `createFile` is `openLocked`'s
+log-creation path (`.{ .read = true, .truncate = false, .lock = .exclusive }`, no explicit `.permissions`)
+— that one is correct as-is: it's the very first time the log exists, there is no prior mode to preserve,
+and letting the umask-masked default apply is the same POSIX behaviour any tool creating a new file gets.
+Nothing else in the module sets a mode through a create call where exactness matters. Class closed, not
+just this instance.
+
+**`syncDir` — left exactly as it was**, per the note for the record. No change.
+
+**Gates, full set:**
+```
+BUILD_EXIT:0
+TEST_EXIT:0
+FORMAT_EXIT:0
+Change 'add-devlog-core' is valid
+VALIDATE_EXIT:0
+GATES_EXIT:0
+```
+63/63 tests (same count as last round — this fixed an existing test's discriminating power, not added a
+new one), `std.testing.allocator` leak-checked. Files touched: `src/log.zig` only. No commits, no
+`tasks.md` ticks.
+
+**[worker]** → @reviewer — permissions fix (round two) ready for audit. The before/after repro above
+(steps 1–2) is reproducible from a clean tree by anyone who wants to re-verify independently rather than
+take the transcript's word for it.
+
+**[reviewer]** Re-audit of the umask fix, block `2.5–2.7`, working-tree diff against `4447333` —
+`src/log.zig` only, confirmed (`git diff 4447333 -- src/record.zig src/main.zig` unchanged from the
+already-approved state). Re-ran the gates myself: `BUILD_EXIT:0 TEST_EXIT:0 FORMAT_EXIT:0`,
+`Change 'add-devlog-core' is valid`, `VALIDATE_EXIT:0 GATES_EXIT:0`. `zig build test --summary all` →
+`63/63 tests passed`; `grep -c '^test "' src/*.zig` → `log.zig 18, main.zig 25, record.zig 19` (62) + the
+anonymous re-export = 63. Matches — same count as last round, consistent with the worker's own note that
+this fix strengthened an existing test rather than adding one.
+
+**Verdict: Approve. Block `2.5–2.7` is done — no blockers outstanding, clear for gates, ticks, and
+commit.**
+
+---
+
+**1. `setPermissions` is applied on every path that produces a temp file — confirmed, one call site, no
+sibling gap.** `atomicReplace`'s `while` loop (`log.zig:271–303`) has exactly one branch that retains a
+created temp file: `dir.createFile` succeeds → `errdefer` armed → `tmp_file.setPermissions(io,
+permissions)` (`log.zig:293`) unconditionally, before the hook, before any content is written. The
+`PathAlreadyExists` retry branch never reaches that point (nothing was created, correctly `continue`s to
+try a new name), and every other `createFile` error returns immediately with nothing created. I grepped
+every `createFile` in the file: production code has exactly two call sites —
+`openLocked`'s log-creation (`log.zig:162`, not a temp file, and see point 4) and `atomicReplace`'s
+(`log.zig:281`, now followed by the explicit `fchmod`). Every other `createFile` in the file is inside a
+test. No path renames a temp file into place without the mode having been applied first.
+
+**2. The discriminating test genuinely discriminates in this environment — and I can independently
+corroborate the worker's own before/after numbers — but its power depends on an ambient umask the test
+doesn't pin, which is worth naming rather than leaving implicit.** `0o664` (owner rw, group rw, other none)
+carries the group-write bit that a `022`-family umask always strips from the `.default_file` base
+(`0o666 & ~0o022 = 0o644`), so it genuinely can't pass by accident the way `0o640` (a strict subset of
+`0o644`) could — I verified this arithmetic independently, not just accepted the comment. This sandbox's
+umask is `022` (`umask` → `022`), and the worker's reported repro numbers check out exactly:
+`expected 436, found 420` is `expected 0o664, found 0o644` — the precise failure I reproduced myself last
+round against the pre-fix code. The assertion (`log.zig:965`,
+`distinctive.toMode() & 0o777 == stat_after.permissions.toMode() & 0o777`) masks both sides identically
+with `0o777` (all nine permission bits), so nothing relevant is discarded by the comparison itself. **The
+caveat asked for:** the test relies entirely on the *ambient* umask of whatever process runs `zig build
+test` — there's no explicit `std.c.umask(...)` pin anywhere in it. `0o664` only discriminates when the
+running umask's group-write bit is set (true for `022`, `027`, `077` — the overwhelming common defaults on
+macOS and Linux dev/CI images) but **not** universally: a `002` umask (used on some Debian-family
+"collaborative group" setups) would already produce `0o664` from `.default_file` with no special handling
+at all, and the test would pass whether or not `atomicReplace` genuinely applies permissions correctly. To
+be clear about scope: this doesn't touch the **fix**'s correctness — `fchmod`/`setPermissions` bypasses
+umask entirely and unconditionally, verified in the previous round by tracing `setPermissionsPosix` down to
+the raw `fchmod` syscall, so the production code is umask-independent regardless of what any test's
+environment happens to be. It's specifically the **test's regression-catching power** that's
+environment-dependent — exactly the "trap for the next person" framing asked about. Non-blocking, since the
+fix itself doesn't need the test to be perfect to be correct, and `022` is what this sandbox and the
+overwhelming majority of real environments run — but worth a cheap, permanent fix: pin the umask explicitly
+for the duration of the test (`std.c.umask` is available, confirmed present in the 0.16.0 install) and
+restore it afterward, so the test's power stops depending on who happens to run it.
+
+**3. The creation-to-`fchmod` window is fine, and I can say exactly why rather than accept it on
+instinct.** I traced the precise ordering in `atomicReplace`: `createFile` (default, umask-derived mode,
+**zero bytes**) → `setPermissions` (now the correct mode) → the test-only hook → `writePositionalAll`
+(content). **The temp file never contains any actual log content until after its permissions are already
+correct** — so the brief window between creation and `fchmod` exposes, at worst, an empty file at the
+umask default, never a byte of the record being written. That's the load-bearing fact that makes this
+window benign regardless of whether the target mode is more or less restrictive than the umask default:
+there's nothing sensitive in the file yet. Combined with the file living in the change's own project
+directory (not a shared or world-writable location) and the window being a single in-process gap between
+two syscalls with no intervening I/O, I don't think this needs closing. Worth exactly the sentence the
+brief asked for, though — this reasoning isn't in the code today, and "we checked and it's fine" is worth
+more as a comment than as something the next reader has to re-derive. Non-blocking suggestion, not a
+finding.
+
+**4. The first-creation path genuinely has no mode to preserve, and produces a sensible mode, not an
+accidental one.** `openLocked`'s creation branch (`log.zig:162`) still passes no `.permissions`, so it
+takes `.default_file` filtered through whatever umask is active at that moment — exactly the conventional,
+expected behaviour for a brand-new file (the same thing `touch`, `git`, or any ordinary tool would produce
+with no special requirements of its own). This isn't an oversight the mode-preservation fix should have
+touched: there is no *prior* mode for a file that doesn't exist yet, so falling back to the OS default is
+correct, not incidental. I also checked the continuity into the very next write: `replaceWith` reads that
+just-created, already-umask-applied mode back via `.stat()` and threads it through to the first
+`atomicReplace` call, which re-applies the identical value via `fchmod` — a no-op in effect, consistent
+with every later call, with no discontinuity between "how the file's mode was born" and "what the
+mode-preservation mechanism believes it is."
+
+---
+
+**Nothing else re-opened.** Blocker 1, the coverage gap, `syncDir`, and the sync ordering were settled last
+round and nothing in this diff touches any of that ground — confirmed by the diff being scoped exactly to
+`atomicReplace`'s permission handling, the doc comments explaining it, and the one test's discriminating
+case.
+
+**This block is done.** Two non-blocking items worth folding into `## NEXT` at the architect's discretion
+(the test's umask determinism, and the one-line "why the creation window is safe" comment) — neither gates
+this block. Clear for gates, ticks, and commit.
+
 ## NEXT
 
 **[architect]** **Section 2 is OPEN** at base `0a7d8b0`, carved into two blocks — **2A (`2.1–2.4`)** the

@@ -367,15 +367,49 @@ pub const ParseError = error{
 
 /// Set by `parseLine`/`parseLog` on failure so the caller can build a
 /// clear message (durable-format: "reports this clearly rather than
-/// misreading the contents"). No allocation — filled with `bufPrint` into
-/// a buffer owned by the caller-supplied `Diagnostics`.
+/// misreading the contents"). Allocator-backed (block 2B ruling, DEVLOG
+/// `## 2`): every failure exits `1` with this message as the whole
+/// interface, so a silently truncated message is worse than a generic one
+/// — it looks complete. The allocator is already threaded everywhere a
+/// `Diagnostics` is constructed and the error path exits immediately, so
+/// the message's lifetime is trivial. Call `init` to construct and
+/// `deinit` to free; `set` replaces any previous message rather than
+/// leaking it.
 pub const Diagnostics = struct {
+    allocator: Allocator,
     line_number: usize = 0,
-    buf: [200]u8 = undefined,
     message: []const u8 = "",
+    /// Whether `message` is heap-owned by this `Diagnostics` (freed on the
+    /// next `set`/`deinit`) or a borrowed static literal (never freed).
+    /// Tracked explicitly rather than inferred from `message.len != 0` —
+    /// that inference is exactly what conflated the OOM fallback literal
+    /// with a real allocation and produced an invalid free (reviewer
+    /// finding, block 2B).
+    owned: bool = false,
+
+    pub fn init(allocator: Allocator) Diagnostics {
+        return .{ .allocator = allocator };
+    }
+
+    pub fn deinit(self: *Diagnostics) void {
+        if (self.owned) self.allocator.free(self.message);
+        self.* = undefined;
+    }
 
     fn set(self: *Diagnostics, comptime fmt: []const u8, args: anytype) void {
-        self.message = std.fmt.bufPrint(&self.buf, fmt, args) catch self.buf[0..];
+        if (self.owned) self.allocator.free(self.message);
+        // Formatting the message itself cannot fail short of OOM; on OOM,
+        // say so explicitly rather than emit a truncated fragment of the
+        // intended text — a fallback string that admits its own limits,
+        // not a silent partial one. The fallback is a borrowed literal:
+        // `owned` is set to `false` on this path so it is never freed.
+        if (std.fmt.allocPrint(self.allocator, fmt, args)) |msg| {
+            self.message = msg;
+            self.owned = true;
+        } else |_| {
+            self.message = "diagnostic message allocation failed";
+            self.owned = false;
+        }
     }
 };
 
@@ -771,7 +805,8 @@ test "header round-trips and carries no role field" {
     try testing.expect(std.mem.indexOf(u8, line, "\"role\"") == null);
     try testing.expect(std.mem.indexOf(u8, line, "\"kind\":\"header\"") != null);
 
-    var diag: Diagnostics = .{};
+    var diag: Diagnostics = .init(allocator);
+    defer diag.deinit();
     var parsed = try parseLine(allocator, line, &diag);
     defer parsed.deinit(allocator);
 
@@ -798,7 +833,8 @@ test "section round-trips with title, base, and a common field" {
     const line = try encodeAlloc(allocator, rec);
     defer allocator.free(line);
 
-    var diag: Diagnostics = .{};
+    var diag: Diagnostics = .init(allocator);
+    defer diag.deinit();
     var parsed = try parseLine(allocator, line, &diag);
     defer parsed.deinit(allocator);
 
@@ -830,7 +866,8 @@ test "item round-trips type, blocking, refs, and an addressee" {
     const line = try encodeAlloc(allocator, rec);
     defer allocator.free(line);
 
-    var diag: Diagnostics = .{};
+    var diag: Diagnostics = .init(allocator);
+    defer diag.deinit();
     var parsed = try parseLine(allocator, line, &diag);
     defer parsed.deinit(allocator);
 
@@ -853,7 +890,8 @@ test "close, verdict and next round-trip their kind-specific fields" {
     } };
     const close_line = try encodeAlloc(allocator, close);
     defer allocator.free(close_line);
-    var diag: Diagnostics = .{};
+    var diag: Diagnostics = .init(allocator);
+    defer diag.deinit();
     var parsed_close = try parseLine(allocator, close_line, &diag);
     defer parsed_close.deinit(allocator);
     try testing.expectEqual(CloseState.resolved, parsed_close.close.state);
@@ -893,7 +931,8 @@ test "body survives a round trip byte-for-byte through newlines, quotes, and con
     // The serialised form is one JSON line: no literal newline byte in it.
     try testing.expect(std.mem.indexOfScalar(u8, line, '\n') == null);
 
-    var diag: Diagnostics = .{};
+    var diag: Diagnostics = .init(allocator);
+    defer diag.deinit();
     var parsed = try parseLine(allocator, line, &diag);
     defer parsed.deinit(allocator);
 
@@ -905,7 +944,8 @@ test "an unknown field is ignored, not rejected (durable-format forward compat)"
     const line =
         \\{"kind":"post","seq":1,"ts":"t","role":"worker","body":"hi","from_a_future_version":{"nested":true}}
     ;
-    var diag: Diagnostics = .{};
+    var diag: Diagnostics = .init(allocator);
+    defer diag.deinit();
     var parsed = try parseLine(allocator, line, &diag);
     defer parsed.deinit(allocator);
     try testing.expectEqualStrings("hi", parsed.post.common.body);
@@ -916,7 +956,8 @@ test "an unrecognised format version is refused with a clear message, not guesse
     const line =
         \\{"kind":"header","seq":1,"ts":"t","format":99,"tool":"devlog 9.9.9","change":"x","roles":["architect"],"closers":["architect"]}
     ;
-    var diag: Diagnostics = .{};
+    var diag: Diagnostics = .init(allocator);
+    defer diag.deinit();
     const result = parseLine(allocator, line, &diag);
     try testing.expectError(error.UnsupportedFormatVersion, result);
     try testing.expect(std.mem.indexOf(u8, diag.message, "99") != null);
@@ -928,7 +969,8 @@ test "a non-header record without a role is rejected (role is required, not head
     const line =
         \\{"kind":"post","seq":1,"ts":"t","body":"hi"}
     ;
-    var diag: Diagnostics = .{};
+    var diag: Diagnostics = .init(allocator);
+    defer diag.deinit();
     const result = parseLine(allocator, line, &diag);
     try testing.expectError(error.MissingField, result);
     try testing.expect(std.mem.indexOf(u8, diag.message, "role") != null);
@@ -939,16 +981,47 @@ test "an unknown kind is rejected" {
     const line =
         \\{"kind":"mystery","seq":1,"ts":"t","role":"worker","body":"hi"}
     ;
-    var diag: Diagnostics = .{};
+    var diag: Diagnostics = .init(allocator);
+    defer diag.deinit();
     const result = parseLine(allocator, line, &diag);
     try testing.expectError(error.UnknownKind, result);
 }
 
 test "malformed JSON is rejected, not partially interpreted" {
     const allocator = testing.allocator;
-    var diag: Diagnostics = .{};
+    var diag: Diagnostics = .init(allocator);
+    defer diag.deinit();
     const result = parseLine(allocator, "{not json", &diag);
     try testing.expectError(error.InvalidJson, result);
+}
+
+test "Diagnostics.set on allocation failure falls back to a borrowed literal, never freed" {
+    // Reviewer finding, block 2B: the fallback string on OOM was freed as
+    // if it were heap-owned, because ownership was inferred from
+    // `message.len != 0` rather than tracked. A `FailingAllocator` that
+    // fails the very first allocation forces `set`'s `catch` branch, so
+    // this exercises the path no other test reaches.
+    var failing = testing.FailingAllocator.init(testing.allocator, .{ .fail_index = 0 });
+    var diag: Diagnostics = .init(failing.allocator());
+    // If the fallback were still (incorrectly) freed here, this `deinit`
+    // would hand the failing allocator a pointer it never allocated —
+    // `std.testing.allocator`'s underlying checks would catch that.
+    defer diag.deinit();
+
+    diag.set("field '{s}' must be a string", .{"role"});
+
+    try testing.expectEqualStrings("diagnostic message allocation failed", diag.message);
+    try testing.expect(!diag.owned);
+    try testing.expectEqual(@as(usize, 0), failing.allocations);
+    try testing.expectEqual(@as(usize, 0), failing.deallocations);
+
+    // A second `set` on the same still-failing allocator must not try to
+    // free the borrowed literal from the first call either — the failing
+    // allocator would reject a free it never allocated, same as
+    // `std.testing.allocator` would.
+    diag.set("field '{s}' must be an integer", .{"seq"});
+    try testing.expectEqualStrings("diagnostic message allocation failed", diag.message);
+    try testing.expect(!diag.owned);
 }
 
 test "nextSeq derives one past the highest seq, and 1 for an empty log" {
@@ -970,20 +1043,24 @@ test "seq validation accepts a strictly increasing, contiguous sequence" {
 }
 
 test "seq validation reports a gap as a fault, not a repair" {
+    const allocator = testing.allocator;
     const a = Record{ .next = .{ .common = .{ .seq = 1, .ts = "t", .role = "architect" } } };
     const b = Record{ .next = .{ .common = .{ .seq = 3, .ts = "t", .role = "architect" } } };
     const records = [_]Record{ a, b };
-    var diag: Diagnostics = .{};
+    var diag: Diagnostics = .init(allocator);
+    defer diag.deinit();
     try testing.expectError(error.NonContiguousSeq, validateSeqOrder(&records, &diag));
     try testing.expect(std.mem.indexOf(u8, diag.message, "contiguous") != null);
 }
 
 test "seq validation reports a repeat or decrease as out of order, not a gap" {
+    const allocator = testing.allocator;
     const a = Record{ .next = .{ .common = .{ .seq = 1, .ts = "t", .role = "architect" } } };
     const b = Record{ .next = .{ .common = .{ .seq = 2, .ts = "t", .role = "architect" } } };
     const c = Record{ .next = .{ .common = .{ .seq = 1, .ts = "t", .role = "architect" } } };
     const records = [_]Record{ a, b, c };
-    var diag: Diagnostics = .{};
+    var diag: Diagnostics = .init(allocator);
+    defer diag.deinit();
     try testing.expectError(error.SeqOutOfOrder, validateSeqOrder(&records, &diag));
     try testing.expect(std.mem.indexOf(u8, diag.message, "out of order") != null);
 }
@@ -996,7 +1073,8 @@ test "parseLog parses a multi-line, multi-kind log in file order" {
         \\{"kind":"post","seq":3,"ts":"t","role":"worker","body":"progress"}
         \\
     ;
-    var diag: Diagnostics = .{};
+    var diag: Diagnostics = .init(allocator);
+    defer diag.deinit();
     var log = try parseLog(allocator, bytes, &diag);
     defer log.deinit();
 
@@ -1013,7 +1091,8 @@ test "parseLog reports which line failed" {
         \\{"kind":"header","seq":1,"ts":"t","format":1,"tool":"devlog 0.1.0","change":"x","roles":["architect"],"closers":["architect"]}
         \\{"kind":"post","seq":2,"ts":"t","body":"missing role"}
     ;
-    var diag: Diagnostics = .{};
+    var diag: Diagnostics = .init(allocator);
+    defer diag.deinit();
     const result = parseLog(allocator, bytes, &diag);
     try testing.expectError(error.MissingField, result);
     try testing.expectEqual(@as(usize, 2), diag.line_number);
@@ -1025,7 +1104,8 @@ test "parseLog surfaces a non-contiguous seq across the whole file as a fault" {
         \\{"kind":"header","seq":1,"ts":"t","format":1,"tool":"devlog 0.1.0","change":"x","roles":["architect"],"closers":["architect"]}
         \\{"kind":"post","seq":3,"ts":"t","role":"worker","body":"hi"}
     ;
-    var diag: Diagnostics = .{};
+    var diag: Diagnostics = .init(allocator);
+    defer diag.deinit();
     const result = parseLog(allocator, bytes, &diag);
     try testing.expectError(error.NonContiguousSeq, result);
 }
@@ -1035,7 +1115,8 @@ test "refs are stored verbatim across any namespace, unvalidated (D10)" {
     const line =
         \\{"kind":"post","seq":1,"ts":"t","role":"worker","refs":[{"ns":"D","id":"2"},{"ns":"totally-unknown-ns","id":"whatever"}],"body":"hi"}
     ;
-    var diag: Diagnostics = .{};
+    var diag: Diagnostics = .init(allocator);
+    defer diag.deinit();
     var parsed = try parseLine(allocator, line, &diag);
     defer parsed.deinit(allocator);
     try testing.expectEqual(@as(usize, 2), parsed.post.common.refs.len);

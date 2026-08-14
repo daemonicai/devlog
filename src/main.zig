@@ -7,12 +7,15 @@ const build_options = @import("build_options");
 const manifest = @import("manifest");
 const Io = std.Io;
 
-// The record model and its JSON codec (block 2A) have no consumer yet in
-// this dispatcher — sections 4/6/7 wire it in. Referenced here only so
-// `zig build test` discovers its tests; no production logic reaches it.
+// The record model and its JSON codec (block 2A), and the locked-append
+// I/O layer (block 2B), have no consumer yet in this dispatcher — sections
+// 4/6/7 wire them in. Referenced here only so `zig build test` discovers
+// their tests; no production logic reaches either yet.
 const record = @import("record.zig");
+const log = @import("log.zig");
 test {
     _ = record;
+    _ = log;
 }
 
 /// One subcommand of the surface. `section` names the `tasks.md` section

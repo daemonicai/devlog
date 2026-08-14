@@ -17,12 +17,12 @@
       unrecognised `format` with a clear message (`durable-format`)
 - [x] 2.4 Implement `seq` assignment — strictly increasing, contiguous, establishing total order
       (`append-only-log`)
-- [ ] 2.5 Implement exclusive locking and atomic append: the complete line or nothing, `seq` assigned
+- [x] 2.5 Implement exclusive locking and atomic append: the complete line or nothing, `seq` assigned
       under the lock (D11)
-- [ ] 2.6 Implement the `header` record — carrying `format`, `tool`, `change`, the declared `roles` and
+- [x] 2.6 Implement the `header` record — carrying `format`, `tool`, `change`, the declared `roles` and
       `closers` (D13), and no `role` of its own; written on file creation, and appended again whenever the
       writing tool version or the declaration differs from the last header
-- [ ] 2.7 Round-trip test: write a log of every record kind, re-read it, assert every field and the
+- [x] 2.7 Round-trip test: write a log of every record kind, re-read it, assert every field and the
       ordering survive
 
 ## 3. Body input
