@@ -170,6 +170,27 @@ A write takes an exclusive lock on the log for its duration, assigns `seq` under
 the complete line or nothing. An interrupted write must never leave a partial record. Agents run in
 series today; this exists so that ceasing to does not corrupt a log.
 
+**Amended during block 2B.** "The complete line or nothing" cannot be delivered by appending in place.
+`writePositionalAll` loops until every byte lands, so a record whose line spans more than one write
+syscall can leave a partial line on disk if the process is killed mid-loop — and no in-process test can
+exercise that, which is how the gap went unnoticed until the reviewer read the implementation. A write
+therefore stages the new content in a temporary file alongside the log and `rename`s it into place;
+`rename` is atomic, so a reader sees either the old log or the new one and never a torn record.
+`durable-format`'s no-stray-files requirement is amended to carve out exactly this one temporary file,
+which must not outlive the write that made it.
+
+Two consequences, both accepted deliberately:
+
+- **A write is O(size of log), not O(size of record)**, because atomic replacement means writing the whole
+  file. DEVLOGs are small — a long-running change is hundreds of kilobytes — and a write happens once per
+  agent post, so the cost is irrelevant at this scale. Revisit only if a log ever gets large enough to
+  notice, which would itself be a signal the format is being misused.
+- **The lock is on the log's inode, and a rename replaces that inode.** A second writer that acquires the
+  lock on the file it opened can therefore be holding a lock on an inode the first writer has already
+  replaced, and would silently write its record into an orphan. After taking the lock, a writer must
+  confirm the path still resolves to the inode it holds open, and start over if it does not. This is the
+  hazard the strategy introduces; it is not optional.
+
 ### D12 — MPL 2.0, static tarballs, no support burden
 
 MPL 2.0. Distribution mirrors memlite: statically linked tarballs attached to tagged GitHub releases for

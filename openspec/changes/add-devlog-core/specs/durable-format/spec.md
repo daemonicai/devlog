@@ -38,6 +38,13 @@ The tool SHALL hold no persistent state anywhere but `DEVLOG.jsonl`. Everything 
 item numbering, item states, references, and any index used to answer a query — SHALL be derived from
 that file on each invocation and discarded when the process exits.
 
+One exception, and only one: a write MAY create a single temporary file in the same directory as
+`DEVLOG.jsonl`, for the duration of that write and no longer, solely so that the log can be replaced
+atomically and never observed in a partial state. It SHALL be removed before the command exits, whether
+the write succeeded or failed, and it SHALL NOT be read by any command — it is a write mechanism, not
+state. This exception exists because atomic replacement cannot be achieved without it, and the guarantee
+it buys — that no reader ever sees a torn record — is worth more than the invariant it costs.
+
 #### Scenario: Nothing to rebuild
 
 - **WHEN** the repository is cloned fresh, containing only the committed file
@@ -51,7 +58,18 @@ that file on each invocation and discarded when the process exits.
 #### Scenario: No stray files are produced
 
 - **WHEN** any command completes, successfully or not
-- **THEN** no file other than `DEVLOG.jsonl` has been created, modified, or deleted
+- **THEN** no file other than `DEVLOG.jsonl` exists that the command created
+- **AND** no file other than `DEVLOG.jsonl` has been modified or deleted
+
+#### Scenario: A write's temporary file does not outlive it
+
+- **WHEN** a write completes, successfully or not
+- **THEN** the temporary file it used to replace the log atomically no longer exists
+
+#### Scenario: A read ignores a temporary file
+
+- **WHEN** a temporary file is present from a write that was killed before it could clean up
+- **THEN** no command reads it, and it is not mistaken for the log
 
 ### Requirement: The change being operated on is named explicitly
 

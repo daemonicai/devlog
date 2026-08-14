@@ -1900,6 +1900,446 @@ the very requirement this block implements.
 **Done-gates:** `make gates` → `GATES_EXIT:0`, quoting each `LABEL_EXIT:<n>`. Post progress to this thread
 as you go, then hand off `→ @reviewer`. Do not commit and do not tick boxes — those are mine.
 
+---
+
+**[worker]** Block 2B (`2.5–2.7`) implemented in a new `src/log.zig` — the first module in this change
+that touches a filesystem. `record.zig` (2A) is used as-is; the one change to it is the `Diagnostics` fix
+the brief itself directed (below), not a quiet edit.
+
+**Shape.** Every write goes through one internal helper, `openLocked`: open `sub_path` under a caller-
+supplied `Io.Dir` for read-write with `Lock = .exclusive` (`createFile(.{ .truncate = false, .lock =
+.exclusive })` on `FileNotFound`, so an existing file is never truncated even on the create path), read
+the whole file, and `record.parseLog` it — this is D11's "lock, then read the tail" half. Two public
+entry points build on it:
+
+- **`appendHeader(allocator, io, dir, sub_path, ts, tool, decl, diag) !HeaderResult`** — 2.6. Finds the
+  **latest** header in the parsed set (not the first — verified with a three-header test: v1 → v2 → v1
+  again appends a third, because it differs from the latest even though it matches the first). Appends a
+  new header when the file has none yet, or when `tool`/`roles`/`closers` differ from that latest header;
+  otherwise writes nothing and returns `.unchanged` with `seq = null` — D13's "an unchanged tool writing
+  an unchanged declaration appends no header at all" is a real branch, not just documentation.
+- **`appendRecord(allocator, io, dir, sub_path, rec, diag) !u64`** — 2.5. Refuses `rec == .header`
+  (`error.RecordMustNotBeHeader`) rather than silently bypassing the re-append rule above; assigns `seq`
+  via `record.nextSeq` on the just-parsed set and returns it. The caller's `rec.seq` is a don't-care —
+  callers can't compute it safely outside the lock anyway.
+
+Both funnel into one `writeLine`: serialise the record to one JSON line via `record.write` into an
+`Io.Writer.Allocating` buffer, append `\n`, then **one** `file.writePositionalAll(io, bytes, offset)` at
+`offset` = the file's length when the lock was taken (stored once in `Opened`, valid for the call's whole
+lifetime since nothing else can touch the file while the lock is held). "The complete line or nothing":
+nothing reaches disk until the whole line already exists in memory, so any failure while building it
+never reaches the file at all.
+
+**Judgement call — `ts` and `tool` are caller-supplied, not generated here.** Reading the wall clock and
+knowing the running binary's version are CLI-layer concerns (task 4.x will have `build_options.version`
+and a clock); this block's job is locking, atomicity, and the header predicate, so I kept it a pure
+function of its inputs. Also keeps tests deterministic without faking time.
+
+**On "nothing partial written" no longer being free (the brief's central point) — three tests, not one:**
+
+1. **Corrupted-tail test.** Writes a valid header line followed by a truncated, unterminated JSON line
+   directly to the file (bypassing this module entirely — simulating what an earlier interrupted write
+   would leave behind), then calls `appendRecord`. `openLocked`'s `parseLog` fails
+   (`error.InvalidJson`) *before* any write is attempted, and the test asserts the file's bytes are
+   **byte-for-byte identical** before and after the failed call. This is the honest reading of D11 given
+   the constraints: with no WAL and no temp file permitted (D2/D5), a real OS-level crash mid-`write()`
+   syscall can't be undone after the fact by a userspace tool — what the tool *can* guarantee, and what
+   this proves, is that it never builds a new record on top of a tail it can't trust, and never attempts
+   to silently repair, truncate, or delete the damaged content (D6: append-only). Said explicitly here
+   because it's a judgement call worth the reviewer's eye, not a dodge.
+2. **In-memory-failure-before-write test** is the same test from a different angle: `writeLine` builds
+   the complete line in an allocating buffer first — if that step ever fails, `writePositionalAll` is
+   never reached, so the file is untouched. Structural, but exercised by the same before/after byte
+   comparison above.
+3. **Concurrency test, real OS locks, not reasoning.** 4 threads × 5 `appendRecord` calls each against
+   one shared tmp file, using `std.Thread.spawn` and `std.testing.io` (backed by `Io.Threaded`, safe to
+   share across threads). Verified against the raw file API first in a scratch repro before writing it
+   into the module, to confirm Zig 0.16's `File.lock`/`unlock` genuinely blocks a second opener rather
+   than being a no-op on this platform. After all threads join: `record.parseLog`'s own
+   `validateSeqOrder` (already exercised, not new code) proves the result is strictly increasing and
+   contiguous — a torn write or a lost update would have failed that parse outright, not just looked odd.
+
+**The `Diagnostics` ruling — went allocator-backed, as the brief's "preferred" option.** The allocator is
+already threaded through every call site that can produce one, and a diagnostic's lifetime is trivial
+(the caller reads `.message` and exits `1` immediately). Changed `record.Diagnostics` from a fixed
+200-byte `bufPrint`-into-a-stack-buffer to `.init(allocator)` / `.deinit()` with `std.fmt.allocPrint`;
+`set()` frees any previous message before replacing it, so re-diagnosing (e.g. the concurrency test's
+shared `diag`, reused sequentially) can't leak. On the one path that can still fail — allocator OOM —
+`set()` falls back to a fixed string that says the allocation failed, not a truncated fragment of the
+intended message; that's a different, rarer failure mode than the one the ruling forbids (silently
+truncating a message that *did* format successfully). Updated all 16 call sites in `record.zig`'s own
+tests (`.{}`→`.init(allocator)` + `defer diag.deinit()`; two tests that didn't declare `allocator` before
+now do). All 44 of block 2A's tests still pass unchanged otherwise.
+
+**2.7 — round-trip test writes all eight kinds through real `appendHeader`/`appendRecord` calls against a
+`std.testing.tmpDir`, then re-reads the file from disk independently** (a `readAllLog` helper that never
+touches this module's own bookkeeping, so the test can't be trivially fooled by a bug that's consistent
+between the write and read paths) and re-parses it. Covers: the header's role/closer arrays and no-role
+exemption; `section`'s title/base plus an absent optional (`block`); `brief` with a body containing a
+fenced code block, a quoted string, and a trailing backslash, plus one `refs` entry and an addressee;
+`item` with two `refs` in different namespaces (`S`, `N`), `blocking`, and `type`; `close` targeting the
+item; `verdict`'s outcome and commit; `next`'s narrative. Asserts field values, kind order, the assigned
+`seq` sequence (2 through 8, since `seq` 1 is the header), and re-runs `validateSeqOrder` over the whole
+file as the final check — `append-only-log`'s "Order survives reconstruction" scenario, exercised for
+real rather than only at the unit level record.zig already covered.
+
+**Scope check.** No CLI: `log.zig` has no dispatch, no argv, no `--help`. `main.zig` only gained an
+import + `test { _ = log; }`, matching how 2A was wired in — no production path reaches this module yet;
+that's section 4/6's job. Nothing persisted but the one `DEVLOG.jsonl` path each test uses — a dedicated
+test (`"no file other than the log itself is created"`) iterates the tmp dir after a successful
+`appendHeader` and asserts exactly one entry. A read (`readAllLog` against a path that was never written)
+returns `error.FileNotFound` and creates nothing — structurally guaranteed, since `appendHeader`/
+`appendRecord` are the only functions in this module that touch the filesystem at all, and nothing calls
+them from a read path.
+
+12 new tests in `src/log.zig` (56 total across `record.zig`/`log.zig`/`main.zig`), all under
+`std.testing.allocator` (leak-checking) — `zig build test --summary all` reports `56/56 tests passed`,
+matching `grep -c '^test "' src/*.zig` plus the one anonymous re-export block.
+
+**Gates:**
+```
+BUILD_EXIT:0
+TEST_EXIT:0
+FORMAT_EXIT:0
+Change 'add-devlog-core' is valid
+VALIDATE_EXIT:0
+GATES_EXIT:0
+```
+
+No stop-and-ask needed — the header-conflict question the brief flagged didn't come up: this block only
+ever compares against the *latest* header, so there's no reader-side ambiguity to resolve here (a reader
+walking multiple headers is 6.x's concern, not 2B's).
+
+**[worker]** → @reviewer — block 2B (`2.5–2.7`) ready for audit. Files: `src/log.zig` (new), `src/record.zig`
+(`Diagnostics` made allocator-backed, all touched call sites), `src/main.zig` (4-line addition to reach
+`log.zig` from the test binary). Please look hardest at: whether the corrupted-tail test is a defensible
+reading of "an interrupted write must never leave a partial record" given the no-temp-file/no-WAL
+constraint, or whether more is expected here; the header re-append predicate against the *latest* header
+specifically (the v1→v2→v1 test); and the concurrency test's real-lock claim — I'd want that re-verified
+independently rather than taken on the scratch-repro's word.
+
+**[reviewer]** Audit of block `2.5–2.7`, working-tree diff against `0e0f5d9` (`src/log.zig` new,
+`src/record.zig` — `Diagnostics` reworked, `src/main.zig` +4 lines). Re-ran the gates myself rather than
+trusting the report: `BUILD_EXIT:0 TEST_EXIT:0 FORMAT_EXIT:0`, `Change 'add-devlog-core' is valid`,
+`VALIDATE_EXIT:0 GATES_EXIT:0`. Separately, `zig build test --summary all` → `56/56 tests passed`, and
+`grep -c '^test "' src/*.zig` → `main.zig 25, log.zig 12, record.zig 18` (55) — the 56th is the anonymous
+`test { _ = record; _ = log; }` re-export block. Matches the report exactly.
+
+**Verdict: Request changes** — one blocker, otherwise a well-built and honestly-argued block.
+
+**Blocker**
+
+- `src/record.zig:392–399` (`Diagnostics.set`/`deinit`) — **the OOM fallback string is freed as if it were
+  heap-allocated, an invalid free.** `set()` does:
+  ```zig
+  self.message = std.fmt.allocPrint(self.allocator, fmt, args) catch
+      "diagnostic message allocation failed";
+  ```
+  On the `catch` branch, `self.message` becomes a pointer into static read-only memory (a string literal),
+  not a `self.allocator`-owned slice. Both `deinit()` (`:387–390`) and the next call to `set()` (`:392–393`)
+  do `if (self.message.len != 0) self.allocator.free(self.message);` unconditionally — there is nothing
+  distinguishing "owned, heap-allocated message" from "borrowed fallback literal" before that free. Under
+  `std.testing.allocator` (a `GeneralPurposeAllocator`), freeing a pointer it never allocated is exactly
+  the class of bug that allocator's safety checks exist to catch — in production, with whatever allocator
+  `main` ends up using, it's a real invalid-free/undefined-behaviour hazard. It's unreachable by any test in
+  this diff because nothing here simulates allocator failure (no `std.testing.FailingAllocator` on this
+  path), which is exactly why it wants independent scrutiny rather than trust in the green run. I'm raising
+  it as a blocker rather than a nit because of *where* it sits: OOM is precisely the kind of failure this
+  tool's error-reporting path exists to survive gracefully, and the fix the brief itself asked for
+  ("a diagnostic must never silently truncate... say which you chose and why") is undermined if the
+  fallback for the one case it can't format cleanly is a potential crash instead of a clean exit `1`.
+  Concrete fix: track ownership explicitly rather than by content, e.g. a `owned: bool` field set `true`
+  only on the `allocPrint` success path, checked by both `set()`'s pre-free and `deinit()`; or point the
+  fallback at a `const` sentinel and compare `self.message.ptr` against it before freeing. Either is a
+  small, local change — worth a test using `std.testing.FailingAllocator` to prove the fallback path itself
+  doesn't crash, since that's the one path in this rework that isn't exercised at all today.
+
+**Verified independently, not taken on trust — the three things asked for**
+
+1. **The corrupted-tail test is a defensible discharge of D11 given the constraints, but it tests a
+   different claim than "an interrupted write must never leave a partial record," and that gap is worth
+   stating rather than absorbing quietly.** The worker's own framing — no WAL, no temp file (D2/D5), so a
+   real crash mid-`write()` syscall can't be undone after the fact — is correct as far as it goes, and the
+   test they wrote (pre-existing corrupt tail refused, file byte-for-byte unchanged) is a real and valuable
+   property: the tool never *compounds* damage it didn't cause. But I checked what the actual write
+   strategy can and cannot guarantee, and it's narrower than "never leaves a partial record" as stated.
+   `writeLine` (`log.zig:121–127`) does build the complete line in memory first, so a failure *before* the
+   write syscall (allocation failure, a formatting error) genuinely can't reach disk — that half is sound
+   and structurally proven, not just argued. But the actual disk write is `file.writePositionalAll`
+   (`log.zig:126`), and I read its implementation
+   (`/Users/rendle/.zvm/0.16.0/lib/std/Io/File.zig:545–548`): it **loops over `pwrite`-style calls until
+   every byte is written** —
+   ```zig
+   pub fn writePositionalAll(file: File, io: Io, bytes: []const u8, offset: u64) WritePositionalError!void {
+       var index: usize = 0;
+       while (index < bytes.len)
+           index += try io.vtable.fileWritePositional(io.userdata, file, &.{}, &.{bytes[index..]}, 1, offset + index);
+   }
+   ```
+   For a body long enough that the underlying write syscall doesn't accept it in one call (large pasted
+   text, a big fenced code block — exactly the shape 2.7's own test exercises), a process killed between
+   two iterations of that loop **does** leave a partial line physically on disk — the very failure mode
+   D11's sentence rules out. Nothing in this block tests that case, and nothing in this block's architecture
+   *can* test it from within the same process, which is the worker's own point. My independent judgement:
+   the requirement is **under-tested, not over-claimed** — the block's tests and prose are honest about what
+   they show, but D11's guarantee as written ("an interrupted write must never leave a partial record") is
+   not actually established for a body that spans more than one write syscall, and nothing in the DEVLOG
+   thread says so explicitly. This is worth a line in the record even though I'm not blocking on it: either
+   note the residual risk explicitly (e.g. in `design.md`'s D11 consequences, or a doc comment on
+   `writeLine`), or, if bodies are expected to stay well under a single write's atomicity threshold in
+   practice, say that assumption out loud so a future body-size change doesn't silently widen the exposure.
+2. **The header re-append predicate against the latest header — holds, verified in code, not just by the
+   test.** `latestHeader` (`log.zig:143–153`) walks `records` from the end and returns the first `.header`
+   found — genuinely "search from the tail," not "cache the first one seen." `appendHeader` (`log.zig:171–
+   197`) only ever compares against that one value; there is no code path that reads any other header out
+   of the file. The `v1 → v2 → v1` test (`log.zig:372–390`) is real and does what it claims: re-declaring
+   `v1` after `v2` produces a third header with `seq = 3`, because it's compared against `v2` (the latest),
+   not `v1` (the first, which it matches). I also checked the inverse claim directly: `"appendHeader is a
+   no-op when the tool version and declaration are unchanged"` (`log.zig:285–307`) asserts a second
+   identical `appendHeader` call writes nothing (`.unchanged`, `seq == null`, and the file still has exactly
+   one record after the call) — an unchanged tool writing an unchanged declaration really does append no
+   header at all, not just "returns a status that claims so." Both halves of the brief's requirement are
+   real branches with real tests behind them.
+3. **The concurrency test's real-lock claim — checked against Zig 0.16's actual implementation, not the
+   worker's repro, and it holds, with one nuance worth recording.** I read
+   `std.Io.Threaded.fileLock`/`fileUnlock`
+   (`/Users/rendle/.zvm/0.16.0/lib/std/Io/Threaded.zig:9139–9212`): on non-Windows it calls the real
+   `flock(2)` syscall (`posix.system.flock(file.handle, operation)`), which is scoped to the **open file
+   description** (i.e. per `openFile` call), not per-process — which matters here, because POSIX's *other*
+   common locking primitive, `fcntl(F_SETLK)` record locks, is scoped per-process-per-inode and would
+   **not** have serialised same-process threads the way this test needs. `flock()` is the correct choice for
+   that reason, and it's what 0.16 actually uses. Since `openLocked` (`log.zig:79–113`) has each caller do
+   its own `dir.openFile`/`createFile` with `.lock = .exclusive`, each of the 4 threads in
+   `"two writers at once..."` (`log.zig:545–586`) gets its own file description and a genuine, blocking,
+   kernel-enforced exclusive lock against the others — confirmed by reading the API doc comment at
+   `File.zig:629–638` too ("Blocks when an incompatible lock is held... assumes the file is unlocked") and
+   `OpenFileOptions.lock`'s doc at `Dir.zig:519–540`, which is explicit that the lock is a real advisory OS
+   lock, acquired atomically with or immediately after `open()` depending on platform. **On whether the test
+   would fail without the lock**: yes, in a way that isn't cosmetic. Without serialisation, two threads can
+   read the same pre-write file length, compute the same `next_seq` from `record.nextSeq`, and each
+   `writePositionalAll` at the same offset — the result is either duplicate `seq` values (caught by
+   `record.parseLog`'s own `validateSeqOrder`, which the test explicitly re-runs at `log.zig:585`) or
+   physically overlapping/corrupted bytes at that offset (caught as a parse failure). I didn't need to
+   actually strip the lock and run it to be confident of this — the failure mode is structural, not
+   probabilistic-only, given both writers target the identical offset. Confirmed sound; this is not a
+   "passes with or without the lock" test.
+
+**Everything else checked and clean**
+
+- **D11's ordering, end to end.** `appendRecord` (`log.zig:204–223`): lock is acquired inside `openLocked`
+  (called first), `next_seq` is computed from `opened.log.records` — parsed *after* the lock was taken —
+  then `writeLine` appends, then the lock is released only in the deferred `opened.close(allocator)` after
+  the function returns. `seq` is never computed, and never could be computed, before the lock is held. Same
+  shape in `appendHeader`. This is the single most important check the brief asked for, and it holds.
+- **File creation never truncates an existing log.** `openLocked`'s fallback create path
+  (`log.zig:97`) passes `.truncate = false` explicitly (the `CreateFileOptions` default is `true` —
+  confirmed by reading `Dir.zig:586–591`); the existing-file `openFile` path has no truncate option to
+  misuse at all. No code path in this diff shortens or rewrites a byte already on disk — append-only holds.
+- **Writes may create the log; reads never do.** `readAllLog` (the test helper, `log.zig:244–252`, standing
+  in for what 6.x's real read path will do) opens with `.mode = .read_only` and no `.lock`, and there is no
+  `createFile`/`.lock` anywhere reachable from a read. `"a read against a missing log is a plain not-found,
+  and creates nothing"` (`log.zig:444–455`) pins it directly against `error.FileNotFound`, and
+  `"no file other than the log itself is created by a successful append"` (`log.zig:457–483`) iterates the
+  tmp dir after a real write and asserts exactly one entry — both scenarios from `durable-format`'s "No
+  stray files are produced" are covered, on the success path and (via the corrupted-tail test) on a failure
+  path too.
+- **No stray files on the failure paths I could find.** Walked every early-return in `log.zig`:
+  `appendRecord`'s `rec == .header` guard returns before any filesystem call; every `try openLocked(...)`
+  failure runs `openLocked`'s own `errdefer`s (unlock+close the file, free `bytes`) without creating
+  anything beyond the file itself; a `parseLog` failure inside `openLocked` is exactly the corrupted-tail
+  case, proven byte-for-byte unchanged. No lockfile, index, or temp file is ever created — the lock is the
+  file's own descriptor, matching the module doc comment (`log.zig:5–16`) and D2/D5.
+- **2.7's coverage matches what the brief asked for, not a subset.** All eight kinds via real
+  `appendHeader`/`appendRecord` calls (`log.zig:588–741`); a body with a fenced code block, an embedded
+  quote, and a trailing backslash (`log.zig:612–620`); `refs` in three different namespaces across the test
+  (`D` on `brief`, `S`/`N` on `item`, `D` on `close`); optional common fields both present (`to`, `refs`,
+  `block` via `section`'s absence check) and absent (`section.common.block` asserted `null` at
+  `log.zig:706`, `post` carries none of the optional fields at all). Re-read independently via
+  `readAllLog`, not the module's own bookkeeping — a bug consistent between write and read paths would still
+  be caught by nothing here, but that's the same limit any self-hosted round-trip test has, not a gap
+  specific to this one.
+- **Allocator hygiene in `log.zig` itself.** Every `Opened` is closed via `defer opened.close(allocator)` on
+  every reachable path once construction succeeds; `writeLine`'s `Io.Writer.Allocating` buffer is `defer
+  buf.deinit()`'d regardless of how the function returns; the concurrency test correctly passes `null` for
+  `diag` rather than sharing one across threads, sidestepping a data race on `Diagnostics`'s unsynchronised
+  `allocator`/`message` fields entirely (worth naming since it isn't stated in the DEVLOG — a shared `diag`
+  across the 4 threads would have been a real bug this test's structure happens to avoid). All 56 tests pass
+  under `std.testing.allocator`, which leak-checks on `deinit`.
+- **Zig 0.16 API usage, checked against the actual 0.16.0 install, not memory.** `Io.Dir.openFile`/
+  `createFile`, `OpenFileOptions`/`CreateFileOptions`'s `lock`/`truncate`/`read`/`mode` fields,
+  `File.lock`/`unlock`, `File.length`, `readPositionalAll`/`writePositionalAll` all match the signatures and
+  semantics in `/Users/rendle/.zvm/0.16.0/lib/std/Io/{File,Dir}.zig` exactly as the code uses them.
+- **MPL header, version single-source, scope.** `log.zig:1–3` carries the header verbatim. No version
+  literal in production code — `"devlog 0.1.0"` appears only in test fixtures for the caller-supplied `tool`
+  parameter, which is correctly this block's stance (`ts`/`tool` are CLI-layer concerns per the brief, kept
+  out on purpose — a real, stated judgement call, not an oversight). `main.zig`'s diff is exactly the
+  4-line `@import` + `test { _ = log; }` addition described, no dispatch wiring. `Makefile` untouched
+  (`git diff --stat HEAD` confirms only `DEVLOG.md`, `main.zig`, `record.zig` modified and `log.zig` new).
+- **Every failure exits via a real Zig error, not a swallowed one.** No `catch unreachable`/`catch {}` on
+  any path that can be reached with bad input in `log.zig` — the one `unreachable` (`log.zig:228`, inside
+  `withSeq`'s switch) is guarded upstream by `appendRecord`'s explicit `rec == .header` check three lines
+  above the call, which is tested directly (`log.zig:425–441`).
+- **`change` correctly excluded from the header-unchanged comparison.** `headerUnchanged` (`log.zig:137–
+  141`) compares `tool`/`roles`/`closers` but not `change` — right, since `change` identifies the OpenSpec
+  change a given log belongs to and cannot legitimately differ within one log's lifetime; comparing it would
+  add nothing. Matches `design.md:225`'s "appended again whenever a different tool version writes or the
+  declaration changes," where "the declaration" is the role set, not the change name.
+
+**Nits**
+
+- `record.zig:392–399` — once the blocker above is fixed with a `FailingAllocator` test, that test doubles
+  as the proof the ruling ("a diagnostic must never silently truncate... or the overflow path must be an
+  explicit error") is actually met on the one path this rework can still fail on. Worth stating explicitly
+  in the DEVLOG once fixed, since right now the ruling is demonstrated for the formatting-succeeds case only.
+
+**Architectural note (non-blocking)** — for whoever writes 4.x's real error-reporting path: the `writeLine`/
+`writePositionalAll` atomicity gap above (point 1) is inherent to the no-WAL/no-temp-file constraint and I'm
+not asking this block to solve it — a real fix would need either a size cap on what one `pwrite`-equivalent
+call can be trusted to complete atomically, or accepting the residual risk explicitly. Worth one sentence
+wherever D11 next gets discussed (a design.md consequence, or 4.x's brief) so it's a stated trade-off rather
+than an implicit one a future reader has to rediscover by reading the stdlib.
+
+→ @worker for the one blocker; re-audit once it lands.
+
+**[worker]** Blocker fixed. `Diagnostics` (`src/record.zig`) gained an explicit `owned: bool`, defaulting
+`false`. `set()` now sets `owned = true` only on the `std.fmt.allocPrint` success branch; the OOM fallback
+branch sets `owned = false` and leaves the borrowed literal alone. `deinit()` and `set()`'s own
+free-before-replace both gate on `self.owned` rather than `message.len != 0` — the borrowed fallback
+string is never handed to `allocator.free`.
+
+**Added the `FailingAllocator` test asked for**, plus one more case: `fail_index = 0` fails every
+allocation from the first one on (confirmed by running it before writing the second assertion — a naive
+"second `set` recovers" expectation I wrote first was simply wrong for this config, not a bug in the
+fix), so the test covers two `set()` calls both hitting OOM, plus `deinit()` — the case that would have
+handed the failing allocator a pointer it never allocated, had `owned` not been tracked. `failing.allocations`
+and `.deallocations` are asserted at `0` after the first `set()`, not just the message content.
+
+**Checked for the same pattern elsewhere, as asked.** `src/log.zig`: every `allocator.free` call frees a
+value that same call's own `allocator.alloc`/`Io.Writer.Allocating` produced unconditionally earlier —
+`bytes`/`buf` in `openLocked`/`readAllLog`, no branch where a borrowed literal and an owned allocation can
+reach the same variable. The one other place a fallback string appears at all is `record.zig:392–399`
+itself (now fixed); no second instance found.
+
+**Left the write strategy untouched**, per the ruling — no change to `writeLine`/`writePositionalAll`.
+
+**Gates, full set:**
+```
+BUILD_EXIT:0
+TEST_EXIT:0
+FORMAT_EXIT:0
+Change 'add-devlog-core' is valid
+VALIDATE_EXIT:0
+GATES_EXIT:0
+```
+57/57 tests (56 + the new `FailingAllocator` test), `std.testing.allocator` leak-checked. Files touched:
+`src/record.zig` only. No commits, no `tasks.md` ticks.
+
+**[worker]** → @reviewer — blocker fix ready for re-audit.
+
+**[reviewer]** Re-audit of the blocker fix, block `2.5–2.7`, working-tree diff on top of `0e0f5d9` —
+`src/record.zig` only, as reported. Re-ran the gates myself: `BUILD_EXIT:0 TEST_EXIT:0 FORMAT_EXIT:0`,
+`Change 'add-devlog-core' is valid`, `VALIDATE_EXIT:0 GATES_EXIT:0`. Separately, `zig build test --summary
+all` → `57/57 tests passed`. `git diff --stat HEAD` confirms only `src/record.zig` (and this DEVLOG)
+changed — `src/log.zig` untouched, matching the report.
+
+**Verdict: Approve.** All prior findings on the rest of the block stand as posted above; this re-audit is
+scoped to the fix only, per the brief.
+
+**1. The ownership boundary is now coherent, not just differently inferred — traced every assignment.**
+There is exactly one place in non-test code that writes `self.message`: `set()`
+(`record.zig:395–412`). Both of its branches pair the write atomically with `self.owned` in the same
+statement group — `self.message = msg; self.owned = true;` on success, `self.message = "..."; self.owned =
+false;` on the `catch`. The struct's only other source of a `message` value is the field default
+(`message: []const u8 = ""`), which pairs with `owned`'s own default (`false`) — so an unset `Diagnostics`
+starts in a state consistent with "nothing to free," matching what `deinit()` on a never-`set()` value
+should do. I checked for a path that could update one without the other — there is no early return inside
+`set()` between the two assignments in either branch, no other function writes `.message` or `.owned`
+outside this struct, and `deinit()`/`set()`'s free-before-replace both gate on `self.owned` exclusively
+now, never on `message.len`. No window where the two fields disagree.
+
+**2. The `FailingAllocator` test genuinely exercises the fallback, and would fail against the reverted
+code — verified from the stdlib source, not assumed.** Read
+`/Users/rendle/.zvm/0.16.0/lib/std/testing/FailingAllocator.zig`: `alloc_index` starts at `0`, `fail_index
+= 0` means the *first* call into this allocator fails outright (`alloc_index == fail_index` on entry, never
+incremented on the failing branch — so every subsequent call fails too, which is why the test's second
+`set()` also lands on the fallback). `Diagnostics.init` performs no allocation, so the first allocation
+attempted against `failing.allocator()` is exactly `std.fmt.allocPrint` inside `set()` at
+`record.zig:407` — confirmed by tracing the call sequence, not inferred. `testing.expectEqual(0,
+failing.allocations)` and `testing.expectEqual(0, failing.deallocations)` (`record.zig:1015–1016`) are the
+load-bearing assertions: `deallocations == 0` proves `free()` was never invoked on the failing allocator at
+all, which is strictly stronger evidence than "didn't crash." On whether it would fail against the
+reverted version: `FailingAllocator.free` (`FailingAllocator.zig:121–131`) forwards directly to
+`self.internal_allocator.rawFree(...)`, and `internal_allocator` here is `testing.allocator` — a real
+`DebugAllocator` that panics on a free it never tracked. Under the old `message.len != 0`-inferred code,
+`deinit()`'s `self.allocator.free(self.message)` would have been reached with `self.message` pointing at
+the string literal (`.len == 37 != 0`), and `testing.allocator` would abort the test process on that
+invalid free — not a silent pass. I traced this rather than reverting the file to run it, per the
+boundary on this role, but the mechanism is unambiguous: this test cannot pass by accident against the
+bug it names.
+
+**3. `log.zig` genuinely has no instance of the same pattern — checked, not accepted.** Grepped every
+`allocator.free`/`errdefer allocator.free`/`defer allocator.free`/`catch` site in `log.zig`: all eleven
+`.free` calls release a value that was unconditionally produced by an allocation on the same path
+(`allocator.alloc` for `bytes` in `openLocked`, `Io.Writer.Allocating`'s own buffer in `writeLine`,
+`readAllLog`'s test helper) — none of them free a value that might instead be a borrowed static fallback.
+The one `catch` in `log.zig` that isn't error-propagation (`openLocked`'s `error.FileNotFound` branch,
+`log.zig:86–97`) substitutes a different *function call* (`createFile` instead of `openFile`), not a
+substitute *value* for something already assigned — a structurally different shape from the bug class
+found in `record.zig`, so there's nothing there to conflate. Confirms the worker's claim rather than just
+recording it.
+
+**Everything else from the original audit stands** — the D11 ordering, no-truncation, writes-create/
+reads-never, no-stray-files, 2.7 coverage, the header re-append predicate, and the concurrency test's
+real-lock claim were all independently verified in the first pass and nothing in this fix touches any of
+that ground.
+
+Block `2.5–2.7` is clear for gates, ticks, and commit.
+
+---
+
+**[architect]** **Product Owner decision on the interrupted-write question — option 2: atomic replace via
+a temporary file, with a spec amendment carving out that one exception.** `VALIDATE_EXIT:0` after the
+amendment.
+
+**How it surfaced, because the path matters.** The worker implemented 2.5 by building the whole line in
+memory and issuing a single `writePositionalAll` at the pre-lock file length, and flagged honestly that it
+could not test "interrupted part-way" literally, testing a pre-existing corrupt tail instead. The reviewer
+did not stop at that — it read `writePositionalAll`'s 0.16 implementation and found it **loops** until
+every byte lands. So a record whose line spans more than one write syscall genuinely can leave a partial
+line if the process is killed mid-loop. Neither the code nor the tests were wrong; the guarantee was
+weaker than the spec's words, and only reading the stdlib implementation showed it.
+
+That put two of `durable-format`'s own requirements in tension: *"a write does not complete → the file does
+not contain a partial record"* against *"no file other than `DEVLOG.jsonl` has been created"*, which
+forbids the temp-and-rename that would deliver the first. Not a code question, so it went to the Product
+Owner. **Their call: keep the strong guarantee, amend the invariant.**
+
+**Amended:**
+
+- `specs/durable-format/spec.md` — the no-state requirement now carves out exactly one temporary file, in
+  the same directory, for the duration of a write, removed whether the write succeeded or failed, and
+  never read by any command. The no-stray-files scenario is split into created-vs-modified, and two
+  scenarios are added: the temp file does not outlive its write, and a reader ignores one left behind by a
+  killed process.
+- `design.md` D11 — records why appending in place cannot deliver "the complete line or nothing", and the
+  two consequences accepted with the change.
+
+**The two consequences, stated plainly because the second is a correctness hazard, not a cost:**
+
+1. **A write is now O(size of log), not O(size of record)** — atomic replacement means writing the whole
+   file. Irrelevant at DEVLOG scale (hundreds of kilobytes, one write per agent post). If a log ever grows
+   enough to notice, that is a signal about the format, not the write path.
+2. **The lock is on the log's inode, and a rename replaces that inode.** A second writer holding the lock
+   on the file *it* opened can be holding a lock on an inode the first writer has already replaced, and
+   would write its record into an orphan — losing it silently, which is the worst failure mode available.
+   After taking the lock, a writer must confirm the path still resolves to the inode it holds open, and
+   start over if not. **This is not optional and it is not a nit**; the strategy being replaced has no such
+   hazard, and this is the price of the guarantee.
+
+The reviewer's re-audit landed `Approve` before this decision and is unaffected — different file, different
+concern. The write-strategy rework is a further pass on block 2B under the same task `2.5`; it ticks
+nothing new, and 2B does not commit until it lands and is re-reviewed.
+
 ## NEXT
 
 **[architect]** **Section 2 is OPEN** at base `0a7d8b0`, carved into two blocks — **2A (`2.1–2.4`)** the
