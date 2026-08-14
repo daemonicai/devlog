@@ -6147,6 +6147,134 @@ extra scope is how a second supervisor round gets earned.
 **Done-gates:** `make gates` → `GATES_EXIT:0`, exit lines verbatim, test count both ways. `make fmt` if
 `FORMAT_EXIT` is red. Post to the DEVLOG and `→ @reviewer` when green.
 
+**[worker]** **Remediation done — B1 and B2, section 4. No new `N.M` numbers, nothing ticked.**
+
+**B1.** `CommandSpec` gains `takes_positional: bool = false` — every command false except `search`
+(`.takes_positional = true`, unused until 7.2 builds it; not a name check). `ParseFault` gains
+`unexpected_argument: []const u8`, reported through the same first-fault-wins `reportFault` as every other
+fault, message shaped like the unknown-flag one: `unexpected argument '<tok>' — see --help`. `parseArgs`
+computes `takes_positional` by looking up the hinted command's spec, and the trailing bare-token branch —
+previously a silent no-op comment — now sets this fault whenever `strict` (one of the eight write commands)
+and `!takes_positional`. Verified against the built binary: `post stray-token` → exit 1, `unexpected
+argument 'stray-token'`, log unchanged; `item --blocking true --type note` → exit 1, `unexpected argument
+'true'` (the natural 4C mistake), log unchanged, no `#1` printed; `post --bogus` still refuses as
+`unknown flag '--bogus'` — unregressed.
+
+**B2.** `log.zig`'s `headerUnchanged` now calls `sameRoleSet` (mutual containment over `containsString`)
+instead of `stringSlicesEqual`, so `roles`/`closers` compare as sets — order-independent, and correct even
+against a pre-fix latest header that happens to hold a duplicate. `stringSlicesEqual` removed, superseded.
+`runHeader` (`main.zig`) gains a `findDuplicate` helper and refuses a repeated `--role` or `--closer`,
+naming the value, before the existing closer-⊆-role check — refused, not deduplicated, and before any
+filesystem access. Verified: reordered roles (`architect,worker` then `worker,architect`) → second call
+`unchanged`, log stays 1 line; repeated `--role architect` → exit 1, `--role 'architect' given more than
+once`, no file created; repeated `--closer` → same shape.
+
+**Tests added:** `log.zig` — `"appendHeader is a no-op when the same roles are re-declared in a different
+order"` (byte-identical log via `readAllLog` before/after). `main.zig` — six new tests: stray token after
+`post`, stray token after `item`, `--blocking true` specifically, `post --bogus` regression pin, repeated
+`--role`, repeated `--closer` (each asserting exit code, message substring, and that no file/no new record
+landed).
+
+**Gates:** `BUILD_EXIT:0` `TEST_EXIT:0` `FORMAT_EXIT:0` (after `make fmt`) `VALIDATE_EXIT:0`
+`GATES_EXIT:0`. Test count: **157** named `test "…"` blocks (`grep -rc '^test "' src/*.zig`); `zig build
+test --summary all` reports **158/158** — the +1 is `main.zig`'s own anonymous `test { _ = record; _ = log;
+_ = body; }` root block, which the runner counts as a test in its own right.
+
+→ @reviewer
+
+**[reviewer]** **Section 4 remediation (B1, B2) — Approve.**
+
+Audited `git diff c95ebfd -- src/` (only `src/log.zig` and `src/main.zig` touched; `tasks.md` and the
+`Makefile` both untouched, confirmed by `git status`). Gates re-run myself, not trusted from the report:
+
+```
+BUILD_EXIT:0
+TEST_EXIT:0
+FORMAT_EXIT:0
+VALIDATE_EXIT:0
+GATES_EXIT:0
+```
+
+`grep -rc '^test "' src/*.zig` → `body.zig` 12, `log.zig` 31, `record.zig` 22, `main.zig` 92 = **157**
+named. `zig build test --summary all` → **158/158** passed (the +1 is `main.zig`'s own anonymous
+import-aggregator test, same as every prior block). Both numbers match the worker's report exactly, and
+150 → 157 accounts precisely for the 7 tests the diff adds (1 in `log.zig`, 6 in `main.zig`).
+
+**B1 — verified as a command-scoped refusal through the existing structure, not a new one beside it.**
+Traced the full `parseArgs` else-if chain (`src/main.zig:562-622`) by hand rather than trusting the
+report:
+
+- `takes_positional` (`CommandSpec`, `src/main.zig:31-101`) is `false` on all thirteen existing commands
+  and `true` only on `search`'s spec entry (`:249`) — a property looked up structurally via
+  `findCommand(command_hint)` (`:544-547`), not a `std.mem.eql(u8, name, "search")` anywhere in the new
+  code. `search` isn't even in `strict` yet, so the field is inert until 7.2 wires it up — exactly as
+  the worker states.
+- The new branch (`:610-616`) is reached only when `p.command != null` — the command-word-assignment
+  branch (`:606-607`, `p.command == null`) is strictly earlier in the chain and mutually exclusive with
+  it, so the command word itself can never trip the new fault. Confirmed by the `post`/`item` positive
+  paths in every new test: the command name always lands successfully before the stray token is seen.
+- Flag values never reach the loop as independent tokens — `takeFlagValue` (called from the `--role`,
+  `--log`, etc. branches) advances `i` past the value inside the same iteration, so `--role architect`
+  never presents `architect` to the else-if chain at all. `--blocking` is the one bare boolean with
+  nothing to consume, which is exactly why `--blocking true` is the case that used to slip through and
+  is now the case the remediation pins by name (`src/main.zig:302-344`).
+- The fault is set via `p.setFault(.{ .unexpected_argument = arg })` (`:616`) — the same
+  first-fault-wins `Parsed.setFault` (`:443-445`) every other `ParseFault` variant uses, reported through
+  the same `reportFault` switch (`:627-636`), no second call site. `run()`'s ordering
+  (`if (p.fault) |f| return reportFault(...)` at `:1197`, ahead of the `--version`/`--help` checks at
+  `:1202-1216`) is untouched by this diff — confirmed by reading the surrounding lines, not the diff
+  alone, since the precedence rule lives in code the diff doesn't touch. A stray positional now correctly
+  participates in "parse faults beat `--help`/`--version`" rather than sitting outside it, which is the
+  ruling extended to a new fault kind, not disturbed.
+- `post --bogus` unknown-flag regression is pinned by name in the new suite and gates confirm it still
+  exits 1 with `unknown flag '--bogus'`.
+
+No over-broad refusal found: the new branch requires `strict` (so `show`/`list`/`refs`/`status`/`resume`
+— none built yet — are unaffected, exactly as before), and requires `!takes_positional`, so nothing
+currently reachable that should keep working was touched.
+
+**B2 — `sameRoleSet` is genuine set equality, not the "every element of A is in B" trap the brief warned
+about.** `src/log.zig:379-388`: mutual containment, `a ⊆ b` and `b ⊆ a` via `containsString`, no length
+comparison. Traced why that's correct rather than assuming it: this function answers a *set-equality*
+question (order and repetition carry no meaning), not a *bag-equality* question, so a length check would
+be wrong here, not merely unnecessary — `sameRoleSet(["architect","architect"], ["architect"])` correctly
+returns `true` (same set, redundant declaration), and `sameRoleSet(["architect"], ["architect","worker"])`
+correctly returns `false` (asymmetric containment fails on `worker`). This is exactly the property the doc
+comment claims — "correct even against a pre-fix latest header that happens to hold a duplicate" — and I
+confirmed it holds by construction, not just by the one new test.
+
+`runHeader` (`src/main.zig:760-765`) refuses a repeated `--role`/`--closer` value via the new
+`findDuplicate` (`:300-308`, itself unremarkable — first earlier-occurring match, no allocation) before
+the closer-⊆-role check and *before* `log.appendHeader` is ever called (`:781`) — the only filesystem
+effect in this function. A3 holds: both new refusal branches return before any I/O.
+
+`stringSlicesEqual` has no remaining callers (`grep -rn` across `src/` returns nothing) — fully dead,
+fully removed, not orphaned.
+
+**No test was weakened.** The diff's only removed lines (`git diff c95ebfd -- src/ | grep '^-'`) are
+`stringSlicesEqual`'s body, the old `search` command-line entry it replaced, and a superseded comment —
+zero test assertions removed or loosened. The pre-existing `unchanged`/`appended`-on-tool-version/
+`appended`-on-role-diff tests (`src/log.zig:763-848`) all use either identical declarations or genuinely
+differing role sets (never mere reordering or duplication), so set-wise comparison changes nothing about
+what they assert; all three still pass, confirmed by the gate run above.
+
+**Also checked:**
+- No `catch unreachable`, `catch {}`, `@intCast`, or `anyerror` introduced anywhere in the diff.
+- No allocation in `sameRoleSet` or `findDuplicate` — plain loops over borrowed slices, nothing to leak.
+- `specs/append-only-log/spec.md`'s "the declaration SHALL be a set" text, its two new scenarios
+  (re-declaration in a different order → nothing appended; a role named twice → refused), and `design.md`
+  D13's amendment all match the shipped behaviour line for line — reordering is `unchanged`, duplication
+  is refused, not silently deduplicated.
+- `specs/work-items/spec.md`'s B3 additions (closing a never-raised item, closing an already-closed item,
+  `closers ⊆ roles`) are documentation-only against pre-existing 4C code, outside this diff's `src/`
+  changes — read them against `checkItemExists` and the closer check and found them consistent, but they
+  are not this block's work to verify further.
+
+No blockers, no nits. This is a clean remediation: narrow, exactly the two findings briefed, no scope
+creep into the architectural notes the brief explicitly parked in `## NEXT`.
+
+→ @architect
+
 ## NEXT
 
 **[architect]** **Section 3 is CLOSED** — supervisor `Approve` on the second pass, after one remediation

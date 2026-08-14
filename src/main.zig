@@ -27,6 +27,14 @@ const CommandSpec = struct {
     summary: []const u8,
     section: []const u8,
     usage: ?[]const u8 = null,
+    /// Whether the command recognises a bare positional argument after its
+    /// name (section 4 supervisor finding B1). Every command this change
+    /// builds is `false` — a stray token is a refused parse fault, not a
+    /// silently dropped one — except `search` (7.2), which takes its query
+    /// this way. A property on the spec rather than a name check against
+    /// `"search"`, so the exemption is structural and does not have to be
+    /// remembered when a future command adds one too.
+    takes_positional: bool = false,
 };
 
 const header_usage =
@@ -232,7 +240,7 @@ const commands = [_]CommandSpec{
     .{ .name = "list", .summary = "List records, filtered by section, block, role, kind, state, or addressee.", .section = "6" },
     .{ .name = "refs", .summary = "Show every record carrying a given external reference.", .section = "6" },
     .{ .name = "status", .summary = "Show the rendered current state: NEXT plus open items.", .section = "6" },
-    .{ .name = "search", .summary = "Search record bodies, ranked by relevance.", .section = "7" },
+    .{ .name = "search", .summary = "Search record bodies, ranked by relevance.", .section = "7", .takes_positional = true },
 };
 
 /// The one place that owns the `devlog: ` prefix, the trailing newline,
@@ -287,6 +295,16 @@ fn containsStr(haystack: []const []const u8, needle: []const u8) bool {
         if (std.mem.eql(u8, s, needle)) return true;
     }
     return false;
+}
+
+/// The first value in `items` that also appears earlier in `items`, or
+/// `null` if every value is distinct (D13, section 4 supervisor finding
+/// B2). `runHeader` refuses rather than deduplicates — this only detects.
+fn findDuplicate(items: []const []const u8) ?[]const u8 {
+    for (items, 0..) |item, i| {
+        if (containsStr(items[0..i], item)) return item;
+    }
+    return null;
 }
 
 fn startsWithDash(s: []const u8) bool {
@@ -356,6 +374,7 @@ const ParseFault = union(enum) {
     empty_value_for: []const u8,
     repeated_flag: []const u8,
     malformed_ref: []const u8,
+    unexpected_argument: []const u8,
 };
 
 /// Result of phase 2's real scan over argv (ADR-0002: no third-party
@@ -518,6 +537,14 @@ fn parseArgs(allocator: Allocator, args: []const [:0]const u8) Allocator.Error!P
     const wants_verdict = command_hint != null and std.mem.eql(u8, command_hint.?, "verdict");
     const strict = wants_header or wants_post or wants_section_cmd or wants_brief or wants_next or
         wants_item or wants_close or wants_verdict;
+    // Whether the hinted command recognises a bare positional argument at
+    // all (B1: `CommandSpec.takes_positional`). Looked up structurally,
+    // not by name, so a future command that takes one only has to set the
+    // property — never touch this dispatcher.
+    const takes_positional = if (command_hint) |c|
+        if (findCommand(c)) |spec| spec.takes_positional else false
+    else
+        false;
 
     // Which commands recognise each shared optional flag — `section`'s
     // own `--section` (the tasks.md section it opens) and `post`'s/
@@ -580,11 +607,18 @@ fn parseArgs(allocator: Allocator, args: []const [:0]const u8) Allocator.Error!P
             p.command = arg;
         } else if (startsWithDash(arg) and (strict or p.command == null)) {
             p.setFault(.{ .unknown_flag = arg });
+        } else if (p.command != null and !startsWithDash(arg) and strict and !takes_positional) {
+            // A bare token after the command, for a command that does not
+            // take one (B1): silent success here is the one outcome this
+            // tool must never produce, so it is a parse fault through the
+            // same first-fault-wins structure as every other one (A6),
+            // not a branch that does nothing.
+            p.setFault(.{ .unexpected_argument = arg });
         }
-        // else: a bare token after the command (never reassigned — the
-        // first one found is final), or a flag belonging to a command
-        // this block does not build, left untouched for that command's
-        // own section to validate once it exists.
+        // else: a bare token after the command on a command that takes
+        // one (`search`, once 7.2 builds it) or a flag belonging to a
+        // command this block does not build, left untouched for that
+        // command's own section to validate once it exists.
     }
 
     return p;
@@ -597,6 +631,7 @@ fn reportFault(stderr: *Io.Writer, fault: ParseFault) u8 {
         .empty_value_for => |flag| fail(stderr, "{s} requires a non-empty value", .{flag}),
         .repeated_flag => |flag| fail(stderr, "{s} given more than once — see --help", .{flag}),
         .malformed_ref => |val| fail(stderr, "--ref '{s}' is malformed — expected ns:id, both sides non-empty", .{val}),
+        .unexpected_argument => |arg| fail(stderr, "unexpected argument '{s}' — see --help", .{arg}),
     };
 }
 
@@ -717,6 +752,17 @@ fn runHeader(
     const change = p.change orelse return fail(stderr, "'header' requires --change <name>", .{});
     if (p.roles.items.len == 0) return fail(stderr, "'header' requires at least one --role <r>", .{});
     if (p.closers.items.len == 0) return fail(stderr, "'header' requires at least one --closer <r>", .{});
+
+    // The declaration is a set (D13, section 4 supervisor finding B2): a
+    // repeated value is refused rather than silently deduplicated, because
+    // this tool stores what it is given or refuses it — never a
+    // transformation of the caller's input.
+    if (findDuplicate(p.roles.items)) |dup| {
+        return fail(stderr, "--role '{s}' given more than once", .{dup});
+    }
+    if (findDuplicate(p.closers.items)) |dup| {
+        return fail(stderr, "--closer '{s}' given more than once", .{dup});
+    }
 
     for (p.closers.items) |closer| {
         if (!containsStr(p.roles.items, closer)) {
@@ -3526,4 +3572,215 @@ test "verdict from an undeclared role is refused, and the log is byte-for-byte u
     const after = try log.readAllLog(std.testing.allocator, tmp.dir, std.testing.io);
     defer std.testing.allocator.free(after);
     try std.testing.expectEqualStrings(before, after);
+}
+
+// --- Remediation, section 4 (supervisor findings B1, B2) ------------------
+// B1: a bare positional token after a write command's name is now a parse
+// fault, not a silently dropped token. B2: `devlog header`'s declaration is
+// a set — reordering is not a change (log.zig), and a repeated --role/
+// --closer value is refused rather than deduplicated (here).
+
+test "a stray positional token after post is refused, and the log is unchanged (B1)" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    var diag: record.Diagnostics = .init(std.testing.allocator);
+    defer diag.deinit();
+    _ = try log.appendHeader(
+        std.testing.allocator,
+        std.testing.io,
+        tmp.dir,
+        "DEVLOG.jsonl",
+        "t0",
+        "devlog 0.1.0",
+        .{ .change = "x", .roles = &.{"architect"}, .closers = &.{"architect"} },
+        &diag,
+    );
+    const before = try log.readAllLog(std.testing.allocator, tmp.dir, std.testing.io);
+    defer std.testing.allocator.free(before);
+
+    var stdin_file = try openStdinStandin(tmp.dir, std.testing.io, "hi");
+    defer stdin_file.close(std.testing.io);
+    var out: Io.Writer.Allocating = .init(std.testing.allocator);
+    defer out.deinit();
+    var err_out: Io.Writer.Allocating = .init(std.testing.allocator);
+    defer err_out.deinit();
+
+    const code = run(
+        std.testing.allocator,
+        std.testing.io,
+        tmp.dir,
+        stdin_file,
+        test_ts,
+        &.{ "--log", "DEVLOG.jsonl", "--role", "architect", "post", "stray-token" },
+        &out.writer,
+        &err_out.writer,
+    );
+    try std.testing.expectEqual(@as(u8, 1), code);
+    try std.testing.expect(std.mem.indexOf(u8, err_out.written(), "unexpected argument 'stray-token'") != null);
+
+    const after = try log.readAllLog(std.testing.allocator, tmp.dir, std.testing.io);
+    defer std.testing.allocator.free(after);
+    try std.testing.expectEqualStrings(before, after);
+}
+
+test "a stray positional token after item is refused, and the log is unchanged (B1)" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    var diag: record.Diagnostics = .init(std.testing.allocator);
+    defer diag.deinit();
+    _ = try log.appendHeader(
+        std.testing.allocator,
+        std.testing.io,
+        tmp.dir,
+        "DEVLOG.jsonl",
+        "t0",
+        "devlog 0.1.0",
+        .{ .change = "x", .roles = &.{"architect"}, .closers = &.{"architect"} },
+        &diag,
+    );
+    const before = try log.readAllLog(std.testing.allocator, tmp.dir, std.testing.io);
+    defer std.testing.allocator.free(before);
+
+    var stdin_file = try openStdinStandin(tmp.dir, std.testing.io, "hi");
+    defer stdin_file.close(std.testing.io);
+    var out: Io.Writer.Allocating = .init(std.testing.allocator);
+    defer out.deinit();
+    var err_out: Io.Writer.Allocating = .init(std.testing.allocator);
+    defer err_out.deinit();
+
+    const code = run(
+        std.testing.allocator,
+        std.testing.io,
+        tmp.dir,
+        stdin_file,
+        test_ts,
+        &.{ "--log", "DEVLOG.jsonl", "--role", "architect", "item", "stray-token", "--type", "note" },
+        &out.writer,
+        &err_out.writer,
+    );
+    try std.testing.expectEqual(@as(u8, 1), code);
+    try std.testing.expect(std.mem.indexOf(u8, err_out.written(), "unexpected argument 'stray-token'") != null);
+
+    const after = try log.readAllLog(std.testing.allocator, tmp.dir, std.testing.io);
+    defer std.testing.allocator.free(after);
+    try std.testing.expectEqualStrings(before, after);
+}
+
+test "--blocking true is refused: --blocking is a bare flag, 'true' is a stray argument (B1)" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    var diag: record.Diagnostics = .init(std.testing.allocator);
+    defer diag.deinit();
+    _ = try log.appendHeader(
+        std.testing.allocator,
+        std.testing.io,
+        tmp.dir,
+        "DEVLOG.jsonl",
+        "t0",
+        "devlog 0.1.0",
+        .{ .change = "x", .roles = &.{"architect"}, .closers = &.{"architect"} },
+        &diag,
+    );
+    const before = try log.readAllLog(std.testing.allocator, tmp.dir, std.testing.io);
+    defer std.testing.allocator.free(before);
+
+    var stdin_file = try openStdinStandin(tmp.dir, std.testing.io, "hi");
+    defer stdin_file.close(std.testing.io);
+    var out: Io.Writer.Allocating = .init(std.testing.allocator);
+    defer out.deinit();
+    var err_out: Io.Writer.Allocating = .init(std.testing.allocator);
+    defer err_out.deinit();
+
+    const code = run(
+        std.testing.allocator,
+        std.testing.io,
+        tmp.dir,
+        stdin_file,
+        test_ts,
+        &.{ "--log", "DEVLOG.jsonl", "--role", "architect", "item", "--blocking", "true", "--type", "note" },
+        &out.writer,
+        &err_out.writer,
+    );
+    try std.testing.expectEqual(@as(u8, 1), code);
+    try std.testing.expect(std.mem.indexOf(u8, err_out.written(), "unexpected argument 'true'") != null);
+
+    const after = try log.readAllLog(std.testing.allocator, tmp.dir, std.testing.io);
+    defer std.testing.allocator.free(after);
+    try std.testing.expectEqualStrings(before, after);
+}
+
+test "post --bogus is still refused as an unknown flag — must not regress under B1 (reviewer pin)" {
+    try expectRun(
+        std.testing.allocator,
+        &.{ "--log", "DEVLOG.jsonl", "--role", "architect", "post", "--bogus" },
+        1,
+        null,
+        "unknown flag '--bogus'",
+    );
+}
+
+test "header refuses a repeated --role value, naming it, and the log is unchanged (B2)" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    var stdin_file = try openStdinStandin(tmp.dir, std.testing.io, "");
+    defer stdin_file.close(std.testing.io);
+    var out: Io.Writer.Allocating = .init(std.testing.allocator);
+    defer out.deinit();
+    var err_out: Io.Writer.Allocating = .init(std.testing.allocator);
+    defer err_out.deinit();
+
+    const code = run(
+        std.testing.allocator,
+        std.testing.io,
+        tmp.dir,
+        stdin_file,
+        test_ts,
+        &.{
+            "--log",     "DEVLOG.jsonl", "header",    "--change", "x",
+            "--role",    "architect",    "--role",    "worker",   "--role",
+            "architect", "--closer",     "architect",
+        },
+        &out.writer,
+        &err_out.writer,
+    );
+    try std.testing.expectEqual(@as(u8, 1), code);
+    try std.testing.expect(std.mem.indexOf(u8, err_out.written(), "--role 'architect' given more than once") != null);
+
+    // The log must not even have been created.
+    try std.testing.expectError(error.FileNotFound, tmp.dir.openFile(std.testing.io, "DEVLOG.jsonl", .{}));
+}
+
+test "header refuses a repeated --closer value, naming it, and the log is unchanged (B2)" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    var stdin_file = try openStdinStandin(tmp.dir, std.testing.io, "");
+    defer stdin_file.close(std.testing.io);
+    var out: Io.Writer.Allocating = .init(std.testing.allocator);
+    defer out.deinit();
+    var err_out: Io.Writer.Allocating = .init(std.testing.allocator);
+    defer err_out.deinit();
+
+    const code = run(
+        std.testing.allocator,
+        std.testing.io,
+        tmp.dir,
+        stdin_file,
+        test_ts,
+        &.{
+            "--log",     "DEVLOG.jsonl", "header",    "--change", "x",
+            "--role",    "architect",    "--role",    "worker",   "--closer",
+            "architect", "--closer",     "architect",
+        },
+        &out.writer,
+        &err_out.writer,
+    );
+    try std.testing.expectEqual(@as(u8, 1), code);
+    try std.testing.expect(std.mem.indexOf(u8, err_out.written(), "--closer 'architect' given more than once") != null);
+
+    try std.testing.expectError(error.FileNotFound, tmp.dir.openFile(std.testing.io, "DEVLOG.jsonl", .{}));
 }

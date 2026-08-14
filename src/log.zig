@@ -374,18 +374,26 @@ fn replaceWith(
     try atomicReplace(io, dir, sub_path, full, permissions);
 }
 
-fn stringSlicesEqual(a: []const []const u8, b: []const []const u8) bool {
-    if (a.len != b.len) return false;
-    for (a, b) |x, y| {
-        if (!std.mem.eql(u8, x, y)) return false;
+/// Set equality by mutual containment (D13, section 4 supervisor finding
+/// B2): every element of `a` is present in `b` and vice versa. Order
+/// carries no meaning, and neither does a repeated element — mutual
+/// containment establishes set equality regardless of how many times a
+/// value appears on either side, so this stays correct even against a
+/// latest header written before `runHeader` started refusing duplicates.
+fn sameRoleSet(a: []const []const u8, b: []const []const u8) bool {
+    for (a) |x| {
+        if (!containsString(b, x)) return false;
+    }
+    for (b) |y| {
+        if (!containsString(a, y)) return false;
     }
     return true;
 }
 
 fn headerUnchanged(latest: record.HeaderRecord, tool: []const u8, decl: HeaderDeclaration) bool {
     return std.mem.eql(u8, latest.tool, tool) and
-        stringSlicesEqual(latest.roles, decl.roles) and
-        stringSlicesEqual(latest.closers, decl.closers);
+        sameRoleSet(latest.roles, decl.roles) and
+        sameRoleSet(latest.closers, decl.closers);
 }
 
 fn latestHeader(records: []const record.Record) ?record.HeaderRecord {
@@ -837,6 +845,47 @@ test "appendHeader re-appends when the declared roles differ from the latest hea
     defer log.deinit();
     try testing.expectEqual(@as(usize, 2), log.records.len);
     try testing.expectEqual(@as(usize, 2), log.records[1].header.roles.len);
+}
+
+test "appendHeader is a no-op when the same roles are re-declared in a different order" {
+    const allocator = testing.allocator;
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    var diag: record.Diagnostics = .init(allocator);
+    defer diag.deinit();
+
+    const first = try appendHeader(
+        allocator,
+        testing.io,
+        tmp.dir,
+        "DEVLOG.jsonl",
+        "t1",
+        "devlog 0.1.0",
+        .{ .change = "x", .roles = &.{ "architect", "worker", "reviewer" }, .closers = &.{ "architect", "worker" } },
+        &diag,
+    );
+    try testing.expectEqual(HeaderOutcome.created, first.outcome);
+
+    const before = try readAllLog(allocator, tmp.dir, testing.io);
+    defer allocator.free(before);
+
+    const second = try appendHeader(
+        allocator,
+        testing.io,
+        tmp.dir,
+        "DEVLOG.jsonl",
+        "t2",
+        "devlog 0.1.0",
+        .{ .change = "x", .roles = &.{ "reviewer", "architect", "worker" }, .closers = &.{ "worker", "architect" } },
+        &diag,
+    );
+    try testing.expectEqual(HeaderOutcome.unchanged, second.outcome);
+    try testing.expectEqual(@as(?u64, null), second.seq);
+
+    const after = try readAllLog(allocator, tmp.dir, testing.io);
+    defer allocator.free(after);
+    try testing.expectEqualStrings(before, after);
 }
 
 test "the latest header is what governs re-append, not the first" {
