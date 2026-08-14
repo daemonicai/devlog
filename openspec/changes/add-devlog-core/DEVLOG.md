@@ -5392,6 +5392,86 @@ invariant, established at the write boundary, and worth relying on rather than r
 records this tool wrote. It does **not** hold for a hand-written log, which is out of scope for this
 change and worth exactly one sentence in `8.4`.
 
+---
+
+**[architect]** **Brief — block 4C (`4.4`, `4.5`, `4.6`, `4.9`) → @worker.** The last block of section 4:
+`devlog item`, `devlog close`, `devlog verdict`, and the enum validation that closes `4.9`. Blocks 4A and
+4B built and then proved the write spine; this block is the one with actual new logic in it, and one
+genuinely new mechanism.
+
+**Read first:** the whole `## 4. Write commands` section — decisions **A1–A6** (binding here identically),
+both prior blocks' briefs, audits and landing notes, and the Product Owner's `--to` decision at the end.
+Then `design.md` D6, D7, D9 and the `## Record schema` per-kind table; `specs/work-items/spec.md` **in
+full** — it is the spec this block actually answers to, and it has four requirements, not one.
+
+**`4.4` — `devlog item --type <t> [--section <s>] [--block <b>] [--to <r>] [--blocking]`.** Raises a work
+item. `--type` is required, one of `question`, `finding`, `decision`, `note`, `task`. `--to` is
+**optional** — `work-items` has a scenario for a note that blocks nothing and needs no addressee, so do
+not make it required by symmetry with `brief`. `--blocking` is a boolean flag, absent meaning false, and
+**independent of `--type`**: the spec says so explicitly, so any type may block. Body required. Prints the
+assigned identifier as `#<n>` and nothing else on stdout, so a shell can capture it.
+
+**This block's one new mechanism, and the thing to get right: the item number is assigned under the
+lock, exactly as `seq` is.** D9 makes the *n*th `item` record `#n`. That number is a function of the log's
+contents, so computing it anywhere but inside the lock is the same race `seq` would have — two concurrent
+`devlog item` calls would both read "there are 4 items" and both claim `#5`. `appendRecord` already stamps
+`seq` under the lock via `withSeq`; the item number belongs in the same place, by the same argument.
+`5.2` will later assert the stored number matches the positionally-derived one — that assertion should be
+provably redundant, not a safety net. Do not compute it in `main.zig`.
+
+**`4.5` — `devlog close --item <n> --state <s>`.** Closes a work item. `--state` is required, one of
+`resolved`, `deferred`, `superseded`. **The body is the mandatory reason** — `work-items` has a scenario
+for exactly this, and `readBody` already refuses an empty body, so what this needs is the test that pins
+it, not new machinery. Takes `--ref` and nothing else: no `--section`, no `--block`, no `--to`, matching
+the schema example. The closer guardrail is **already built** — 4A put `role ∈ closers when rec == .close`
+into `checkRoleAllowed` under the lock, so wire it and test it rather than reimplementing it. Its message
+must name the guardrail, per `4.5`'s own wording.
+
+**Two rulings on `close`, so you neither over- nor under-build it:**
+
+- **Refuse a close naming an item number that does not exist.** The parsed log is right there under the
+  lock, so this costs one bounds check. It is the same failure class as the addressee the Product Owner
+  just confirmed: a typo'd `--item 7` writes a close record that closes nothing, the real item stays open
+  forever, and nothing anywhere reports a fault. Message should say how many items exist.
+- **Allow closing an already-closed item.** Do *not* add a refusal for this. `append-only-log` says a
+  correction is expressed by appending a new record referring to the earlier one — refusing a second close
+  would make "closed as `deferred`, later `resolved`" unrepresentable, which is a real sequence this very
+  DEVLOG performs. Which close wins is a **derivation** question and it belongs to `5.1`, not to the write
+  boundary. Leave it alone deliberately, and say in your post that you did.
+
+**`4.6` — `devlog verdict --section <s> --block <b> --outcome <o> --commit <sha>`.** All four required.
+`--outcome` is one of `approve`, `approve-with-nits`, `request-changes` — all three occur in this DEVLOG,
+which is where D7's list came from. `--commit` is stored **unvalidated**, same posture as `4.1`'s
+`--base`: the tool does not run `git`. Body required. The per-block status grid folds these by section and
+block (`5.4`), which is why both are required here rather than optional.
+
+**`4.9` — reject writes that omit the author role, and validate enum values against their permitted
+sets.** The first half has been true since 4A, as a consequence of `4.11`. The second half is this block's:
+`--type`, `--state`, `--outcome`. **The message must name the permitted set**, exactly as the undeclared-
+role message names the declared roles — an agent that mistypes `--outcome aprove` needs to be told what
+the three legal values are, not merely that it was wrong. Validate at parse time, **before** the body is
+read, per **A3**. `4.9` ticks with this block because this is where it becomes wholly true.
+
+**Binding on all three commands:**
+
+- **`--ref` on every one of them** (`4.8`). That box was ticked in 4A on `post` alone and my landing note
+  flagged it as the one tick in this section whose truth can decay. These are the last three commands the
+  section adds. **If any of them omits `--ref`, a ticked box becomes false** — treat that as a blocker on
+  yourself, not a nit.
+- **A3's ordering:** parse → validate flags and enums → read body → *then* touch the filesystem. Each
+  command gets the test that a refused write leaves the log byte-for-byte unchanged and leaves no file
+  behind against a missing log. 4B's nit pass established that we mean this per command, literally.
+- **A1's role and addressee checks apply unchanged**, under the lock.
+- Each command gets its own `--help`, in the shape 4A established.
+
+**Done-gates:** `make gates` → `GATES_EXIT:0`, exit lines quoted verbatim; test count both ways (named
+`test "…"` blocks and what `--summary all` runs). `make fmt` rewrites if `FORMAT_EXIT` is red — you do not
+need `zig fmt` directly.
+
+**Scope:** this completes section 4 except `3.2`, which is the Product Owner's and is not yours to tick or
+claim. Do not tick anything, do not commit, do not touch `tasks.md`, the `Makefile`, or `CLAUDE.md`. Post
+to the DEVLOG as you go; `→ @reviewer` when green.
+
 ## NEXT
 
 **[architect]** **Section 3 is CLOSED** — supervisor `Approve` on the second pass, after one remediation
