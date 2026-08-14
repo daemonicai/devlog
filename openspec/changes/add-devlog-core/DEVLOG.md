@@ -3714,6 +3714,187 @@ were never yours; now they are also not possible.
 **Done-gates:** `make gates` → `GATES_EXIT:0`, quoting each `LABEL_EXIT:<n>`. Post to this thread as you
 go, then hand off `→ @reviewer`.
 
+---
+
+**[worker]** **Block `3.1–3.4` implemented.** New module `src/body.zig`, referenced from `src/main.zig`'s
+test block the same way `record`/`log` already are — no dispatcher wiring, no new subcommand, as scoped.
+
+- **3.1** `readBody(allocator, io, stdin: Io.File) ![]u8` reads to EOF via
+  `Io.File.Reader.init` + `.interface.allocRemaining(allocator, .unlimited)` — `.unlimited`, not a size
+  cap, so nothing is silently truncated. No trim, no CRLF translation, no BOM strip, no UTF-8 check;
+  said so in the module doc comment for the next reader.
+- **3.2** Checked 0.16's actual API rather than assuming: `Io.File.isTty(file, io) Io.Cancelable!bool`.
+  Called *before* touching the reader at all, so a terminal never gets so much as one blocking read.
+  `writeRefusalMessage` prints `devlog: refusing to read a body from a terminal — redirect it from a
+  file instead, e.g. \`devlog post ... < body.md\`` — names the fix, not just the failure.
+- **3.3** `isBlank` (byte-level `std.ascii.isWhitespace`, not a Unicode notion of blank) decides the
+  refusal only; the returned bytes are always the untrimmed originals — confirmed by a test that a body
+  which is *mostly* whitespace plus one real character is returned unchanged, not trimmed down to it.
+  Went with the architect's call as given; no objection.
+- **3.4** Coverage per the brief, all byte-for-byte (`expectEqualStrings`, not just "parses"): a fenced
+  block containing backticks of its own, a Markdown table, `--role architect`-shaped text, a `## 3.`
+  heading-shaped line, apparent JSON, CRLF line endings, trailing newline present and absent. One test
+  round-trips `readBody`'s own return value; a second carries the same eight bodies through the *full*
+  path — `readBody` → `record.Record.post` → `log.appendRecord` (real locked/atomic file) →
+  `record.parseLog` — and asserts every body survives that whole trip unchanged, not just `readBody` in
+  isolation.
+
+**On `3.2`'s test — stating the gap plainly, as asked.** Every test opens a real (non-terminal) file and
+points `readBody` at it in place of `Io.File.stdin()`; that proves the *branch order* (the `isTty` check
+runs before any read is attempted, so an empty/whitespace file is never reached by the terminal check)
+and that a non-terminal source reads correctly to EOF. **It does not and cannot prove `isTty` returns
+`true` against a real terminal** — a test harness only ever hands the process a pipe. I did not build a
+TTY-allocating harness to close that, per the brief. No command calls `readBody` yet (out of this
+block's scope — section 4 wires the first one), so there is no invocation to hand the Product Owner
+today that would actually reach this code path; once a command does call it, the recipe is: run that
+command with stdin attached to a real terminal and nothing typed — it should print the terminal-refusal
+message and exit `1` immediately, never hang waiting for input.
+
+**Gates:** `BUILD_EXIT:0 TEST_EXIT:0 FORMAT_EXIT:0 VALIDATE_EXIT:0 GATES_EXIT:0`. 9 new tests in
+`src/body.zig`, all green; no existing test touched or weakened.
+
+No `BLOCKED by the OpenSpec Apply Workflow` hit during this block.
+
+→ @reviewer
+
+---
+
+**[reviewer]** **Block `3.1–3.4` — Approve.**
+
+Read `src/body.zig` in full (new, 325 lines), the `src/main.zig` diff (test-discovery import only, no
+dispatch wiring — confirmed by `grep -n "body\." src/main.zig`, one hit: the import), and this thread's
+brief. Confirmed no other files touched: `git diff HEAD --stat` shows only `DEVLOG.md` and `src/main.zig`;
+`build.zig`, `build.zig.zon`, and the `Makefile` are untouched.
+
+**Gates — reran independently, not taken on report:**
+```
+BUILD_EXIT:0
+TEST_EXIT:0
+FORMAT_EXIT:0
+Change 'add-devlog-core' is valid
+VALIDATE_EXIT:0
+GATES_EXIT:0
+```
+`zig build test --summary all` separately: `72/72 tests passed` (9 new in `body.zig`, confirmed by
+`grep -c '^test "' src/body.zig`). Matches the worker's report exactly.
+
+**On the two flagged items:**
+
+1. **`error.StreamTooLong => unreachable` (`src/body.zig:74`) — correct, verified against Zig 0.16's
+   actual source, not the worker's stated reasoning.** Read `lib/std/Io.zig` and `lib/std/Io/Reader.zig`
+   from the pinned 0.16.0 toolchain directly. The real mechanism is stronger than "reaching `maxInt(usize)`
+   bytes is impossible in practice": `Io.Limit.subtract` (`Io.zig:697-701`) special-cases `.unlimited` —
+   `if (l == .unlimited) return .unlimited;` — so it **never decrements**. In
+   `appendRemainingAligned`'s loop (`Reader.zig:367-387`), `remaining` starts at `.unlimited` and stays
+   `.unlimited` through every iteration; the loop can only exit via the `error.EndOfStream` case (a normal
+   return) or a propagated `ReadFailed`/`OutOfMemory`. The trailing `return error.StreamTooLong;` is
+   dead code specifically when `limit == .unlimited` — not merely astronomically unlikely, but
+   unreachable by the construction of `Limit.subtract` itself. So `readBody`'s `unreachable` is genuinely
+   safe: no input, however large, can drive that branch.
+
+   **The comparison to `log.zig:449`'s `.header => unreachable` holds in effect but not quite in kind.**
+   Both are dead branches confirmed by reading code, not asserted on faith — that part of the comparison
+   is sound. But `log.zig:449` and `record.zig:637` are guarded by **this codebase's own** runtime checks
+   in the same function/call chain (`appendRecord`'s `if (rec == .header) return error...` immediately
+   before `withSeq` is called) — self-contained and re-auditable by reading only this project. `body.zig:74`
+   is guarded by an **external stdlib contract** (`Limit.unlimited`'s subtract semantics) that this
+   codebase asserts nothing about and doesn't re-verify. It's correct today against the pinned Zig 0.16.0
+   (ADR-0001), but it's a fact about the standard library, not about `devlog`, and would need re-checking
+   against source on any future toolchain bump rather than assumed to still hold. Nit, not a blocker: the
+   doc comment (`body.zig:69-73`) states the weaker "impractical" justification rather than the airtight
+   structural one — worth tightening for the next reader, but doesn't change the correctness verdict.
+
+2. **`isBlank`'s byte-level check — matches the architect's ruling exactly, and the non-ASCII case
+   behaves sanely.** Confirmed by reading the full function body: `isBlank` only ever decides between
+   `return error.EmptyBody` and `return bytes` (`body.zig:78, 80`) — there is no code path that returns a
+   trimmed or otherwise modified copy in either branch, and the `errdefer allocator.free(bytes)` at
+   `body.zig:76` covers exactly the refusal path, freeing on `EmptyBody` and not firing on success. The
+   "whitespace plus one real character" test (`body.zig:180-195`) confirms the untrimmed original is what
+   comes back. For U+00A0 (non-breaking space, UTF-8 `0xC2 0xA0`): neither byte matches
+   `std.ascii.isWhitespace`, so a body of only U+00A0 is **accepted**, not refused — the safe direction
+   (erring toward storing content rather than mis-refusing it), and the only direction consistent with the
+   binding "no encoding validation" constraint, since a Unicode-aware blank check would require decoding
+   the body first. Sane, not surprising. One gap: no test in `3.4`'s suite exercises this specific case —
+   the module's own doc comment (`body.zig:83-86`) makes exactly this scope claim, so a test pinning it
+   (a body of only U+00A0 round-trips as non-blank) would guard against a future "helpful" switch to a
+   Unicode-aware check. Nit, not a blocker.
+
+**Correctness / hazards checked, all clean:**
+- **Byte-for-byte, no exceptions** — confirmed by reading: no trim, no CRLF translation, no BOM strip, no
+  UTF-8 validation anywhere on the path. `3.4`'s two tests (`body.zig:197-235` and `:255-325`) assert
+  `expectEqualStrings` against the exact input bytes, not merely successful parsing, both for `readBody`
+  alone and through the full `readBody` → `record.Record.post` → `log.appendRecord` → `record.parseLog`
+  round trip.
+- **`isTty` runs before any read** — `body.zig:62` is the first line of `readBody`, before
+  `Io.File.Reader.init` is even constructed (`:65`). Confirmed from the code path, not inferred from the
+  test.
+- **Nothing can block** — no line-oriented read, no fixed-size cap, no second buffer fill;
+  `allocRemaining(allocator, .unlimited)` reads to EOF via a dynamically-growing allocation. The terminal
+  guard is checked first, so a TTY never reaches even one blocking read. (An intentionally slow, still-open
+  pipe blocking `readBody` until its writer closes is expected `cat`-like behaviour, not the hang D5
+  guards against — D5 targets an unattended interactive terminal, not a legitimate open pipe.)
+- **`3.4` coverage against the brief's list** — fenced code block with backticks inside it, a table,
+  flag-like text (`--role architect`), heading-like text (`## 3. Body input`), apparent JSON, CRLF line
+  endings, trailing newline present, trailing newline absent: all eight present in `body.zig:206-223`
+  (and mirrored in the full-path test). Nothing on the brief's list is missing.
+- **Zig 0.16 API reality** — `Io.File.isTty(file, io) Io.Cancelable!bool` and
+  `Io.Reader.allocRemaining(r, gpa, limit) LimitedAllocError![]u8` both verified directly against the
+  pinned 0.16.0 `lib/std` source, matching the worker's stated signatures.
+- **Allocator hygiene** — `testing.allocator` throughout; every test frees `body` via `defer`; the
+  refusal path (`EmptyBody`) frees via the `errdefer` noted above rather than leaking. No leak surfaced by
+  any test run under `make gates`.
+- **Every failure is an error return, not an exit or a crash** — this module returns `ReadBodyError`,
+  it does not call `std.process.exit` itself; exiting `1` on stderr is left to section 4's dispatcher, which
+  is out of this block's scope by the brief (and confirmed absent from the diff).
+- **MPL 2.0 header present** (`body.zig:1-3`); no new dependency (only `std`, `record.zig`, `log.zig`
+  imported); no version string in this module, so nothing to single-source.
+- **Scope** — no subcommand, no dispatch wiring; `main.zig`'s only change is the test-discovery import,
+  matching `record`/`log`'s existing pattern exactly.
+
+**On `3.2`'s test claim — accurate, no more and no less.** The worker states its tests prove the branch
+*order* (`isTty` runs before any read) and that a non-terminal source reads correctly to EOF, and states
+plainly that no test proves `isTty` returns `true` against a real terminal. Read every test in the file:
+all nine open a real file via `openAsStdin` and none allocates a pty or otherwise fakes a terminal, so the
+claim is exactly right — it doesn't overstate what's covered. Per the brief, not treated as a finding;
+`3.2` stays with the Product Owner for hand-verification once section 4 gives it a caller.
+
+**Nits (non-blocking):**
+- `body.zig:69-73` — tighten the `StreamTooLong => unreachable` comment to the structural reason
+  (`Limit.unlimited.subtract` never decrements, so the loop can't reach the `StreamTooLong` return) rather
+  than the size-based one; also worth a one-line flag that this is a Zig-stdlib contract to re-verify on
+  any future toolchain bump, not a fact intrinsic to this codebase.
+- `body.zig:100-102` — `writeRefusalMessage`'s doc comment says "no trailing newline — the caller adds
+  one, matching every other error message in this tool," but every existing `stderr.print` call in
+  `main.zig` embeds `\n` directly in its own format string (e.g. `main.zig:200, 205, 239`) — there's no
+  existing "helper omits `\n`, caller appends" convention to match today. Not wrong, just not yet true;
+  flagging so section 4 doesn't forget to append `\n` at the call site, since nothing enforces it.
+- Consider adding the U+00A0-only-body case to `3.4`'s suite (see finding 2 above) to pin the documented
+  scope of `isBlank`.
+
+**Architectural note:** none beyond the above — this block doesn't reach into another section, and I
+have no concern with anything visible in an adjacent block from here.
+
+→ @architect
+
+---
+
+**[worker]** **All three nits closed.**
+
+- `body.zig` `StreamTooLong => unreachable` comment now states the structural reason
+  (`Io.Limit.subtract` special-cases `.unlimited` to never decrement, so `appendRemainingAligned`'s loop
+  cannot reach that return) instead of the size-based one, and flags — unlike `log.zig:449`'s
+  runtime-guarded `unreachable` — that this one rests on an external stdlib contract and needs
+  re-verifying on any Zig version bump.
+- `writeRefusalMessage`'s doc comment no longer claims an existing "helper omits `\n`" convention; it
+  now says the message carries no trailing newline and the caller appends one, the way `main.zig`'s own
+  `stderr.print(...)` calls each embed their own `"...\n"` today.
+- Added a test pinning that a body of only U+00A0 (non-breaking space) is **accepted**, not refused —
+  neither UTF-8 byte matches `std.ascii.isWhitespace`, which is deliberate (byte-level, ASCII-only
+  refusal check, per the module's own no-encoding-interpretation constraint), and the test name and
+  comment say so explicitly.
+
+`BUILD_EXIT:0 TEST_EXIT:0 FORMAT_EXIT:0 VALIDATE_EXIT:0 GATES_EXIT:0`. No commits, no ticks.
+
 ## NEXT
 
 **[architect]** **Section 3 is OPEN** at base `5d2e805`, as a single block `3.1–3.4` — the stdin read
