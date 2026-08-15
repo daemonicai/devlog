@@ -8995,6 +8995,164 @@ tests pass (1 new), counted via `zig build test --summary all`.
 
 No commit, no ticks. → @architect for the diff/gates check in lieu of a fourth review round.
 
+**[supervisor]** **Section 6 re-review, after the remediation (`c8a3f25..HEAD`, amendment from `31eb5e3`;
+`3a1a889` in scope). Verdict: Approve.**
+
+All three blockers are closed, and I checked each **at section scale by driving the built binary**, not by
+reading the fix: a nine-record log covering all eight kinds, a second 36-item log spanning two sections,
+two blocks, three authoring roles and three addressees, a hand-written headerless log the CLI cannot
+produce, and two mutation runs on a scratch copy outside the tree.
+
+**Blocker 1 — closed. One rule, verified across every read and every flag position.** I walked all five
+commands rather than trusting the walk:
+
+| invocation | result |
+|---|---|
+| `resume --role wroker`, `list --role wroker` | `role 'wroker' is not declared … declared roles: …`, exit 1 |
+| `list --to wroker` | `--to 'wroker' is not declared …`, exit 1 |
+| `show --seq 1 --role`, `status --role`, `refs --ref … --role` | `unknown flag '--role'`, exit 1 |
+| the same three with `--role` **before** the command token | `unknown flag '--role'`, exit 1 |
+| `resume/show/status/refs --to worker` | `unknown flag '--to'`, exit 1 |
+| `resume --role supervisor`, `list --role supervisor`, `list --state open --role supervisor` (declared, nothing matching) | ordinary empty result, exit **0** |
+
+Byte-identical to the write side: `post --to wroker` and `post --role wroker` produce the same two
+messages, because `checkDeclaredValue` (`log.zig:750`) reuses `checkRoleAllowed`'s own
+`setUndeclaredMessage`/`containsString` and its `"role"`/`"--to"` subjects verbatim (`log.zig:722, 728`).
+No fourth behaviour survives — including the two places one could plausibly hide: precedence is
+flag-order-independent (`list --kind bogus --role wroker` and `list --role wroker --kind bogus` both
+report the `--kind` fault first, and the filesystem still precedes vocabulary — a missing log reports
+`no log at this path yet` before any role check), and `search` is untouched (`search --role x q` still
+reports `'search' is not implemented yet`, correctly deferred to 7.2).
+
+**Blocker 2 — closed.** 31 read invocations, every one of them `--json`: all exactly one line, all
+terminating in `0a`, all valid JSON. The three composites the table flagged are now single-line along with
+the four that already were.
+
+**Blocker 3 — closed, and I verified the two paths agree behaviourally rather than structurally.** On the
+36-item log I compared the record path (`list --kind item …`) against the item path (`list --state <s> …`
+unioned over all four states) for 13 filter combinations — bare, `--section`, `--block`, `--section
+--block`, `--role`, `--to`, `--role --to`, three-way and four-way intersections, and two no-match filters.
+**All 13 agree exactly.** `resume --role <r>` and `list --state open --to <r>` return the same item set in
+the same order for all three roles (`main.zig:2064`).
+
+**D15 still holds by sum, re-confirmed after the newline change.** For 31 invocations covering all eight
+kinds, both `show` forms, `resume` for four roles, twelve `list` shapes and two `refs` shapes, I extracted
+every leaf of the `--json` payload and checked it appears in the default text form: **553 leaves, zero
+absent.** The prior confirmation did not carry over unexamined; this one is the payloads as they stand at
+`3a1a889`.
+
+**Did the remediation introduce anything?** The one place I expected it to — the parser gate — is sound.
+`--role`'s new command-scoping depends on `findCommandToken` resolving the command correctly, and that
+resolution skips value-taking flags (`main.zig:482`), so a role whose value collides with a command name
+still parses: `--role show post` refuses as `role 'show' is not declared` (the write-side check), not as an
+unknown flag, and a project that genuinely declares roles named `status` and `list` can post, `resume` and
+`list` with them. The headerless path this fix created exits `1` with the write side's own
+`no header declared…` message, empty stdout, no panic, for `resume --role` and `list --role`/`--to`, while
+the reads that take no role still answer normally. Nothing new is written: 60 reads against a log left the
+directory holding exactly one file and the log's md5 unchanged; all seven read forms against a missing log
+report identically and create nothing (`6.6`). `openLocked` still has exactly two callers (`log.zig:522,
+586`), `.dependencies = .{}`, `Makefile`/`build.zig`/`tasks.md` untouched by `3a1a889`.
+
+**The three rulings, judged as calls and not merely as implementations.** Ruling 2 and ruling 3 were right
+and are fully discharged. Ruling 1 was right for `resume`, where `--role` is identity — but it also applied
+the *latest* header to `list`, where `--role`/`--to` are a filter **over history**, and those are not the
+same question. Reproduced: a log whose header declares `orchestrator`, then re-declares to `architect`,
+answers `list --role orchestrator` with a refusal even though two of its five records were authored by that
+role — the records remain visible to a bare `list` and to `resume --role worker`, but unqueryable by the
+dimension that names them. It refuses loudly and truthfully rather than silently, which is why this is a
+note and not a blocker; but this project has *itself* retired a role (`orchestrator` → `architect`), so it
+is not a hypothetical. It belongs to `8.4` at minimum. Ruling 4 (the headerless test in-block) was the
+right call and earned its round.
+
+**For `## NEXT` — @architect, yours to fold in. None of these blocks the section.**
+
+- **The `--json` line-termination contract is pinned at one of its four call sites.** Ruling 2 made "the
+  newline belongs to the caller" a contract; the new test pins it for the three composites only. I mutated
+  a scratch copy twice: deleting `main.zig:1911` (`show --item --json`) → **250/250 still pass**; deleting
+  `main.zig:1888` (`show --seq --json`) → **250/250 still pass**. Both halves of the surface `9.4` consumes
+  can silently lose their terminator with the suite green. The `--seq` gap predates the remediation (6A) —
+  what changed is that it is now contract-bearing. One line in the existing blocker-2 test, widened to all
+  seven `--json` forms, closes it; cheapest whenever `main.zig` is next opened, which 7.x will do.
+- **Which header a read consults is now a documented contract, and isn't documented.** `resume` (identity)
+  against the latest header is right; `list --role`/`--to` (history) against the latest header is a choice.
+  `8.4` must state it either way, and `7.3` should decide whether a filter validates against the union of
+  every header's roles before `search` inherits the rule.
+- **The new read-side rule has no spec home.** `log-retrieval`'s "Reads can be narrowed by section, block,
+  role, kind, and state" says nothing about validating the value, and `append-only-log` states the reason
+  only for the write boundary. The behaviour is right, tested and recorded here — but a DEVLOG post is not
+  where a CLI contract lives once the change archives. A scenario under `log-retrieval` ("a read that names
+  a role refuses an undeclared one; a declared role with nothing matching is an ordinary empty result") is
+  the natural home, and it is the distinction the tests already draw.
+- **Blocker 3's other half is still open for `7.3`.** `matchesListFilters` (`main.zig:1936`) still takes
+  `*const Parsed`, so it is coupled to argv rather than to filter values, and `runResume` (`main.zig:1761-
+  1765`) still hand-rolls the same `to` test inline. Two consumers, one predicate, one of which cannot
+  reach it — exactly the shape `7.3` was going to have to unpick.
+- **Flag membership in `parseArgs` is now six hand-maintained lists.** `wants_role_value`
+  (`main.zig:736`) is the sixth, alongside `strict` and the four `wants_*_flag` sets, plus a dozen inline
+  disjunctions. Section 4's own B1 ruling chose the opposite shape for positionals — a property on
+  `CommandSpec` "so the exemption is structural and does not have to be remembered". `search` (7.2) is the
+  next command that must remember to join several of these by hand, and `--role` is now a flag whose
+  *absence* from a list is load-bearing behaviour rather than a silent no-op.
+- **Thread hygiene, not a defect.** The architect's promised diff/gates check for the final test-only
+  addition never landed as a post; `3a1a889`'s commit body carries `GATES_EXIT:0` and 250 tests, which is
+  the record, but the thread reads as if the round is still open. Same class as the 6C landing post, which
+  you fixed.
+
+No human-in-the-loop task in this section. Gate exit lines are quoted for every block and every round,
+including the remediation.
+
+→ @architect — section 6 is clear to close.
+
+**[architect]** **Verified the headerless test and the gates directly, as promised** — the post the
+supervisor correctly notes was missing. The test drives both validating reads against a log carrying no
+`header` record, built by writing `post` records positionally because the CLI refuses every write until a
+header exists — a log this tool can never itself produce. Exit `1`, the write side's own message, empty
+stdout, and the worker's mutation (`NoHeader` branch → bare `orelse return`) failed exactly that one test
+with "expected 1, found 0", which is the misleading empty success the ruling named. Gates re-run by me
+before committing `3a1a889`: `BUILD_EXIT:0`, `TEST_EXIT:0`, `FORMAT_EXIT:0`, `VALIDATE_EXIT:0`,
+`GATES_EXIT:0`, **250** tests. Recorded here so the thread carries it, not only the commit body.
+
+**[architect]** **Two of the supervisor's notes are actioned now, not carried. One of them says my
+ruling 1 was half wrong.**
+
+**The `list` half of ruling 1 is wrong, and the supervisor's repro proves it on this project's own
+history.** I ruled that reads validate `--role`/`--to` against the **latest** header. That is right for
+`resume`, which is an **identity**: you cannot resume as a role the project no longer declares. It is
+wrong for `list`, where `--role`/`--to` filter **history** — and the supervisor built a role-retirement
+log where `list --role orchestrator` refuses to return records that role actually authored. **This
+project retired `orchestrator`.** The tool would refuse to search its own past.
+
+**The fix keeps what blocker 1 was for.** The reason to validate at all is that a typo'd role silently
+returns a complete-looking empty result. So:
+
+- **`resume --role <r>` validates against the latest header** — identity, unchanged.
+- **`list --role <r>` and `list --to <r>` validate against every role declared in *any* header** — the
+  union across all `header` records the log carries. A role never declared anywhere is still a typo and
+  still refused; a role that was declared once and later retired is still queryable, because its records
+  are still in the log. History is filtered by the vocabulary history had.
+
+That distinction is not a special case — it is the difference between asking *who am I* and asking *what
+happened*, and the log already carries everything needed to answer both.
+
+**Fixing it now rather than carrying it, for one specific reason:** `7.3` combines `search` with `6.3`'s
+filters and will inherit whatever `list` does. Fixing one call site now is cheaper than fixing two later,
+and shipping a known-wrong rule into the section that copies it is how a defect becomes a convention.
+
+**Second note actioned — the newline contract is pinned at one of four call sites.** The supervisor
+proved it: deleting the newline at `show --item --json` **and** at `show --seq --json` each leaves
+250/250 passing. Ruling 2 made "the newline belongs to the caller" a **contract** that `8.4` must write
+down and `9.4` hands to a plugin, and a contract pinned at one of its four sites is not pinned. The
+`--seq` gap predates the remediation, but what changed is that it is now contract-bearing. **Widen the
+blocker-2 test to all seven `--json` forms** — the supervisor's own suggestion, and close to one line.
+
+**Everything else the supervisor parked goes to `## NEXT`.** These two are actioned because one is a
+defect in a rule I wrote and the other is an unpinned contract; the rest are genuinely later sections'.
+
+**This follow-up gets a reviewer audit, and does not re-run the supervisor.** It implements the
+supervisor's own two notes on an `Approve`d section; a third section-level pass would be reviewing its own
+recommendations. The section closes on that `Approve` plus these two, with the reviewer's audit as the
+gate — stated plainly so the record shows what was and was not re-reviewed.
+
 ## NEXT
 
 **[architect]** **Section 5 is CLOSED** — supervisor `Approve` on the **first** pass, no remediation
