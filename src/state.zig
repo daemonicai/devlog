@@ -149,15 +149,21 @@ fn deinitStringMultimap(map: *StringMultimap, allocator: Allocator) void {
 
 /// Mirrors `record.Record.role()`/`.to()` for the two more `Attributed`
 /// fields `5.5`'s indexes need — `null` only for `header`, which carries
-/// no `Attributed` at all.
-fn recordSection(rec: record.Record) ?[]const u8 {
+/// no `Attributed` at all. `pub`, not private to this module's own index
+/// build: `record.Record` cannot carry a same-named method (`.section` and
+/// `.block` are themselves union tags — `role()`/`to()` have no such
+/// collision, which is why those two *are* methods and these two are not),
+/// so this free function is `6.3`'s `list` filter's only way to read a
+/// record's section/block without re-deriving the switch main.zig would
+/// otherwise have to duplicate.
+pub fn recordSection(rec: record.Record) ?[]const u8 {
     return switch (rec) {
         .header => null,
         inline .section, .brief, .post, .item, .close, .verdict, .next => |r| r.common.section,
     };
 }
 
-fn recordBlock(rec: record.Record) ?[]const u8 {
+pub fn recordBlock(rec: record.Record) ?[]const u8 {
     return switch (rec) {
         .header => null,
         inline .section, .brief, .post, .item, .close, .verdict, .next => |r| r.common.block,
@@ -181,7 +187,17 @@ pub const Indexes = struct {
     allocator: Allocator,
     by_role: StringMultimap,
     by_section: StringMultimap,
-    by_block: StringMultimap,
+    /// Keyed on the bare block **label** (`record.Attributed.block`), not
+    /// the `(section, block)` pair — that pair is block *identity* and is
+    /// what `5.4`'s verdict grid (`State.blocks`, `BlockKey`) keys on
+    /// instead. Named `by_block_label`, not `by_block`, precisely so the
+    /// two never read as the same concept (section-5 close ruling, block
+    /// 6C): `6.3`'s `--block` filter needs the bare-label question — "every
+    /// record whose block reads `Y`, in any section" — which this index
+    /// answers directly; `--section X --block Y` together is the other
+    /// question, answered as this index's result intersected with
+    /// `by_section`'s, not by a third index.
+    by_block_label: StringMultimap,
     /// Records whose `to` names this addressee (`record.Record.to()`).
     by_addressee: StringMultimap,
     by_kind: std.EnumArray(record.Kind, std.ArrayList(record.Record)),
@@ -199,8 +215,8 @@ pub const Indexes = struct {
     pub fn bySection(self: Indexes, section: []const u8) []const record.Record {
         return if (self.by_section.get(section)) |list| list.items else &.{};
     }
-    pub fn byBlock(self: Indexes, block: []const u8) []const record.Record {
-        return if (self.by_block.get(block)) |list| list.items else &.{};
+    pub fn byBlockLabel(self: Indexes, block: []const u8) []const record.Record {
+        return if (self.by_block_label.get(block)) |list| list.items else &.{};
     }
     pub fn byAddressee(self: Indexes, to: []const u8) []const record.Record {
         return if (self.by_addressee.get(to)) |list| list.items else &.{};
@@ -218,7 +234,7 @@ pub const Indexes = struct {
     pub fn deinit(self: *Indexes) void {
         deinitStringMultimap(&self.by_role, self.allocator);
         deinitStringMultimap(&self.by_section, self.allocator);
-        deinitStringMultimap(&self.by_block, self.allocator);
+        deinitStringMultimap(&self.by_block_label, self.allocator);
         deinitStringMultimap(&self.by_addressee, self.allocator);
         {
             var it = self.by_kind.iterator();
@@ -251,8 +267,8 @@ fn buildIndexes(
     errdefer deinitStringMultimap(&by_role, allocator);
     var by_section: StringMultimap = .empty;
     errdefer deinitStringMultimap(&by_section, allocator);
-    var by_block: StringMultimap = .empty;
-    errdefer deinitStringMultimap(&by_block, allocator);
+    var by_block_label: StringMultimap = .empty;
+    errdefer deinitStringMultimap(&by_block_label, allocator);
     var by_addressee: StringMultimap = .empty;
     errdefer deinitStringMultimap(&by_addressee, allocator);
     var by_reference: RefMultimap = .empty;
@@ -270,7 +286,7 @@ fn buildIndexes(
     for (records) |rec| {
         if (rec.role()) |r| _ = try appendGrouped(&by_role, allocator, r, rec);
         if (recordSection(rec)) |s| _ = try appendGrouped(&by_section, allocator, s, rec);
-        if (recordBlock(rec)) |b| _ = try appendGrouped(&by_block, allocator, b, rec);
+        if (recordBlock(rec)) |b| _ = try appendGrouped(&by_block_label, allocator, b, rec);
         if (rec.to()) |t| _ = try appendGrouped(&by_addressee, allocator, t, rec);
         for (recordRefs(rec)) |ref| _ = try appendGrouped(&by_reference, allocator, ref, rec);
         try by_kind.getPtr(std.meta.activeTag(rec)).append(allocator, rec);
@@ -287,7 +303,7 @@ fn buildIndexes(
         .allocator = allocator,
         .by_role = by_role,
         .by_section = by_section,
-        .by_block = by_block,
+        .by_block_label = by_block_label,
         .by_addressee = by_addressee,
         .by_kind = by_kind,
         .by_state = by_state,
@@ -939,7 +955,7 @@ test "indexes group records by role, section, and block" {
 
     try testing.expectEqual(@as(usize, 1), state.indexes.bySection("5").len);
     try testing.expectEqual(@as(usize, 0), state.indexes.bySection("99").len);
-    try testing.expectEqual(@as(usize, 1), state.indexes.byBlock("5.1-5.3").len);
+    try testing.expectEqual(@as(usize, 1), state.indexes.byBlockLabel("5.1-5.3").len);
 }
 
 test "the kind index groups every record by its own kind, including those derive ignores" {

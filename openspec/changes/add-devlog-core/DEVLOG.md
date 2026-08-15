@@ -8304,6 +8304,259 @@ filters on is correct here, because absence is a legitimate answer to "does this
 **Done-gates.** `make gates` → `GATES_EXIT:0`, quoting every individual `LABEL_EXIT:<n>` line, and the
 counted test total. Then `→ @reviewer`. No commit, no ticks.
 
+**[worker]** **Block 6C (`6.3`, `6.4`) implemented. This closes section 6.**
+
+**`by_block` → `by_block_label` rename (section-5 close ruling).** `src/state.zig`: `Indexes.by_block` →
+`by_block_label`, `byBlock()` → `byBlockLabel()`, plus the doc comment spelling out why the two must never
+read as one concept (bare-label filter vs. the `(section, block)` pair `5.4`'s verdict grid keys on). Also
+made `state.zig`'s private `recordSection`/`recordBlock` free functions `pub` — `list`'s filter predicate
+needed a way to read a record's section/block without duplicating the switch, and `Record` itself can't
+carry same-named methods (`.section`/`.block` are union tags, which is exactly why `role()`/`to()` are
+methods and these two are free functions instead — tried the method route first, hit that collision,
+reverted).
+
+**`6.3` — `list`.** Both `--kind`/`--state` validate against their permitted sets (`record.Kind`,
+`state_mod.ItemState`) before the read-only load touches the filesystem (A3). Carried 16 implemented as
+briefed: a single active filter is a key lookup into one `Indexes` bucket (already log-order); 2+ filters
+seed from whichever active filter's bucket is found first, apply every other active filter as a predicate
+(`matchesListFilters`), then explicitly `std.mem.sort` by `seq` — the sort is real defensive code, though
+against this seed-then-filter implementation I can't construct a black-box test that fails without it
+(filtering an already-ordered bucket preserves order by construction under any correct predicate check);
+flagging that honestly rather than claiming the combined-filter tests prove the sort fires, when what they
+actually prove is correct final content and order. Zero filters seeds from `opened.log.records` directly,
+never a map enumeration. `--state`/`--blocking` narrow to items (ruling): filtered directly off
+`derived.items` (already `#n`-order), so no sort is needed on that path regardless of how many item
+predicates are active. `--kind` naming anything but `item` alongside `--state`/`--blocking` refuses before
+the filesystem load (A6 shape) — tested both combinations. `--block`'s span-vs-intersection semantics
+tested explicitly with a same-labelled-block-different-section fixture record, and documented in
+`list --help`, which also states filters combine with AND.
+
+**`6.4` — `refs`.** Reuses section 4's `appendRef`/`--ref` parsing and its `malformed_ref` fault unchanged
+— `refs` just requires `p.refs.items.len == 1` before touching the filesystem (0 → "requires --ref", 2+ →
+"takes exactly one"). Single key lookup via `Indexes.byReference`, already log-order. The negative-half
+test the brief called for: a record whose body contains the literal `D7` in prose with no `--ref` ever
+given at write time is asserted absent from `refs --ref D:7`, alongside a real `D:7`-carrying record
+asserted present — a prose-scanning implementation would pass every other test in the block and fail only
+this one. Exact-match-not-prefix also covered (`D:1` vs `D:10`).
+
+**Force-unwraps (the brief's own warning, block 6B's blocker one field over).** `matchesListFilters` and
+the item-only predicate loop guard `section`/`block`/`to` with `orelse return false`/`orelse continue`
+throughout — never `.?` on an `Attributed` optional. The fixture deliberately leaves several records
+without `section`/`block`/`to` (a bare `post`, the two `close` records, the `next`) so the guards are
+exercised by ordinary fixture diversity rather than a contrived hand-written log line.
+
+**D15.** Both commands reuse 6A/6B's renderers exclusively — `renderRecordText`/`record.write` for the
+record path, `writeItemText`/`writeItemJson` for the item path — via two new thin wrappers
+(`writeRecordListText`/`Json`, `writeItemListText`/`Json`) that add only the list-shaped envelope (count
+header, `(none)` on empty, `--- N of M ---` separators / a bare JSON array). No second record or item
+emitter. Empty result is an ordinary success (exit 0) in both forms, tested for both commands.
+
+**Retargeted 3 pre-existing tests** that asserted `list` was still an unimplemented placeholder (now real)
+to `search` (7.2), the one command this change never builds — same pattern as the 4C→6A→6B→6C retargeting
+chain already in the file.
+
+**Bug caught by my own test run, not by inspection:** `filter_count`'s `@intFromBool(...) +
+@intFromBool(...) + ...` overflowed (`u1` arithmetic before the `usize` coercion applied) — `zig build
+test` crashed two tests with SIGABRT on "integer overflow" the first time I ran it. Fixed by wrapping each
+term in `@as(usize, ...)` before summing. Left in this report rather than silently fixed, since it's
+exactly the kind of thing `make gates` exists to catch before a reviewer sees it.
+
+**Gates.** `BUILD_EXIT:0` `TEST_EXIT:0` `FORMAT_EXIT:0` `VALIDATE_EXIT:0` `GATES_EXIT:0` — **243/243**
+tests pass (28 new: 26 in `main.zig` for `list`/`refs`, plus the renamed-index assertion already counted in
+the pre-existing `state.zig` suite), counted via `zig build test --summary all`.
+
+Only `src/state.zig` and `src/main.zig` changed — `record.zig` untouched in the end (I tried adding
+`Record.section()`/`.block()` accessors there first, hit the union-tag-name collision noted above, and
+reverted in favour of exporting `state.zig`'s existing free functions instead). No `tasks.md`, no
+`Makefile`. No commit, no ticks.
+
+→ @reviewer
+
+**[reviewer]** **Block 6C (`6.3`, `6.4`) audited. Verdict: Approve.**
+
+**Gates, re-run independently.** `BUILD_EXIT:0` `TEST_EXIT:0` `FORMAT_EXIT:0` `VALIDATE_EXIT:0`. Test
+total counted, not quoted: `zig build test --summary all` → `Build Summary: 4/4 steps succeeded; 243/243
+tests passed`, matching the worker's number exactly.
+
+**Rename — complete.** `by_block` → `by_block_label`, `byBlock` → `byBlockLabel`
+(`src/state.zig:187-220`), including the doc comment on why the two must never read as one concept.
+Repo-wide grep for `by_block\b`/`byBlock\b` across `src/` and every tracked `.md` outside `DEVLOG.md`
+turns up nothing stale — the one surviving `by_block` string is the rename's own doc comment explaining
+what the index is no longer called (`state.zig:193`), not a leftover reference.
+
+**Carried 16 — verified structurally, not by trust.** `runList` (`src/main.zig:2015-2126` in this
+diff): a single active filter seeds from one `Indexes` bucket (`byKind`/`bySection`/`byBlockLabel`/
+`byRole`/`byAddressee`), all built by one forward pass over `records` in `state.zig`'s `buildIndexes`
+(confirmed at `state.zig:267-296` — appends only, no map-derived reordering); zero filters seeds from
+`opened.log.records` directly (`record.parseLog`'s positional slice, `validateSeqOrder`-checked strictly
+increasing); `--state`/`--blocking` filter `derived.items` directly, itself positional (`#n` order). No
+`.iterator()`/`.valueIterator()`/`.keyIterator()` anywhere in the new `main.zig` code — every map touch
+is a `.get()` key lookup. The combined-filter `seq` sort (`main.zig:2124-2126`) is the one place the
+block does real defensive work, addressed below.
+
+**`--block` semantics and `--help` — correct, per the ruling.** `list --block Y` alone seeds from
+`byBlockLabel` (spans sections); `--section X --block Y` seeds from one bucket and filters the other via
+`matchesListFilters`, i.e. the intersection. Verified against the fixture's deliberate same-label,
+different-section pair (record 4, section 9 block 6C) — the `--block 6C` test asserts it present, the
+`--section 6 --block 6C` test asserts it excluded (`main.zig:828-859` in the diff). `list --help`
+(`main.zig:9-45`) states the span-vs-intersection distinction in one line, and states AND-combination
+separately, as briefed.
+
+**`--state`/`--blocking` item-only narrowing — correct, and the refusal is real.** `item_only` computed
+from `state_filter != null or p.blocking`; `--kind` naming anything but `item` alongside either refuses
+before `log.openReadOnly` is ever called (`main.zig:326-332`) — verified both refusal tests assert the
+tmp dir contains only the stdin standin afterward, i.e. genuinely pre-filesystem (A3). `--blocking`
+without `--state` is tested against a *deferred* (non-open) blocking item to prove it isn't silently
+`--state open` (`main.zig:923-935`) — good test design, not just presence. AND-combination of
+`--state`+`--blocking` narrows to the single matching item, tested. `--kind item` alongside `--state`/
+`--blocking` is accepted as redundant, tested.
+
+**The worker's own flag — carried-16's combined-filter sort, judged as asked.**
+
+**(a) Yes, dead code under this implementation's shape, and yes, correct insurance.** Verified by
+mutation on a scratch copy outside the working tree (deleted the `if (filter_count >= 2) { std.mem.sort
+(...) }` block entirely, replacing the now-unused `filter_count` with `_ = filter_count;` to keep it
+compiling): all 243 tests still passed. This confirms the worker's own claim rather than merely
+recording it. The reason is structural, not incidental: every `Indexes` bucket is built by one
+single forward pass over the seq-ordered `records` slice, so every bucket is itself a seq-ordered
+subsequence; filtering a seq-ordered subsequence by an additional predicate cannot reorder it. Given
+today's `buildIndexes` and today's seed-then-filter `runList`, no input can ever reach `runList` with an
+out-of-order candidate set for the sort to correct. That is exactly why it's *right* to keep: the
+invariant it defends against — a future index-construction change (a differently-computed intersection,
+a parallel build, a hash-derived grouping) that stops preserving insertion order — is plausible future
+work this block cannot rule out, and losing the sort silently would turn into the flaky-diff hazard
+carried 16 was written to prevent. Dead now, load-bearing if the seed side of the invariant ever moves.
+
+**(b) A black-box CLI test has no power here, structurally — full stop.** I could not construct one
+either, for the reason above: as long as `buildIndexes` and the seed selection stay as they are, no
+sequence of `--section`/`--block`/`--role`/`--to`/`--kind` flags can produce an out-of-order candidate
+set for `runList` to sort, so no CLI-level assertion can distinguish "sorted" from "sort deleted." A
+test with real power would have to bypass the CLI and the current index-construction path together —
+e.g. extract the intersect-then-conditionally-sort logic into a small pure function taking an arbitrary
+(possibly hand-shuffled, out-of-order) candidate slice, and unit-test *that* directly with a synthetic
+input the real pipeline can't produce. That is a refactor, not a fixture, and it buys a test that
+exercises an input class the production code path is specifically designed never to generate — testing
+the safety net in isolation from the trapeze. Unlike 6A's five-kind gap (dead code that *was* trivially
+reachable — one fixture per kind through the same command), this dead code is unreachable by
+construction from any command-line input, which is a materially different situation from "nobody wrote
+the fixture yet."
+
+**My recommendation, since you asked for judgment rather than a ruling: waive it for this block, note it
+in `## NEXT`.** The standing rule closing untested branches in-block earned its keep in 6A because the
+fix was five cheap fixtures with real assertion power. Here the "fix" is a refactor whose only purpose
+is to synthesize an input the real system cannot produce, purely so a test can exist — cost without a
+proportionate return, and the worker's own report already surfaces the honest limit rather than
+overclaiming coverage (contrast: it explicitly says the combined-filter tests "prove correct final
+content and order," not that they "prove the sort fires"). If `buildIndexes`' order-preservation
+invariant is ever weakened, that is the point to revisit this — and worth a one-line note there,
+which I've included below for `## NEXT`.
+
+**`6.4` negative half — has real power, verified by mutation.** `main.zig:1121-1131`'s test (`refs
+excludes a record that merely mentions the identifier in prose...`) is not just present; I proved it by
+mutation on a scratch copy: modified `runRefs` to also include, in addition to the exact `byReference`
+match, any record whose body contains the literal `ns+id` substring (a stand-in for the prose-scanning
+implementation the requirement's negative half exists to rule out). Rebuilt and reran: exactly three
+tests failed — the negative-half test itself, the positive-count test (`records (1):` became `records
+(2):`), and the JSON-parity test (array length 1 became 2) — and no others. That is real power against
+the specific defect class the requirement names, not incidental breakage.
+
+**Exact-match on `(ns, id)` — confirmed at the command level, not merely the index.** `runRefs` calls
+`derived.indexes.byReference(target)` with `target: record.Ref` (a struct, not a concatenated string),
+and `RefKeyContext.eql` (`state.zig:130-134`, unchanged this block) compares `ns` and `id` as two
+separate fields — no substring or prefix path exists for a collision to hide in. `refs --ref D:1` vs.
+the fixture's `D:10`-carrying record (`main.zig:1133-1142`) is tested and passes; this is the command
+layer not undoing section 5's existing `D1`/`D10`/`D100` index test, exactly as the brief asked it to
+confirm rather than re-prove.
+
+**The overflow fix — correct, and the pattern doesn't recur.** `filter_count`'s five terms are each
+wrapped `@as(usize, @intFromBool(...))` before summing (`main.zig:380-385`) — coercion happens before
+addition, not after, so no `u1`-arithmetic overflow. Grepped the full diff for `@intFromBool`: this is
+the only occurrence in the block, so the defect class has exactly one instance and it's fixed.
+
+**No `.?` on `Attributed` optionals.** `matchesListFilters` and the item-only predicate loop guard
+`section`/`block`/`to` with `orelse return false` / `orelse continue` throughout (`main.zig:249-270`,
+`355-369`); `role` is accessed directly (`it.opened.common.role`, `main.zig:364`) but that's correct —
+`role` is not optional on `Attributed` (design.md's schema table), unlike the three fields the brief
+warned about. The fixture deliberately leaves `section`/`block`/`to` unset on three records (a bare
+`post`, both `close` records, and `next`) so the guards are exercised by ordinary fixture diversity, as
+claimed. Grepped the full main.zig diff for the force-unwrap pattern (`\.\?`): the only production-code
+hits are `command_hint.?` (pre-existing, guarded by `command_hint != null` in the same expression) and
+`kind_filter.?`/`p.kind.?` (both inside a branch already guarded by `kind_filter != null`, and
+`kind_filter` is non-null only when `p.kind` was `Some` by construction) — none on an `Attributed`
+optional. The remaining hits are test-code JSON-assertion `.?`s, the ordinary Zig idiom for "this key
+must be present or the test should crash loudly."
+
+**D15 parity — both commands, checked, not assumed.** Both `list` and `refs` route every element
+through 6A/6B's existing renderers (`renderRecordText`/`record.write` for the record path,
+`writeItemText`/`writeItemJson` for the item path) via two thin envelope wrappers
+(`writeRecordListText`/`Json`, `writeItemListText`/`Json`, `main.zig:1488-1531`) that add only count
+header / `(none)` / separators in text and array brackets in JSON — no second emitter, consistent with
+D15 and with 6A's field-by-field trace, which this block doesn't have to redo since the underlying
+per-record/per-item renderers are unchanged. Empty result is an ordinary success (exit 0) in both forms
+for both commands — tested explicitly (`list --section 999`, `refs --ref Z:nope`, each in text and
+`--json`). The `list --json` and `refs --json` parity tests assert record count and body content match
+the text form for the same seed; lighter than 6A's full per-field trace, but proportionate, since the
+field-level emitters are untouched this block and were already traced there.
+
+**Ownership.** Read the whole `main.zig` diff (1142 lines) end to end; every new symbol
+(`list_usage`/`refs_usage`, `Parsed.kind`, `matchesListFilters`, `recordSeqLessThan`, `runList`,
+`runRefs`, the four list/list-item renderer wrappers, the fixture and its 26 tests) belongs to `6.3`/
+`6.4`. The three retargeted placeholder tests (now pointing at `search`, 7.2) are the same pattern as
+every prior block's retargeting and don't touch `search`'s own behaviour. No drive-by scope, no new
+dependency, nothing persisted, `Makefile` and `tasks.md` untouched.
+
+**Nits (not blocking):** none beyond the flagged judgment call above.
+
+**Architectural note, for `## NEXT`:** the combined-filter `seq` sort in `runList` is currently
+unreachable by any CLI input — correct as insurance, provable only by refactor-and-unit-test, not by a
+black-box fixture. Revisit if `buildIndexes`' single-forward-pass, order-preserving construction ever
+changes; that is the one change that would make the sort reachable and worth a real test at that point.
+
+Section 6 (`6.1`–`6.6`) is fully implemented and each block is `Approve`d. → @architect for the section
+review.
+
+**[architect]** **Ruling — the rule is waived, and it is waived because this is a different category, not
+because the sort is small.**
+
+I have applied "an untested branch in a block's binding constraint closes in-block" three times this
+section (6A's five kinds, 6B's missing NEXT, 6B's two JSON nits), so waiving it needs a reason that is
+not convenience. Here it is: **that rule is about coverage gaps. This is not a coverage gap — the branch
+is unreachable.** The reviewer proved it by mutation: it deleted the sort on a scratch copy and all 243
+tests still passed, because every `Indexes` bucket is an order-preserving subsequence of a single forward
+pass, so a filtered result is already in `seq` order by construction. A test cannot pin a branch that
+cannot execute differently, and the only test with power would require extracting the intersect-and-sort
+into a pure function fed a synthetic out-of-order input **the real pipeline cannot produce**. That
+refactor would add an abstraction whose sole purpose is to be testable, which is worse than the thing it
+tests.
+
+**The sort stays.** It is correct insurance, and its cost is a few lines. But unreachable defensive code
+with no explanation is exactly what a section review calls dead scaffolding, and it would be right to —
+so **it does not stay silent.**
+
+**One thing to add, and it is the whole of the remediation:** a comment at the sort saying it is currently
+a no-op given `buildIndexes`' single-forward-pass, order-preserving construction, that it becomes
+load-bearing the moment a filtered result stops arriving in `seq` order, and that **`7.3` is the change
+most likely to make that true** — "combine search with the filters from `6.3`" is precisely a pipeline
+whose results arrive ranked by relevance rather than by log order. Without that comment the next reader
+either deletes it as dead or trusts it as tested; both are wrong.
+
+**Carried 21 — re-check the `runList` sort when `7.3` lands.** If BM25 ranking feeds the filter path, the
+sort stops being insurance and becomes load-bearing, and *that* is when it gets a test with real power.
+Recorded so it is not rediscovered as either dead code or an untested branch.
+
+**This is a one-comment change to an approved block** — add it, re-run the gates, and I will verify the
+diff directly rather than spending a review round on a comment. No commit, no ticks.
+
+**[worker]** Added the comment at the combined-filter `seq` sort in `runList` (`src/main.zig`), recording
+the three points from the ruling: currently a no-op because `buildIndexes` (state.zig) makes every bucket
+an order-preserving subsequence of one forward pass, so a combined-filter result already arrives in `seq`
+order; becomes load-bearing the moment that stops being true; `7.3` (search + `6.3` filters) is the change
+most likely to break it, since a relevance-ranked pipeline no longer arrives in log order. No production
+logic, no tests, no renames — comment only.
+
+`make gates`: `BUILD_EXIT:0` `TEST_EXIT:0` `FORMAT_EXIT:0` `VALIDATE_EXIT:0` `GATES_EXIT:0` — 243/243 tests
+passed (unchanged from before the comment, as expected for a comment-only diff). No commit, no ticks.
+
 ## NEXT
 
 **[architect]** **Section 5 is CLOSED** — supervisor `Approve` on the **first** pass, no remediation

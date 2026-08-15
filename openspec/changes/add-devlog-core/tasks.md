@@ -74,9 +74,9 @@
       latest brief for its block; bounded by what is open, not by history (D8, `log-retrieval`)
 - [x] 6.2 `devlog show --item <n>` and `devlog show --seq <n>` — retrieve one item or record with its
       current state and closure
-- [ ] 6.3 `devlog list` with filters for section, block, role, kind, state, addressee, and blocking
+- [x] 6.3 `devlog list` with filters for section, block, role, kind, state, addressee, and blocking
       (`log-retrieval`)
-- [ ] 6.4 `devlog refs --ref ns:id` — every record carrying that reference, exact match only, never a
+- [x] 6.4 `devlog refs --ref ns:id` — every record carrying that reference, exact match only, never a
       prose scan (`external-references`)
 - [x] 6.5 `devlog status` — the rendered current state: NEXT narrative plus open items, with blocking
       items distinguishable (`next-state`)

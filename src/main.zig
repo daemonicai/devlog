@@ -288,6 +288,66 @@ const status_usage =
     \\Takes no body: never reads stdin.
 ;
 
+const list_usage =
+    \\USAGE
+    \\    devlog --log <path> list [--section <s>] [--block <b>] [--role <r>]
+    \\        [--kind <k>] [--state <s>] [--to <role>] [--blocking] [--json]
+    \\
+    \\Lists records, or items, narrowed along any combination of the
+    \\dimensions below. Every given filter must match — filters combine
+    \\with AND (log-retrieval).
+    \\
+    \\FLAGS
+    \\    --section <s>  Only records/items concerning this tasks.md
+    \\                   section.
+    \\    --block <b>    Only records/items whose block label matches.
+    \\                   Given alone, matches by label and may span
+    \\                   sections; given together with --section, the two
+    \\                   are the intersection — the one identified block.
+    \\    --role <r>     Only records authored by this role (for an item,
+    \\                   the role that raised it).
+    \\    --kind <k>     Only records of this kind: header, section, brief,
+    \\                   post, item, close, verdict, next. Refused alongside
+    \\                   --state or --blocking unless it names 'item'.
+    \\    --state <s>    Only items in this derived state: open, resolved,
+    \\                   deferred, superseded. Narrows the result from
+    \\                   records to items (only an item has a state).
+    \\    --to <role>    Only records/items addressed to this role.
+    \\    --blocking     Only items flagged blocking. Narrows the result
+    \\                   from records to items. There is no --no-blocking:
+    \\                   absent means no filtering on it.
+    \\    --json         Emit the same result as JSON instead of rendered
+    \\                   text (D15). One derivation, two renderings — never
+    \\                   two derivations.
+    \\
+    \\With no filters, every record is listed in log order. An empty
+    \\result is an ordinary success (an empty list), not a refusal.
+    \\
+    \\Takes no body: never reads stdin.
+;
+
+const refs_usage =
+    \\USAGE
+    \\    devlog --log <path> refs --ref <ns:id> [--json]
+    \\
+    \\Shows every record carrying the given external reference
+    \\(external-references) — an exact match on the (namespace, identifier)
+    \\pair, never a prefix and never a scan of body prose. A record that
+    \\merely mentions the identifier in its body without recording it as a
+    \\structured reference is not returned.
+    \\
+    \\FLAGS
+    \\    --ref <ns:id>  The reference to look up. Required, exactly once.
+    \\    --json         Emit the same result as JSON instead of rendered
+    \\                   text (D15). One derivation, two renderings — never
+    \\                   two derivations.
+    \\
+    \\An empty result is an ordinary success (an empty list), not a
+    \\refusal.
+    \\
+    \\Takes no body: never reads stdin.
+;
+
 /// Names only, from sections 4, 6 and 7 of the change's `tasks.md`. This
 /// block dispatches to them and gives each a `--help`; their behaviour is
 /// those sections' to build. `header`, `post`, `section`, `brief`, and
@@ -303,8 +363,8 @@ const commands = [_]CommandSpec{
     .{ .name = "next", .summary = "Append the current NEXT narrative.", .section = "4", .usage = next_usage },
     .{ .name = "resume", .summary = "Show the current NEXT, open items for a role, and its latest brief.", .section = "6", .usage = resume_usage },
     .{ .name = "show", .summary = "Show one item or one record by its identifier.", .section = "6", .usage = show_usage },
-    .{ .name = "list", .summary = "List records, filtered by section, block, role, kind, state, or addressee.", .section = "6" },
-    .{ .name = "refs", .summary = "Show every record carrying a given external reference.", .section = "6" },
+    .{ .name = "list", .summary = "List records, filtered by section, block, role, kind, state, or addressee.", .section = "6", .usage = list_usage },
+    .{ .name = "refs", .summary = "Show every record carrying a given external reference.", .section = "6", .usage = refs_usage },
     .{ .name = "status", .summary = "Show the rendered current state: NEXT plus open items.", .section = "6", .usage = status_usage },
     .{ .name = "search", .summary = "Search record bodies, ranked by relevance.", .section = "7", .takes_positional = true },
 };
@@ -348,6 +408,11 @@ fn joinEnumNames(comptime E: type) []const u8 {
 const item_type_names = joinEnumNames(record.ItemType);
 const close_state_names = joinEnumNames(record.CloseState);
 const verdict_outcome_names = joinEnumNames(record.VerdictOutcome);
+const record_kind_names = joinEnumNames(record.Kind);
+/// `list`'s `--state` names a *derived* item state (`state_mod.ItemState`),
+/// not `record.CloseState` — a close record's own three states, plus the
+/// absence of one (`open`). Distinct permitted sets, distinct messages.
+const item_state_names = joinEnumNames(state_mod.ItemState);
 
 fn findCommand(name: []const u8) ?CommandSpec {
     for (commands) |c| {
@@ -391,7 +456,7 @@ const value_taking_flags = [_][]const u8{
     "--log",   "--role", "--change", "--closer",  "--section",
     "--block", "--to",   "--ref",    "--title",   "--base",
     "--type",  "--item", "--state",  "--outcome", "--commit",
-    "--seq",
+    "--seq",   "--kind",
 };
 
 fn isValueTakingFlag(name: []const u8) bool {
@@ -511,6 +576,10 @@ const Parsed = struct {
     /// rendered-text form, present means emit the same content as JSON
     /// instead.
     json: bool = false,
+    /// `list`-only (6.3), exactly-once. Validated against `record.Kind`'s
+    /// permitted set in `runList`, not here — same split A5 draws for every
+    /// other flag's arity-vs-value-validity distinction.
+    kind: ?[]const u8 = null,
 
     fn deinit(self: *Parsed, allocator: Allocator) void {
         self.roles.deinit(allocator);
@@ -616,8 +685,11 @@ fn parseArgs(allocator: Allocator, args: []const [:0]const u8) Allocator.Error!P
     const wants_show = command_hint != null and std.mem.eql(u8, command_hint.?, "show");
     const wants_resume = command_hint != null and std.mem.eql(u8, command_hint.?, "resume");
     const wants_status = command_hint != null and std.mem.eql(u8, command_hint.?, "status");
+    const wants_list = command_hint != null and std.mem.eql(u8, command_hint.?, "list");
+    const wants_refs = command_hint != null and std.mem.eql(u8, command_hint.?, "refs");
     const strict = wants_header or wants_post or wants_section_cmd or wants_brief or wants_next or
-        wants_item or wants_close or wants_verdict or wants_show or wants_resume or wants_status;
+        wants_item or wants_close or wants_verdict or wants_show or wants_resume or wants_status or
+        wants_list or wants_refs;
     // Whether the hinted command recognises a bare positional argument at
     // all (B1: `CommandSpec.takes_positional`). Looked up structurally,
     // not by name, so a future command that takes one only has to set the
@@ -633,12 +705,21 @@ fn parseArgs(allocator: Allocator, args: []const [:0]const u8) Allocator.Error!P
     // but not a command set, hence three separate memberships rather
     // than one. `close` takes neither `--section`, `--block`, nor `--to`
     // (4.5: "nothing else"); `verdict` takes `--section`/`--block` but
-    // not `--to` (4.6 names no addressee).
-    const wants_section_flag = wants_post or wants_section_cmd or wants_brief or wants_item or wants_verdict;
-    const wants_block_flag = wants_post or wants_brief or wants_item or wants_verdict;
-    const wants_to_flag = wants_post or wants_brief or wants_item;
+    // not `--to` (4.6 names no addressee). `list` (6.3) joins all three —
+    // its own filter, not a write-time attribution, but the same shared
+    // flags answer both questions.
+    const wants_section_flag = wants_post or wants_section_cmd or wants_brief or wants_item or wants_verdict or wants_list;
+    const wants_block_flag = wants_post or wants_brief or wants_item or wants_verdict or wants_list;
+    const wants_to_flag = wants_post or wants_brief or wants_item or wants_list;
+    // `refs` (6.4) reuses this same `--ref` parsing and its malformation
+    // fault (A6) rather than a second parser — the brief's own
+    // instruction — even though its `--ref` means "look this up", not
+    // "record this", and is validated exactly-once in `runList`/`runRefs`
+    // rather than here (same arity-vs-value-validity split as everywhere
+    // else). `list` does not filter by reference (6.3 names no such
+    // filter), so it is deliberately absent from this set.
     const wants_ref_flag = wants_post or wants_section_cmd or wants_brief or wants_next or
-        wants_item or wants_close or wants_verdict;
+        wants_item or wants_close or wants_verdict or wants_refs;
 
     var i: usize = 0;
     while (i < args.len) : (i += 1) {
@@ -666,11 +747,11 @@ fn parseArgs(allocator: Allocator, args: []const [:0]const u8) Allocator.Error!P
             if (takeFlagValue(&p, args, &i, "--base")) |v| setOnce(&p, &p.base, "--base", v);
         } else if (wants_item and std.mem.eql(u8, arg, "--type")) {
             if (takeFlagValue(&p, args, &i, "--type")) |v| setOnce(&p, &p.item_type, "--type", v);
-        } else if (wants_item and std.mem.eql(u8, arg, "--blocking")) {
+        } else if ((wants_item or wants_list) and std.mem.eql(u8, arg, "--blocking")) {
             p.blocking = true;
         } else if ((wants_close or wants_show) and std.mem.eql(u8, arg, "--item")) {
             if (takeFlagValue(&p, args, &i, "--item")) |v| setOnce(&p, &p.item_num, "--item", v);
-        } else if (wants_close and std.mem.eql(u8, arg, "--state")) {
+        } else if ((wants_close or wants_list) and std.mem.eql(u8, arg, "--state")) {
             if (takeFlagValue(&p, args, &i, "--state")) |v| setOnce(&p, &p.state, "--state", v);
         } else if (wants_verdict and std.mem.eql(u8, arg, "--outcome")) {
             if (takeFlagValue(&p, args, &i, "--outcome")) |v| setOnce(&p, &p.outcome, "--outcome", v);
@@ -678,7 +759,9 @@ fn parseArgs(allocator: Allocator, args: []const [:0]const u8) Allocator.Error!P
             if (takeFlagValue(&p, args, &i, "--commit")) |v| setOnce(&p, &p.commit, "--commit", v);
         } else if (wants_show and std.mem.eql(u8, arg, "--seq")) {
             if (takeFlagValue(&p, args, &i, "--seq")) |v| setOnce(&p, &p.seq_num, "--seq", v);
-        } else if ((wants_show or wants_resume or wants_status) and std.mem.eql(u8, arg, "--json")) {
+        } else if (wants_list and std.mem.eql(u8, arg, "--kind")) {
+            if (takeFlagValue(&p, args, &i, "--kind")) |v| setOnce(&p, &p.kind, "--kind", v);
+        } else if ((wants_show or wants_resume or wants_status or wants_list or wants_refs) and std.mem.eql(u8, arg, "--json")) {
             p.json = true;
         } else if (wants_section_flag and std.mem.eql(u8, arg, "--section")) {
             if (takeFlagValue(&p, args, &i, "--section")) |v| setOnce(&p, &p.section, "--section", v);
@@ -1402,6 +1485,56 @@ fn writeItemJson(w: *Io.Writer, item: state_mod.Item, diag: ?*record.Diagnostics
     try w.writeAll("]}\n");
 }
 
+/// The text form of a `list`/`refs` result over raw records — "a list is a
+/// sequence of things that already know how to render themselves" (the
+/// block's brief): reuses `renderRecordText`, the exact renderer `show
+/// --seq` already exercises for every one of the eight kinds, once per
+/// element. Mirrors `renderCurrentStateText`'s own "count header, `(none)`
+/// on empty, numbered `--- ... ---` separators" shape below, so every list-
+/// shaped read in this tool renders the same way.
+fn writeRecordListText(w: *Io.Writer, records: []const record.Record) void {
+    w.print("records ({d}):\n", .{records.len}) catch {};
+    if (records.len == 0) w.writeAll("(none)\n") catch {};
+    for (records, 0..) |rec, idx| {
+        w.print("\n--- record {d} of {d} ---\n", .{ idx + 1, records.len }) catch {};
+        renderRecordText(w, rec);
+    }
+}
+
+/// The JSON form of a `list`/`refs` result over raw records — a bare array,
+/// each element written by `record.write` (D15: no second record emitter).
+fn writeRecordListJson(w: *Io.Writer, records: []const record.Record, diag: ?*record.Diagnostics) record.WriteError!void {
+    try w.writeAll("[");
+    for (records, 0..) |rec, idx| {
+        if (idx != 0) try w.writeAll(",");
+        try record.write(w, rec, diag);
+    }
+    try w.writeAll("]\n");
+}
+
+/// The text form of a `list --state`/`--blocking` result — the item-
+/// narrowed half (the block's ruling). Reuses `writeItemText`, the exact
+/// renderer `show --item` already exercises.
+fn writeItemListText(w: *Io.Writer, items: []const state_mod.Item) void {
+    w.print("items ({d}):\n", .{items.len}) catch {};
+    if (items.len == 0) w.writeAll("(none)\n") catch {};
+    for (items, 0..) |it, idx| {
+        w.print("\n--- item {d} of {d} ---\n", .{ idx + 1, items.len }) catch {};
+        writeItemText(w, it);
+    }
+}
+
+/// The JSON form of the item-narrowed `list` result — a bare array, each
+/// element written by `writeItemJson` (D15: no second item emitter).
+fn writeItemListJson(w: *Io.Writer, items: []const state_mod.Item, diag: ?*record.Diagnostics) record.WriteError!void {
+    try w.writeAll("[");
+    for (items, 0..) |it, idx| {
+        if (idx != 0) try w.writeAll(",");
+        try writeItemJson(w, it, diag);
+    }
+    try w.writeAll("]\n");
+}
+
 /// The `brief` slot of a "current state" view (D8, block 6B). `resume`
 /// (6.1) and `status` (6.5) share everything about "NEXT narrative plus a
 /// set of items" except this: `status` has no brief concept at all,
@@ -1735,6 +1868,247 @@ fn runShow(
     return fail(stderr, "item #{d} does not exist — {d} item(s) have been raised so far", .{ n, derived.items.len });
 }
 
+/// Does `rec` satisfy every filter `p` has active, checked directly against
+/// the record's own fields — `record.Record.role()`/`.to()` and
+/// `state_mod.recordSection`/`recordBlock` (the same free functions `5.5`'s
+/// own index build uses), never a `.?`. `section`/`block`/`to` are optional
+/// on `Attributed` and not guaranteed present on a hand-written log (block
+/// 6B's own blocker, one field over): a record lacking a field a filter
+/// asks about simply does not match that filter — absence is a legitimate
+/// answer to "does this record match `--section 6`?", not a crash.
+fn matchesListFilters(rec: record.Record, p: *const Parsed, kind_filter: ?record.Kind) bool {
+    if (p.section) |s| {
+        const rs = state_mod.recordSection(rec) orelse return false;
+        if (!std.mem.eql(u8, rs, s)) return false;
+    }
+    if (p.block) |b| {
+        const rb = state_mod.recordBlock(rec) orelse return false;
+        if (!std.mem.eql(u8, rb, b)) return false;
+    }
+    if (p.role) |r| {
+        const rr = rec.role() orelse return false;
+        if (!std.mem.eql(u8, rr, r)) return false;
+    }
+    if (p.to) |t| {
+        const rt = rec.to() orelse return false;
+        if (!std.mem.eql(u8, rt, t)) return false;
+    }
+    if (kind_filter) |k| {
+        if (std.meta.activeTag(rec) != k) return false;
+    }
+    return true;
+}
+
+fn recordSeqLessThan(_: void, a: record.Record, b: record.Record) bool {
+    return a.seq() < b.seq();
+}
+
+/// `devlog list` (6.3, `log-retrieval`). An index consumer, not a deriving
+/// command: every filter reads off `state_mod`'s already-built indexes or
+/// the raw parsed `records` slice, never a second derivation.
+///
+/// **Carried 16, in full — the block this rule was written for.** A single
+/// active filter is a key lookup into one of `Indexes`' buckets, already in
+/// log order by construction (`5.5`: each bucket is built by one forward
+/// pass over `records`, appending in the order encountered). Two or more
+/// active filters are an intersection: this seeds from whichever one active
+/// filter's bucket is found first (any one will do — correctness does not
+/// depend on which), checks every *other* active filter directly against
+/// each candidate via `matchesListFilters`, and — since an intersection has
+/// no order guarantee independent of how it happened to be computed —
+/// explicitly sorts the result by `seq` before rendering, rather than
+/// trusting the seed bucket's order to survive the narrowing. With no
+/// filter active at all, the seed is `opened.log.records` itself: the
+/// positional slice `record.parseLog` built, never a `StringHashMap`
+/// enumeration, whose order would vary between runs.
+///
+/// **`--state`/`--blocking` narrow the result to items** (the block's
+/// ruling): they are properties only a derived item has, so their presence
+/// switches the command from listing records to listing items — filtered
+/// directly off `derived.items`, itself already positional (`#n` order,
+/// carried 16 again), so no sort is needed on that path regardless of how
+/// many item-level predicates are active. `--kind` naming anything but
+/// `item` alongside either is refused before the read-only load ever
+/// touches the filesystem (A3), not silently ignored (A6's first-fault-wins
+/// shape, applied to a business-logic refusal rather than a parse one).
+fn runList(
+    allocator: Allocator,
+    io: Io,
+    dir: Io.Dir,
+    log_path: []const u8,
+    p: *const Parsed,
+    stdout: *Io.Writer,
+    stderr: *Io.Writer,
+) u8 {
+    const kind_filter: ?record.Kind = if (p.kind) |k|
+        std.meta.stringToEnum(record.Kind, k) orelse
+            return fail(stderr, "--kind '{s}' must be one of: {s}", .{ k, record_kind_names })
+    else
+        null;
+
+    const state_filter: ?state_mod.ItemState = if (p.state) |s|
+        std.meta.stringToEnum(state_mod.ItemState, s) orelse
+            return fail(stderr, "--state '{s}' must be one of: {s}", .{ s, item_state_names })
+    else
+        null;
+
+    const item_only = state_filter != null or p.blocking;
+    if (item_only and kind_filter != null and kind_filter.? != .item) {
+        return fail(
+            stderr,
+            "--kind '{s}' cannot be combined with --state or --blocking, which narrow the result to items",
+            .{p.kind.?},
+        );
+    }
+
+    var diag: record.Diagnostics = .init(allocator);
+    defer diag.deinit();
+
+    var opened = log.openReadOnly(allocator, io, dir, log_path, &diag) catch |err| {
+        return reportLogError(stderr, err, &diag);
+    };
+    defer opened.close(allocator);
+
+    var derived = state_mod.derive(allocator, opened.log.records, &diag) catch |err| {
+        return reportLogError(stderr, err, &diag);
+    };
+    defer derived.deinit();
+
+    if (item_only) {
+        var matching: std.ArrayList(state_mod.Item) = .empty;
+        defer matching.deinit(allocator);
+        for (derived.items) |it| {
+            if (state_filter) |sf| {
+                if (it.state != sf) continue;
+            }
+            if (p.blocking and !it.opened.blocking) continue;
+            if (p.section) |s| {
+                const rs = it.opened.common.section orelse continue;
+                if (!std.mem.eql(u8, rs, s)) continue;
+            }
+            if (p.block) |b| {
+                const rb = it.opened.common.block orelse continue;
+                if (!std.mem.eql(u8, rb, b)) continue;
+            }
+            if (p.role) |r| {
+                if (!std.mem.eql(u8, it.opened.common.role, r)) continue;
+            }
+            if (p.to) |t| {
+                const rt = it.opened.common.to orelse continue;
+                if (!std.mem.eql(u8, rt, t)) continue;
+            }
+            matching.append(allocator, it) catch return fail(stderr, "out of memory", .{});
+        }
+        if (p.json) {
+            writeItemListJson(stdout, matching.items, &diag) catch |err| return reportLogError(stderr, err, &diag);
+        } else {
+            writeItemListText(stdout, matching.items);
+        }
+        return 0;
+    }
+
+    const filter_count: usize =
+        @as(usize, @intFromBool(p.section != null)) +
+        @as(usize, @intFromBool(p.block != null)) +
+        @as(usize, @intFromBool(p.role != null)) +
+        @as(usize, @intFromBool(p.to != null)) +
+        @as(usize, @intFromBool(kind_filter != null));
+
+    const seed: []const record.Record = if (kind_filter) |k|
+        derived.indexes.byKind(k)
+    else if (p.section) |s|
+        derived.indexes.bySection(s)
+    else if (p.block) |b|
+        derived.indexes.byBlockLabel(b)
+    else if (p.role) |r|
+        derived.indexes.byRole(r)
+    else if (p.to) |t|
+        derived.indexes.byAddressee(t)
+    else
+        opened.log.records;
+
+    var matching: std.ArrayList(record.Record) = .empty;
+    defer matching.deinit(allocator);
+    for (seed) |rec| {
+        if (!matchesListFilters(rec, p, kind_filter)) continue;
+        matching.append(allocator, rec) catch return fail(stderr, "out of memory", .{});
+    }
+
+    // A single filter's bucket, or the raw positional slice with none
+    // active, is already in log order by construction — sorting only does
+    // real work, and is only needed at all, once two or more filters
+    // intersect (carried 16).
+    //
+    // Currently a no-op: buildIndexes (state.zig) builds every bucket as an
+    // order-preserving subsequence of a single forward pass over the log, so
+    // a combined-filter result already arrives in `seq` order before this
+    // sort runs — there is no reachable input on which it changes anything.
+    // It becomes load-bearing the moment a filtered result stops arriving in
+    // `seq` order, which 7.3 (combining search with these filters) is the
+    // most likely task to introduce: a search+filter pipeline ranks by
+    // relevance, not by log order.
+    if (filter_count >= 2) {
+        std.mem.sort(record.Record, matching.items, {}, recordSeqLessThan);
+    }
+
+    if (p.json) {
+        writeRecordListJson(stdout, matching.items, &diag) catch |err| return reportLogError(stderr, err, &diag);
+    } else {
+        writeRecordListText(stdout, matching.items);
+    }
+    return 0;
+}
+
+/// `devlog refs` (6.4, `external-references`). Reuses section 4's `--ref
+/// ns:id` parsing (`appendRef`) and its malformation fault rather than a
+/// second parser. Exact match on the `(ns, id)` pair via a single key
+/// lookup into `Indexes.byReference` — already in log order (`5.5`'s own
+/// test already proves `D1` does not collide with `D10`/`D100`; this
+/// command only has to not undo that) — never a scan of body prose: a
+/// record whose body merely mentions the identifier without carrying it as
+/// a structured reference was never added to that index in the first
+/// place, so it cannot appear here (`external-references`'s negative
+/// half).
+fn runRefs(
+    allocator: Allocator,
+    io: Io,
+    dir: Io.Dir,
+    log_path: []const u8,
+    p: *const Parsed,
+    stdout: *Io.Writer,
+    stderr: *Io.Writer,
+) u8 {
+    if (p.refs.items.len == 0) {
+        return fail(stderr, "'refs' requires --ref <ns:id>", .{});
+    }
+    if (p.refs.items.len > 1) {
+        return fail(stderr, "'refs' takes exactly one --ref <ns:id>", .{});
+    }
+    const target = p.refs.items[0];
+
+    var diag: record.Diagnostics = .init(allocator);
+    defer diag.deinit();
+
+    var opened = log.openReadOnly(allocator, io, dir, log_path, &diag) catch |err| {
+        return reportLogError(stderr, err, &diag);
+    };
+    defer opened.close(allocator);
+
+    var derived = state_mod.derive(allocator, opened.log.records, &diag) catch |err| {
+        return reportLogError(stderr, err, &diag);
+    };
+    defer derived.deinit();
+
+    const matching = derived.indexes.byReference(target);
+
+    if (p.json) {
+        writeRecordListJson(stdout, matching, &diag) catch |err| return reportLogError(stderr, err, &diag);
+    } else {
+        writeRecordListText(stdout, matching);
+    }
+    return 0;
+}
+
 /// Dispatches one invocation and returns the process exit code.
 fn run(
     allocator: Allocator,
@@ -1826,10 +2200,16 @@ fn run(
     if (std.mem.eql(u8, spec.name, "status")) {
         return runStatus(allocator, io, dir, log_path, &p, stdout, stderr);
     }
+    if (std.mem.eql(u8, spec.name, "list")) {
+        return runList(allocator, io, dir, log_path, &p, stdout, stderr);
+    }
+    if (std.mem.eql(u8, spec.name, "refs")) {
+        return runRefs(allocator, io, dir, log_path, &p, stdout, stderr);
+    }
 
-    // No other subcommand is wired yet (`list`/`refs` — section 6 block
-    // 6C; `search` — section 7). Fail honestly rather than silently
-    // succeed, and touch nothing on the way out (D5).
+    // No other subcommand is wired yet (`search` — section 7). Fail
+    // honestly rather than silently succeed, and touch nothing on the way
+    // out (D5).
     return fail(stderr, "'{s}' is not implemented yet", .{spec.name});
 }
 
@@ -1968,17 +2348,17 @@ test "a recognised command without --log is an error, not an attempt" {
 }
 
 test "a recognised but unimplemented command with --log fails honestly as not implemented" {
-    // list is still a placeholder past block 6B — status/resume became
-    // real in this block, retargeted here for the same reason 4A's
-    // original status target was retargeted at 6A and again at 6B; every
-    // command this change has not yet built must still fail this way
-    // rather than silently succeed.
+    // search (7.2) is the only command left unbuilt past block 6C — list
+    // and refs became real in this block, retargeted here for the same
+    // reason 4A's original status target was retargeted at 6A, 6B, and now
+    // 6C; every command this change has not yet built must still fail this
+    // way rather than silently succeed.
     try expectRun(
         std.testing.allocator,
-        &.{ "--log", "DEVLOG.jsonl", "list" },
+        &.{ "--log", "DEVLOG.jsonl", "search" },
         1,
         null,
-        "'list' is not implemented yet",
+        "'search' is not implemented yet",
     );
 }
 
@@ -2146,28 +2526,28 @@ test "an unrecognised global flag before the command is rejected" {
 }
 
 test "flags after the subcommand are left for its own section, not rejected here" {
-    // show is real as of block 6A, resume/status as of block 6B, so this
-    // test (from block 4A, retargeted at 4C, 6A, and now again here) moves
-    // to a command block 6B does not build — list, still a placeholder
-    // past this block (6C). `--section` is not one of `--role`'s global
-    // flags, so this pins that it is left for `list`'s own section rather
-    // than rejected here.
+    // show is real as of block 6A, resume/status as of block 6B, list/refs
+    // as of block 6C, so this test (from block 4A, retargeted at 4C, 6A,
+    // 6B, and now again here) moves to the one command this change never
+    // builds — search (7.2), still a placeholder past section 6.
+    // `--section` is not one of `--role`'s global flags, so this pins that
+    // it is left for `search`'s own section rather than rejected here.
     try expectRun(
         std.testing.allocator,
-        &.{ "--log", "DEVLOG.jsonl", "list", "--section", "6" },
+        &.{ "--log", "DEVLOG.jsonl", "search", "--section", "6" },
         1,
         null,
-        "'list' is not implemented yet",
+        "'search' is not implemented yet",
     );
 }
 
 test "--log and --role are recognised in any position relative to the command" {
     try expectRun(
         std.testing.allocator,
-        &.{ "list", "--log", "DEVLOG.jsonl", "--role", "architect" },
+        &.{ "search", "--log", "DEVLOG.jsonl", "--role", "architect" },
         1,
         null,
-        "'list' is not implemented yet",
+        "'search' is not implemented yet",
     );
 }
 
@@ -5824,4 +6204,711 @@ test "resume --help and status --help each print their own usage" {
     try expectRun(std.testing.allocator, &.{ "resume", "--help" }, 0, "--role", null);
     try expectRun(std.testing.allocator, &.{ "status", "--help" }, 0, "devlog status", null);
     try expectRun(std.testing.allocator, &.{ "status", "--help" }, 0, "--json", null);
+}
+
+// --- Block 6C: `list` (6.3) and `refs` (6.4) --------------------------------
+
+/// Owned copies of one `run` call's stdout/stderr, so a seeded-fixture test
+/// can inspect them after the tmp dir and writers that produced them go out
+/// of scope — `expectRun` above has no seeding hook, and every `list`/
+/// `refs` test below needs one, so this is `expectRun`'s seeded sibling
+/// rather than sixteen copies of the same tmp-dir/stdin-standin/writer
+/// boilerplate `show`'s and `resume`'s own fixtured tests already repeat
+/// inline.
+const RunResult = struct {
+    code: u8,
+    stdout: []u8,
+    stderr: []u8,
+
+    fn deinit(self: *RunResult, allocator: Allocator) void {
+        allocator.free(self.stdout);
+        allocator.free(self.stderr);
+    }
+};
+
+fn runSeeded(
+    allocator: Allocator,
+    seed: *const fn (Allocator, Io.Dir, Io, *record.Diagnostics) anyerror!void,
+    args: []const [:0]const u8,
+) !RunResult {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var diag: record.Diagnostics = .init(allocator);
+    defer diag.deinit();
+    try seed(allocator, tmp.dir, std.testing.io, &diag);
+
+    var stdin_file = try openStdinStandin(tmp.dir, std.testing.io, "");
+    defer stdin_file.close(std.testing.io);
+    var out: Io.Writer.Allocating = .init(allocator);
+    defer out.deinit();
+    var err_out: Io.Writer.Allocating = .init(allocator);
+    defer err_out.deinit();
+
+    const code = run(allocator, std.testing.io, tmp.dir, stdin_file, test_ts, args, &out.writer, &err_out.writer);
+    return .{
+        .code = code,
+        .stdout = try allocator.dupe(u8, out.written()),
+        .stderr = try allocator.dupe(u8, err_out.written()),
+    };
+}
+
+/// Spans every dimension `6.3` filters by and both halves `6.4` needs to
+/// tell apart: a real structured reference vs. the same identifier merely
+/// mentioned in prose. Deliberately leaves `section`/`block`/`to` unset on
+/// some records (the `post`/`close`/`next` below) — block 6B's own hazard,
+/// one field over — so a filter's guard against an absent field is
+/// exercised by ordinary fixture diversity rather than a contrived
+/// hand-written log line.
+///
+/// Records, in append order (kind, section/block, role, to):
+///   1. post    section 4, block 4.1-4.3        architect          ref D:1
+///   2. post    (none)                          worker             mentions "D7" in prose, no ref
+///   3. brief   section 6, block 6C   -> worker  architect          ref D:7 (the real one)
+///   4. post    section 9, block 6C              reviewer           ref D:10 (same label, other section)
+///   5. item #1 section 6, block 6C   -> architect  worker  blocking, open
+///   6. item #2 section 4, block 4.1-4.3 -> worker  architect  non-blocking, resolved (closed below)
+///   7. close   (none)                           architect          closes #2
+///   8. item #3 section 6, block 6A   -> reviewer  worker  non-blocking, open
+///   9. item #4 section 6, block 6C   -> architect  worker  blocking, deferred (closed below)
+///  10. close   (none)                           architect          closes #4
+///  11. verdict section 6, block 6C              reviewer
+///  12. next    (none)                           architect
+fn seedListFixture(allocator: Allocator, dir: Io.Dir, io: Io, diag: *record.Diagnostics) !void {
+    _ = try log.appendHeader(
+        allocator,
+        io,
+        dir,
+        "DEVLOG.jsonl",
+        "t0",
+        "devlog 0.1.0",
+        .{ .change = "x", .roles = &.{ "architect", "worker", "reviewer" }, .closers = &.{"architect"} },
+        diag,
+    );
+
+    _ = try log.appendRecord(allocator, io, dir, "DEVLOG.jsonl", record.Record{ .post = .{
+        .common = .{
+            .seq = 0,
+            .ts = "t1",
+            .role = "architect",
+            .section = "4",
+            .block = "4.1-4.3",
+            .refs = &.{.{ .ns = "D", .id = "1" }},
+            .body = "opened section 4 with D1 in mind",
+        },
+    } }, diag);
+
+    _ = try log.appendRecord(allocator, io, dir, "DEVLOG.jsonl", record.Record{ .post = .{
+        .common = .{
+            .seq = 0,
+            .ts = "t2",
+            .role = "worker",
+            .body = "reminds me of D7, but that's just prose, no structured reference here",
+        },
+    } }, diag);
+
+    _ = try log.appendRecord(allocator, io, dir, "DEVLOG.jsonl", record.Record{ .brief = .{
+        .common = .{
+            .seq = 0,
+            .ts = "t3",
+            .role = "architect",
+            .section = "6",
+            .block = "6C",
+            .to = "worker",
+            .refs = &.{.{ .ns = "D", .id = "7" }},
+            .body = "brief for 6C, genuinely referencing D7",
+        },
+    } }, diag);
+
+    _ = try log.appendRecord(allocator, io, dir, "DEVLOG.jsonl", record.Record{ .post = .{
+        .common = .{
+            .seq = 0,
+            .ts = "t4",
+            .role = "reviewer",
+            .section = "9",
+            .block = "6C",
+            .refs = &.{.{ .ns = "D", .id = "10" }},
+            .body = "unrelated section nine, same block label",
+        },
+    } }, diag);
+
+    _ = try log.appendItem(allocator, io, dir, "DEVLOG.jsonl", record.Record{ .item = .{
+        .common = .{
+            .seq = 0,
+            .ts = "t5",
+            .role = "worker",
+            .section = "6",
+            .block = "6C",
+            .to = "architect",
+            .body = "blocking question for 6C",
+        },
+        .item = 0,
+        .type = .question,
+        .blocking = true,
+    } }, diag);
+
+    _ = try log.appendItem(allocator, io, dir, "DEVLOG.jsonl", record.Record{ .item = .{
+        .common = .{
+            .seq = 0,
+            .ts = "t6",
+            .role = "architect",
+            .section = "4",
+            .block = "4.1-4.3",
+            .to = "worker",
+            .body = "non-blocking finding for 4.1-4.3",
+        },
+        .item = 0,
+        .type = .finding,
+        .blocking = false,
+    } }, diag);
+    _ = try log.appendRecord(allocator, io, dir, "DEVLOG.jsonl", record.Record{ .close = .{
+        .common = .{ .seq = 0, .ts = "t7", .role = "architect", .body = "closed, addressed" },
+        .item = 2,
+        .state = .resolved,
+    } }, diag);
+
+    _ = try log.appendItem(allocator, io, dir, "DEVLOG.jsonl", record.Record{ .item = .{
+        .common = .{
+            .seq = 0,
+            .ts = "t8",
+            .role = "worker",
+            .section = "6",
+            .block = "6A",
+            .to = "reviewer",
+            .body = "open nit for 6A",
+        },
+        .item = 0,
+        .type = .finding,
+        .blocking = false,
+    } }, diag);
+
+    _ = try log.appendItem(allocator, io, dir, "DEVLOG.jsonl", record.Record{ .item = .{
+        .common = .{
+            .seq = 0,
+            .ts = "t9",
+            .role = "worker",
+            .section = "6",
+            .block = "6C",
+            .to = "architect",
+            .body = "blocking but later deferred",
+        },
+        .item = 0,
+        .type = .task,
+        .blocking = true,
+    } }, diag);
+    _ = try log.appendRecord(allocator, io, dir, "DEVLOG.jsonl", record.Record{ .close = .{
+        .common = .{ .seq = 0, .ts = "t10", .role = "architect", .body = "superseded by later work" },
+        .item = 4,
+        .state = .deferred,
+    } }, diag);
+
+    _ = try log.appendRecord(allocator, io, dir, "DEVLOG.jsonl", record.Record{ .verdict = .{
+        .common = .{ .seq = 0, .ts = "t11", .role = "reviewer", .section = "6", .block = "6C", .body = "block 6C looks good" },
+        .outcome = .approve,
+        .commit = "abc123",
+    } }, diag);
+
+    _ = try log.appendRecord(allocator, io, dir, "DEVLOG.jsonl", record.Record{ .next = .{
+        .common = .{ .seq = 0, .ts = "t12", .role = "architect", .body = "resume at 6C" },
+    } }, diag);
+}
+
+test "list with no filters returns every record from the positional slice, in log order (carried 16)" {
+    var result = try runSeeded(std.testing.allocator, seedListFixture, &.{ "--log", "DEVLOG.jsonl", "list" });
+    defer result.deinit(std.testing.allocator);
+    try std.testing.expectEqual(@as(u8, 0), result.code);
+
+    const text = result.stdout;
+    const pos_header = std.mem.indexOf(u8, text, "kind: header") orelse return error.TestUnexpectedResult;
+    const pos_post1 = std.mem.indexOf(u8, text, "opened section 4 with D1") orelse return error.TestUnexpectedResult;
+    const pos_post2 = std.mem.indexOf(u8, text, "reminds me of D7") orelse return error.TestUnexpectedResult;
+    const pos_brief = std.mem.indexOf(u8, text, "brief for 6C") orelse return error.TestUnexpectedResult;
+    const pos_post3 = std.mem.indexOf(u8, text, "unrelated section nine") orelse return error.TestUnexpectedResult;
+    const pos_next = std.mem.indexOf(u8, text, "resume at 6C") orelse return error.TestUnexpectedResult;
+    try std.testing.expect(pos_header < pos_post1);
+    try std.testing.expect(pos_post1 < pos_post2);
+    try std.testing.expect(pos_post2 < pos_brief);
+    try std.testing.expect(pos_brief < pos_post3);
+    try std.testing.expect(pos_post3 < pos_next);
+}
+
+test "list --kind item is a single-filter key lookup: only item records, in log order" {
+    var result = try runSeeded(std.testing.allocator, seedListFixture, &.{ "--log", "DEVLOG.jsonl", "list", "--kind", "item" });
+    defer result.deinit(std.testing.allocator);
+    try std.testing.expectEqual(@as(u8, 0), result.code);
+
+    const text = result.stdout;
+    try std.testing.expect(std.mem.indexOf(u8, text, "blocking question for 6C") != null);
+    try std.testing.expect(std.mem.indexOf(u8, text, "non-blocking finding") != null);
+    try std.testing.expect(std.mem.indexOf(u8, text, "open nit for 6A") != null);
+    try std.testing.expect(std.mem.indexOf(u8, text, "blocking but later deferred") != null);
+    // Every other kind is absent — this is the item *records*, not a
+    // narrowing to items (`--kind item` alone does not imply `--state`).
+    try std.testing.expect(std.mem.indexOf(u8, text, "opened section 4") == null);
+    try std.testing.expect(std.mem.indexOf(u8, text, "brief for 6C") == null);
+    try std.testing.expect(std.mem.indexOf(u8, text, "block 6C looks good") == null);
+    try std.testing.expect(std.mem.indexOf(u8, text, "resume at 6C") == null);
+}
+
+test "list --section 6 is a single-filter key lookup: every record concerning that section" {
+    var result = try runSeeded(std.testing.allocator, seedListFixture, &.{ "--log", "DEVLOG.jsonl", "list", "--section", "6" });
+    defer result.deinit(std.testing.allocator);
+    try std.testing.expectEqual(@as(u8, 0), result.code);
+
+    const text = result.stdout;
+    try std.testing.expect(std.mem.indexOf(u8, text, "brief for 6C") != null);
+    try std.testing.expect(std.mem.indexOf(u8, text, "blocking question for 6C") != null);
+    try std.testing.expect(std.mem.indexOf(u8, text, "open nit for 6A") != null);
+    try std.testing.expect(std.mem.indexOf(u8, text, "blocking but later deferred") != null);
+    try std.testing.expect(std.mem.indexOf(u8, text, "block 6C looks good") != null);
+    // Section 4's and section 9's records, and the two records with no
+    // section at all, are excluded.
+    try std.testing.expect(std.mem.indexOf(u8, text, "opened section 4") == null);
+    try std.testing.expect(std.mem.indexOf(u8, text, "non-blocking finding") == null);
+    try std.testing.expect(std.mem.indexOf(u8, text, "unrelated section nine") == null);
+    try std.testing.expect(std.mem.indexOf(u8, text, "reminds me of D7") == null);
+    try std.testing.expect(std.mem.indexOf(u8, text, "resume at 6C") == null);
+}
+
+test "list --block 6C alone matches by label and spans sections (the rename's own ruling)" {
+    var result = try runSeeded(std.testing.allocator, seedListFixture, &.{ "--log", "DEVLOG.jsonl", "list", "--block", "6C" });
+    defer result.deinit(std.testing.allocator);
+    try std.testing.expectEqual(@as(u8, 0), result.code);
+
+    const text = result.stdout;
+    // Section 6's block 6C records...
+    try std.testing.expect(std.mem.indexOf(u8, text, "brief for 6C") != null);
+    try std.testing.expect(std.mem.indexOf(u8, text, "blocking question for 6C") != null);
+    try std.testing.expect(std.mem.indexOf(u8, text, "block 6C looks good") != null);
+    // ...and section 9's, same label, different section — proving the span.
+    try std.testing.expect(std.mem.indexOf(u8, text, "unrelated section nine") != null);
+    // Block 6A and block 4.1-4.3 records are excluded — different labels.
+    try std.testing.expect(std.mem.indexOf(u8, text, "open nit for 6A") == null);
+    try std.testing.expect(std.mem.indexOf(u8, text, "opened section 4") == null);
+}
+
+test "list --section 6 --block 6C is the intersection — excludes section 9's same-labelled block" {
+    var result = try runSeeded(std.testing.allocator, seedListFixture, &.{
+        "--log", "DEVLOG.jsonl", "list", "--section", "6", "--block", "6C",
+    });
+    defer result.deinit(std.testing.allocator);
+    try std.testing.expectEqual(@as(u8, 0), result.code);
+
+    const text = result.stdout;
+    try std.testing.expect(std.mem.indexOf(u8, text, "brief for 6C") != null);
+    try std.testing.expect(std.mem.indexOf(u8, text, "blocking question for 6C") != null);
+    try std.testing.expect(std.mem.indexOf(u8, text, "block 6C looks good") != null);
+    // The section-5 close ruling's own scenario: same block label, wrong
+    // section, excluded once --section narrows the intersection.
+    try std.testing.expect(std.mem.indexOf(u8, text, "unrelated section nine") == null);
+}
+
+test "list --role and --to are each a single-filter key lookup, by author and by addressee" {
+    {
+        var result = try runSeeded(std.testing.allocator, seedListFixture, &.{ "--log", "DEVLOG.jsonl", "list", "--role", "reviewer" });
+        defer result.deinit(std.testing.allocator);
+        try std.testing.expectEqual(@as(u8, 0), result.code);
+        const text = result.stdout;
+        try std.testing.expect(std.mem.indexOf(u8, text, "unrelated section nine") != null);
+        try std.testing.expect(std.mem.indexOf(u8, text, "block 6C looks good") != null);
+        try std.testing.expect(std.mem.indexOf(u8, text, "opened section 4") == null);
+        try std.testing.expect(std.mem.indexOf(u8, text, "brief for 6C") == null);
+    }
+    {
+        var result = try runSeeded(std.testing.allocator, seedListFixture, &.{ "--log", "DEVLOG.jsonl", "list", "--to", "worker" });
+        defer result.deinit(std.testing.allocator);
+        try std.testing.expectEqual(@as(u8, 0), result.code);
+        const text = result.stdout;
+        // The brief and item #2's own record are both addressed to worker.
+        try std.testing.expect(std.mem.indexOf(u8, text, "brief for 6C") != null);
+        try std.testing.expect(std.mem.indexOf(u8, text, "non-blocking finding") != null);
+        try std.testing.expect(std.mem.indexOf(u8, text, "blocking question for 6C") == null);
+    }
+}
+
+test "list --role and --section together is an intersection, sorted by seq (carried 16)" {
+    var result = try runSeeded(std.testing.allocator, seedListFixture, &.{
+        "--log", "DEVLOG.jsonl", "list", "--role", "worker", "--section", "6",
+    });
+    defer result.deinit(std.testing.allocator);
+    try std.testing.expectEqual(@as(u8, 0), result.code);
+
+    const text = result.stdout;
+    // worker authored the section-6 item records (#1, #3, #4's opening
+    // record) but not the section-6 brief (architect) or verdict
+    // (reviewer) — the intersection, in ascending seq (append) order.
+    const pos_1 = std.mem.indexOf(u8, text, "blocking question for 6C") orelse return error.TestUnexpectedResult;
+    const pos_3 = std.mem.indexOf(u8, text, "open nit for 6A") orelse return error.TestUnexpectedResult;
+    const pos_4 = std.mem.indexOf(u8, text, "blocking but later deferred") orelse return error.TestUnexpectedResult;
+    try std.testing.expect(pos_1 < pos_3);
+    try std.testing.expect(pos_3 < pos_4);
+    try std.testing.expect(std.mem.indexOf(u8, text, "brief for 6C") == null);
+    try std.testing.expect(std.mem.indexOf(u8, text, "block 6C looks good") == null);
+}
+
+test "list --state open narrows the result to items, blocking and non-blocking alike (ruling)" {
+    var result = try runSeeded(std.testing.allocator, seedListFixture, &.{ "--log", "DEVLOG.jsonl", "list", "--state", "open" });
+    defer result.deinit(std.testing.allocator);
+    try std.testing.expectEqual(@as(u8, 0), result.code);
+
+    const text = result.stdout;
+    // #1 (blocking, open) and #3 (non-blocking, open) — #2 (resolved) and
+    // #4 (deferred) are excluded.
+    try std.testing.expect(std.mem.indexOf(u8, text, "blocking question for 6C") != null);
+    try std.testing.expect(std.mem.indexOf(u8, text, "open nit for 6A") != null);
+    try std.testing.expect(std.mem.indexOf(u8, text, "non-blocking finding") == null);
+    try std.testing.expect(std.mem.indexOf(u8, text, "blocking but later deferred") == null);
+    // Narrowed to items: no raw records (brief/post/verdict bodies) leak
+    // into an item-shaped result.
+    try std.testing.expect(std.mem.indexOf(u8, text, "brief for 6C") == null);
+    try std.testing.expect(std.mem.indexOf(u8, text, "block 6C looks good") == null);
+    try std.testing.expect(std.mem.indexOf(u8, text, "items (2):") != null);
+}
+
+test "list --blocking narrows to items regardless of state — there is no --no-blocking" {
+    var result = try runSeeded(std.testing.allocator, seedListFixture, &.{ "--log", "DEVLOG.jsonl", "list", "--blocking" });
+    defer result.deinit(std.testing.allocator);
+    try std.testing.expectEqual(@as(u8, 0), result.code);
+
+    const text = result.stdout;
+    // #1 (open, blocking) and #4 (deferred, blocking) both qualify —
+    // #4 proves --blocking alone is not implicitly --state open.
+    try std.testing.expect(std.mem.indexOf(u8, text, "blocking question for 6C") != null);
+    try std.testing.expect(std.mem.indexOf(u8, text, "blocking but later deferred") != null);
+    try std.testing.expect(std.mem.indexOf(u8, text, "open nit for 6A") == null);
+    try std.testing.expect(std.mem.indexOf(u8, text, "non-blocking finding") == null);
+}
+
+test "list --state open --blocking combines with AND: only the open, blocking item" {
+    var result = try runSeeded(std.testing.allocator, seedListFixture, &.{
+        "--log", "DEVLOG.jsonl", "list", "--state", "open", "--blocking",
+    });
+    defer result.deinit(std.testing.allocator);
+    try std.testing.expectEqual(@as(u8, 0), result.code);
+
+    const text = result.stdout;
+    try std.testing.expect(std.mem.indexOf(u8, text, "items (1):") != null);
+    try std.testing.expect(std.mem.indexOf(u8, text, "blocking question for 6C") != null);
+    try std.testing.expect(std.mem.indexOf(u8, text, "blocking but later deferred") == null);
+    try std.testing.expect(std.mem.indexOf(u8, text, "open nit for 6A") == null);
+}
+
+test "list --kind item alongside --state is allowed (redundant, not a conflict)" {
+    var result = try runSeeded(std.testing.allocator, seedListFixture, &.{
+        "--log", "DEVLOG.jsonl", "list", "--kind", "item", "--state", "open",
+    });
+    defer result.deinit(std.testing.allocator);
+    try std.testing.expectEqual(@as(u8, 0), result.code);
+    try std.testing.expect(std.mem.indexOf(u8, result.stdout, "items (2):") != null);
+}
+
+test "list --kind naming anything but 'item' alongside --state or --blocking is a refusal, not an empty success (ruling, A6)" {
+    // Both fire before the read-only load ever touches the filesystem
+    // (A3) — run against an empty dir, no header ever written, and prove
+    // nothing was created.
+    {
+        var out: Io.Writer.Allocating = .init(std.testing.allocator);
+        defer out.deinit();
+        var err_out: Io.Writer.Allocating = .init(std.testing.allocator);
+        defer err_out.deinit();
+        var tmp = std.testing.tmpDir(.{});
+        defer tmp.cleanup();
+        var stdin_file = try openStdinStandin(tmp.dir, std.testing.io, "");
+        defer stdin_file.close(std.testing.io);
+        const code = run(
+            std.testing.allocator,
+            std.testing.io,
+            tmp.dir,
+            stdin_file,
+            test_ts,
+            &.{ "--log", "DEVLOG.jsonl", "list", "--kind", "post", "--state", "open" },
+            &out.writer,
+            &err_out.writer,
+        );
+        try std.testing.expectEqual(@as(u8, 1), code);
+        try std.testing.expect(std.mem.indexOf(u8, err_out.written(), "cannot be combined") != null);
+        var count: usize = 0;
+        var it = tmp.dir.iterate();
+        while (try it.next(std.testing.io)) |entry| {
+            try std.testing.expectEqualStrings("stdin-standin", entry.name);
+            count += 1;
+        }
+        try std.testing.expectEqual(@as(usize, 1), count);
+    }
+    {
+        var out: Io.Writer.Allocating = .init(std.testing.allocator);
+        defer out.deinit();
+        var err_out: Io.Writer.Allocating = .init(std.testing.allocator);
+        defer err_out.deinit();
+        var tmp = std.testing.tmpDir(.{});
+        defer tmp.cleanup();
+        var stdin_file = try openStdinStandin(tmp.dir, std.testing.io, "");
+        defer stdin_file.close(std.testing.io);
+        const code = run(
+            std.testing.allocator,
+            std.testing.io,
+            tmp.dir,
+            stdin_file,
+            test_ts,
+            &.{ "--log", "DEVLOG.jsonl", "list", "--kind", "verdict", "--blocking" },
+            &out.writer,
+            &err_out.writer,
+        );
+        try std.testing.expectEqual(@as(u8, 1), code);
+        try std.testing.expect(std.mem.indexOf(u8, err_out.written(), "cannot be combined") != null);
+    }
+}
+
+test "list --kind with an unrecognised value is refused, naming the permitted set" {
+    try expectRun(
+        std.testing.allocator,
+        &.{ "--log", "DEVLOG.jsonl", "list", "--kind", "bogus" },
+        1,
+        null,
+        "--kind 'bogus' must be one of",
+    );
+}
+
+test "list --state with an unrecognised value is refused, naming the permitted set" {
+    try expectRun(
+        std.testing.allocator,
+        &.{ "--log", "DEVLOG.jsonl", "list", "--state", "bogus" },
+        1,
+        null,
+        "--state 'bogus' must be one of",
+    );
+}
+
+test "list with no matches is an ordinary empty success, in both forms (not a refusal)" {
+    {
+        var result = try runSeeded(std.testing.allocator, seedListFixture, &.{ "--log", "DEVLOG.jsonl", "list", "--section", "999" });
+        defer result.deinit(std.testing.allocator);
+        try std.testing.expectEqual(@as(u8, 0), result.code);
+        try std.testing.expect(std.mem.indexOf(u8, result.stdout, "records (0):") != null);
+        try std.testing.expect(std.mem.indexOf(u8, result.stdout, "(none)") != null);
+    }
+    {
+        var result = try runSeeded(std.testing.allocator, seedListFixture, &.{ "--log", "DEVLOG.jsonl", "list", "--section", "999", "--json" });
+        defer result.deinit(std.testing.allocator);
+        try std.testing.expectEqual(@as(u8, 0), result.code);
+        try std.testing.expectEqualStrings("[]\n", result.stdout);
+    }
+}
+
+test "list --json is a bare array, parity-checked against the text form (D15)" {
+    var result = try runSeeded(std.testing.allocator, seedListFixture, &.{ "--log", "DEVLOG.jsonl", "list", "--kind", "item" });
+    defer result.deinit(std.testing.allocator);
+
+    var json_result = try runSeeded(std.testing.allocator, seedListFixture, &.{ "--log", "DEVLOG.jsonl", "list", "--kind", "item", "--json" });
+    defer json_result.deinit(std.testing.allocator);
+    try std.testing.expectEqual(@as(u8, 0), json_result.code);
+
+    var parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, json_result.stdout, .{});
+    defer parsed.deinit();
+    const arr = parsed.value.array;
+    try std.testing.expectEqual(@as(usize, 4), arr.items.len);
+    for (arr.items) |v| {
+        try std.testing.expectEqualStrings("item", v.object.get("kind").?.string);
+    }
+    // Same bodies reachable in both forms.
+    try std.testing.expect(std.mem.indexOf(u8, result.stdout, "blocking question for 6C") != null);
+    try std.testing.expectEqualStrings("blocking question for 6C", arr.items[0].object.get("body").?.string);
+}
+
+test "list against a missing log reports plainly, exits non-zero, and creates nothing (durable-format)" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var stdin_file = try openStdinStandin(tmp.dir, std.testing.io, "");
+    defer stdin_file.close(std.testing.io);
+    var out: Io.Writer.Allocating = .init(std.testing.allocator);
+    defer out.deinit();
+    var err_out: Io.Writer.Allocating = .init(std.testing.allocator);
+    defer err_out.deinit();
+
+    const code = run(
+        std.testing.allocator,
+        std.testing.io,
+        tmp.dir,
+        stdin_file,
+        test_ts,
+        &.{ "--log", "DEVLOG.jsonl", "list" },
+        &out.writer,
+        &err_out.writer,
+    );
+    try std.testing.expectEqual(@as(u8, 1), code);
+    try std.testing.expect(std.mem.indexOf(u8, err_out.written(), "devlog header") != null);
+
+    var count: usize = 0;
+    var it = tmp.dir.iterate();
+    while (try it.next(std.testing.io)) |entry| {
+        try std.testing.expectEqualStrings("stdin-standin", entry.name);
+        count += 1;
+    }
+    try std.testing.expectEqual(@as(usize, 1), count);
+}
+
+test "list --help prints its own usage, naming the --block and AND-combination semantics" {
+    try expectRun(std.testing.allocator, &.{ "list", "--help" }, 0, "devlog list", null);
+    try expectRun(std.testing.allocator, &.{ "list", "--help" }, 0, "matches by label and may span", null);
+    try expectRun(std.testing.allocator, &.{ "list", "--help" }, 0, "filters combine", null);
+}
+
+test "refs returns every record carrying the exact reference, and only those" {
+    var result = try runSeeded(std.testing.allocator, seedListFixture, &.{ "--log", "DEVLOG.jsonl", "refs", "--ref", "D:7" });
+    defer result.deinit(std.testing.allocator);
+    try std.testing.expectEqual(@as(u8, 0), result.code);
+
+    const text = result.stdout;
+    try std.testing.expect(std.mem.indexOf(u8, text, "records (1):") != null);
+    try std.testing.expect(std.mem.indexOf(u8, text, "brief for 6C") != null);
+}
+
+test "refs excludes a record that merely mentions the identifier in prose without recording it as a reference (external-references' negative half, 6.4)" {
+    var result = try runSeeded(std.testing.allocator, seedListFixture, &.{ "--log", "DEVLOG.jsonl", "refs", "--ref", "D:7" });
+    defer result.deinit(std.testing.allocator);
+    try std.testing.expectEqual(@as(u8, 0), result.code);
+
+    // The second post's body contains the literal "D7" in prose but was
+    // never given `--ref D:7` at write time — a prose-scanning
+    // implementation would pass every other test in this block and fail
+    // only this one.
+    try std.testing.expect(std.mem.indexOf(u8, result.stdout, "reminds me of D7") == null);
+}
+
+test "refs is an exact match on the (ns, id) pair, never a prefix" {
+    var result = try runSeeded(std.testing.allocator, seedListFixture, &.{ "--log", "DEVLOG.jsonl", "refs", "--ref", "D:1" });
+    defer result.deinit(std.testing.allocator);
+    try std.testing.expectEqual(@as(u8, 0), result.code);
+
+    const text = result.stdout;
+    try std.testing.expect(std.mem.indexOf(u8, text, "opened section 4 with D1") != null);
+    // D:10 must not match a D:1 query.
+    try std.testing.expect(std.mem.indexOf(u8, text, "unrelated section nine") == null);
+}
+
+test "refs requires --ref, refused before the read-only load, nothing created" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var stdin_file = try openStdinStandin(tmp.dir, std.testing.io, "");
+    defer stdin_file.close(std.testing.io);
+    var out: Io.Writer.Allocating = .init(std.testing.allocator);
+    defer out.deinit();
+    var err_out: Io.Writer.Allocating = .init(std.testing.allocator);
+    defer err_out.deinit();
+
+    const code = run(
+        std.testing.allocator,
+        std.testing.io,
+        tmp.dir,
+        stdin_file,
+        test_ts,
+        &.{ "--log", "DEVLOG.jsonl", "refs" },
+        &out.writer,
+        &err_out.writer,
+    );
+    try std.testing.expectEqual(@as(u8, 1), code);
+    try std.testing.expect(std.mem.indexOf(u8, err_out.written(), "requires --ref") != null);
+
+    var count: usize = 0;
+    var it = tmp.dir.iterate();
+    while (try it.next(std.testing.io)) |entry| {
+        try std.testing.expectEqualStrings("stdin-standin", entry.name);
+        count += 1;
+    }
+    try std.testing.expectEqual(@as(usize, 1), count);
+}
+
+test "refs takes exactly one --ref, refused when given twice, before the read-only load" {
+    try expectRun(
+        std.testing.allocator,
+        &.{ "--log", "DEVLOG.jsonl", "refs", "--ref", "D:1", "--ref", "D:2" },
+        1,
+        null,
+        "exactly one",
+    );
+}
+
+test "refs reuses section 4's --ref parsing and its malformation fault, not a second parser (A6)" {
+    try expectRun(
+        std.testing.allocator,
+        &.{ "--log", "DEVLOG.jsonl", "refs", "--ref", "no-colon-here" },
+        1,
+        null,
+        "malformed",
+    );
+    try expectRun(
+        std.testing.allocator,
+        &.{ "--log", "DEVLOG.jsonl", "refs", "--ref", ":2" },
+        1,
+        null,
+        "malformed",
+    );
+}
+
+test "refs for a reference no record carries is an ordinary empty success, in both forms" {
+    {
+        var result = try runSeeded(std.testing.allocator, seedListFixture, &.{ "--log", "DEVLOG.jsonl", "refs", "--ref", "Z:nope" });
+        defer result.deinit(std.testing.allocator);
+        try std.testing.expectEqual(@as(u8, 0), result.code);
+        try std.testing.expect(std.mem.indexOf(u8, result.stdout, "records (0):") != null);
+    }
+    {
+        var result = try runSeeded(std.testing.allocator, seedListFixture, &.{ "--log", "DEVLOG.jsonl", "refs", "--ref", "Z:nope", "--json" });
+        defer result.deinit(std.testing.allocator);
+        try std.testing.expectEqual(@as(u8, 0), result.code);
+        try std.testing.expectEqualStrings("[]\n", result.stdout);
+    }
+}
+
+test "refs --json is a bare array, parity-checked against the text form (D15)" {
+    var result = try runSeeded(std.testing.allocator, seedListFixture, &.{ "--log", "DEVLOG.jsonl", "refs", "--ref", "D:7" });
+    defer result.deinit(std.testing.allocator);
+
+    var json_result = try runSeeded(std.testing.allocator, seedListFixture, &.{ "--log", "DEVLOG.jsonl", "refs", "--ref", "D:7", "--json" });
+    defer json_result.deinit(std.testing.allocator);
+    try std.testing.expectEqual(@as(u8, 0), json_result.code);
+
+    var parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, json_result.stdout, .{});
+    defer parsed.deinit();
+    const arr = parsed.value.array;
+    try std.testing.expectEqual(@as(usize, 1), arr.items.len);
+    try std.testing.expectEqualStrings("brief", arr.items[0].object.get("kind").?.string);
+    try std.testing.expectEqualStrings("brief for 6C, genuinely referencing D7", arr.items[0].object.get("body").?.string);
+    try std.testing.expect(std.mem.indexOf(u8, result.stdout, "brief for 6C, genuinely referencing D7") != null);
+}
+
+test "refs against a missing log reports plainly, exits non-zero, and creates nothing (durable-format)" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var stdin_file = try openStdinStandin(tmp.dir, std.testing.io, "");
+    defer stdin_file.close(std.testing.io);
+    var out: Io.Writer.Allocating = .init(std.testing.allocator);
+    defer out.deinit();
+    var err_out: Io.Writer.Allocating = .init(std.testing.allocator);
+    defer err_out.deinit();
+
+    const code = run(
+        std.testing.allocator,
+        std.testing.io,
+        tmp.dir,
+        stdin_file,
+        test_ts,
+        &.{ "--log", "DEVLOG.jsonl", "refs", "--ref", "D:1" },
+        &out.writer,
+        &err_out.writer,
+    );
+    try std.testing.expectEqual(@as(u8, 1), code);
+    try std.testing.expect(std.mem.indexOf(u8, err_out.written(), "devlog header") != null);
+
+    var count: usize = 0;
+    var it = tmp.dir.iterate();
+    while (try it.next(std.testing.io)) |entry| {
+        try std.testing.expectEqualStrings("stdin-standin", entry.name);
+        count += 1;
+    }
+    try std.testing.expectEqual(@as(usize, 1), count);
+}
+
+test "refs --help prints its own usage" {
+    try expectRun(std.testing.allocator, &.{ "refs", "--help" }, 0, "devlog refs", null);
+    try expectRun(std.testing.allocator, &.{ "refs", "--help" }, 0, "--ref", null);
 }
