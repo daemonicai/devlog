@@ -7698,6 +7698,77 @@ the worker reported — the with-close path keeps its coverage, the empty path g
 
 Block 6A (`6.6`, `6.2`) is clear to commit and tick.
 
+**[architect]** **Block 6A landed** — `6.6` and `6.2` ticked, one commit (`778acb6`). Gates re-run by me:
+`BUILD_EXIT:0`, `TEST_EXIT:0`, `FORMAT_EXIT:0`, `VALIDATE_EXIT:0`, `GATES_EXIT:0`. **201** tests —
+counted, not quoted. Carried items **10**, **13**, **16** and **17** all discharged here, as the brief
+required.
+
+**The confirmation round earned its cost.** Both new fixture sets were proved by mutation rather than by
+reading: deleting the `commit` line from `renderRecordText`'s `.verdict` branch — the exact D15 divergence
+where text drops a field JSON still carries — failed exactly one test, the right one. That is the
+difference between "there are tests" and "the tests would catch the thing they exist to catch", and it is
+now this change's most reliable review technique.
+
+**[architect]** **Brief — block 6B (`6.1`, `6.5`) → @worker.**
+
+**Tasks.**
+
+- `6.1` `devlog resume --role <r>` — current NEXT narrative, open items addressed to that role, and the
+  latest brief for its block; bounded by what is open, not by history (D8, `log-retrieval`).
+- `6.5` `devlog status` — the rendered current state: NEXT narrative plus open items, with blocking items
+  distinguishable (`next-state`).
+
+Both are declared commands with `"not implemented yet"` stubs today (`src/main.zig:263`, `:267`); this
+block makes them real. Everything they render already exists in `src/state.zig` — this is rendering, not
+new derivation. If you find yourself deriving something here, stop and say so.
+
+**These two commands overlap, and that overlap is the block's main design risk.** `status` is NEXT plus
+the open items; `resume` is NEXT plus the open items *addressed to one role*, plus that role's latest
+brief. **Write one renderer for "NEXT narrative plus a set of items", parameterised**, not two that drift.
+D15 already forbids the text and JSON forms diverging; two hand-written item renderers would let `status`
+and `resume` disagree about the same item, which is the same failure one level up.
+
+**Ruling — what "the latest brief for its block" means (`6.1`), decided now rather than in review.** D8
+says `resume` returns three things but not how the role's block is found. Implement it as:
+
+1. **The role's block is the block of the most recent `brief` record addressed to that role** (`to ==
+   role`). That is the block the role was last put to work on, which is what an agent resuming cold needs.
+2. **Then return the latest brief for *that block*** — which is not necessarily the brief found in step 1.
+   A remediation brief for the same block addressed to someone else is later and more current, and an
+   agent resuming on stale instructions is exactly the failure `resume` exists to prevent.
+3. **Step 2 keys on the (`section`, `block`) pair**, per the section-5 close ruling — never the bare block
+   label. This is the site that ruling was written for: a label match would return another section's
+   brief.
+4. **If no brief is addressed to the role, there is no block.** `resume` returns NEXT and the open items
+   with the brief plainly absent — an ordinary state for a role that has not been briefed yet, not an
+   error and not an empty-string field.
+
+**Boundedness is a requirement, not a quality (`6.1`).** `log-retrieval`: *"The size of this read SHALL be
+bounded by what is currently open rather than by the length of the log's history"*, with its own scenario
+— *"the log has accumulated a large number of records but few items are open"* → *"the starting read
+remains small"*. Write the test that pins it: a log with many records and few open items, asserting the
+read's size tracks the open items rather than the history. Its sibling scenario, *"items open and
+addressed to other roles do not appear in this agent's starting read"*, needs a test too — the exclusion
+is the half that silently breaks.
+
+**`6.5` — blocking items must be distinguishable** (`next-state`'s third scenario), in **both**
+renderings. In text that is a visible marker; in JSON it is the field. And `next-state`'s *"closing an
+item changes what is presented"* scenario is a `status` test now that a command can show it: close an
+open item, and it is gone from the next `status` with no new NEXT recorded.
+
+**Carried 16 applies directly here and is easy to miss.** `byState(.open)` is a positional list, so it is
+safe; **`by_addressee` is a hash map**. If `resume` filters via that index, iterate in a stable order —
+by item number — rather than in map order. Unstable output would show up as a flaky diff, not as a wrong
+answer, which is the worst way to find it.
+
+**Constraints unchanged.** D15 — text by default, same content on `--json`, one derivation two renderers.
+Read path is `openReadOnly` from 6A; **never `openLocked`** — a read does not create and does not lock. A
+missing log reports plainly. Zig 0.16 against the real API. No new dependencies, nothing persisted.
+`--json` is a read-command flag only.
+
+**Done-gates.** `make gates` → `GATES_EXIT:0`, quoting every individual `LABEL_EXIT:<n>` line, and the
+counted test total. Then `→ @reviewer`. No commit, no ticks.
+
 ## NEXT
 
 **[architect]** **Section 5 is CLOSED** — supervisor `Approve` on the **first** pass, no remediation
