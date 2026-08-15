@@ -8219,6 +8219,91 @@ stays 215/215; no production code touched — `record.zig`, `state.zig`'s fix fr
 Only `src/main.zig` changed. No commit, no ticks. Per the architect's note above, no `→ @reviewer` — the
 architect verifies the diff and gates directly.
 
+**[architect]** **Verified the two additions myself, as I said I would.** Both are real content
+assertions, not "it printed something": the JSON is parsed and `next` asserted `.null` for **both**
+commands with exit `0` checked (`src/main.zig:5804-5818`), and `status --json`'s `blocking` is asserted
+`true`/`false`/`false` through the parsed tree (`:5565-5567`), matching the pattern `resume --json`
+already used. Gates re-run by me: `BUILD_EXIT:0`, `TEST_EXIT:0`, `FORMAT_EXIT:0`, `VALIDATE_EXIT:0`,
+`GATES_EXIT:0`, **215** tests.
+
+**Block 6B landed** — `6.1` and `6.5` ticked, one commit (`731b772`).
+
+**[architect]** **Brief — block 6C (`6.3`, `6.4`) → @worker. This closes section 6.**
+
+**Tasks.**
+
+- `6.3` `devlog list` with filters for section, block, role, kind, state, addressee, and blocking
+  (`log-retrieval`).
+- `6.4` `devlog refs --ref ns:id` — every record carrying that reference, exact match only, never a prose
+  scan (`external-references`).
+
+Both are declared commands with stubs today (`src/main.zig:306`, `:307`). Both are **index consumers** —
+section 5 built exactly the indexes they need, and 6A/6B built the read path and the renderers. If you
+find yourself deriving or re-scanning, stop and say so.
+
+**Carried 16 lands hardest here, and this is the block it was written for.** 6A looked up by key and 6B
+routed around the hash maps entirely. `list` cannot: it enumerates. The rule, concretely —
+
+- **A single filter on an indexed dimension is a key lookup**, returning one group already in log order.
+  Safe, and the reason the indexes exist.
+- **Combined filters are an intersection, and an intersection has no inherent order.** Sort the result by
+  `seq` before rendering. Log order is the only order this tool has ever promised and the only one that is
+  stable across runs.
+- **`list` with no filters must come from the positional records slice**, never from enumerating a map.
+  Enumerating a `StringHashMap` would produce a different order every run, which presents as a flaky diff
+  rather than a wrong answer — the worst way to find it.
+
+**Ruling — `--block`'s semantics, and the rename the section-5 close ordered.** Implement exactly:
+
+1. **Rename `by_block` → `by_block_label`** (`src/state.zig:184`, and `byBlock` → `byBlockLabel` at
+   `:203`). The name is the whole mitigation: `5.4`'s grid keys on the (`section`, `block`) pair because
+   that is block *identity*; this index keys on the bare label because `6.3` needs a label filter. Two
+   different questions that must never read as one concept.
+2. **`--block Y` alone matches by label and may span sections.** That is the honest meaning of the flag on
+   its own, and it is why the index exists.
+3. **`--section X --block Y` is the intersection** — which is exactly `BlockKey`, and is how you ask for
+   one identified block.
+4. **Say this in `list --help`**, in one line. A user who has to infer whether `--block` spans sections
+   will infer wrong.
+
+**Ruling — `--state` and `--blocking` are item-only filters, and they narrow the result to items.** The
+other dimensions (`section`, `block`, `role`, `kind`, `addressee`) apply to every record; `state` and
+`blocking` are properties only an item has. A `list --state open` that returned posts and verdicts
+"because they aren't not-open" would be nonsense. So: **either of those filters restricts the result to
+`item` records**, and `--kind` naming something other than `item` alongside them is a refusal, not an
+empty success — the same first-fault-wins shape as every other parse fault (A6). `--blocking` present
+means blocking only; absent means no filtering on it (there is no `--no-blocking` in this change).
+
+**Filters combine with AND** across dimensions. Say so in `--help`.
+
+**`6.4` — `refs`, and the requirement's negative half is the one that breaks silently.**
+`external-references`: *"every record carrying that reference is returned, **and records that merely
+mention the identifier in prose without recording it as a reference are not**"*. That second clause needs
+its own test — a record whose **body** contains the literal `D7` while carrying no `D7` ref, asserted
+absent from `refs --ref design:D7`. Without it, a prose-scanning implementation passes every other test in
+the block. `--ref` parsing and its malformation fault already exist from section 4; reuse them rather than
+writing a second parser. Exact match on the (`ns`, `id`) pair, never a prefix — `D1` must not match `D10`
+or `D100`, and section 5 already has a test proving the index does not collide, so this is about the
+command not undoing it.
+
+**D15 applies to both commands** — text by default, the same content on `--json`, one derivation and two
+renderers. Reuse 6A/6B's renderers; a list is a sequence of things that already know how to render
+themselves. An empty result is an ordinary success in both forms (exit `0`, an empty list), not a refusal
+and not an error.
+
+**Constraints unchanged.** `openReadOnly`, never `openLocked`. A missing log reports plainly. Zig 0.16
+against the real API. No new dependencies, nothing persisted. `--json` on read commands only.
+
+**On force-unwraps, since this block reads the same optional fields 6B did:** `section`, `block`, `to` and
+`refs` are optional on `Attributed` and **not** guaranteed present on a hand-written log. Guard them.
+6B's blocker was three `.?`s on write-boundary invariants, one of which aborted the process on a log this
+tool did not write. Do not reintroduce the pattern; a filter that skips a record lacking the field it
+filters on is correct here, because absence is a legitimate answer to "does this record match `--section
+6`?" — unlike `brief`, where the write path requires the field.
+
+**Done-gates.** `make gates` → `GATES_EXIT:0`, quoting every individual `LABEL_EXIT:<n>` line, and the
+counted test total. Then `→ @reviewer`. No commit, no ticks.
+
 ## NEXT
 
 **[architect]** **Section 5 is CLOSED** — supervisor `Approve` on the **first** pass, no remediation
