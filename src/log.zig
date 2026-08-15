@@ -741,12 +741,22 @@ fn checkRoleAllowed(records: []const record.Record, rec: record.Record, diag: ?*
 /// for the write-side refusal is stated in terms of exactly this read —
 /// "a record addressed to a misspelt role is addressed to nobody, and
 /// every derived per-role view … silently omits it" — which is precisely
-/// what `devlog resume --role <r>` and `devlog list --role`/`--to <r>`
-/// render. Unlike `checkRoleAllowed`, there is no `record.Record` on a
-/// read: only a bare value one of these flags carried, so this validates
-/// the value directly. `subject` selects both the message text and the
-/// error returned, mirroring `checkRoleAllowed`'s own two-case naming
-/// (`UndeclaredRole`/`UndeclaredTo`) rather than collapsing them into one.
+/// what `devlog resume --role <r>` renders: **identity**, so it is
+/// checked against the **latest** header, the same header a write would be
+/// checked against right now. Unlike `checkRoleAllowed`, there is no
+/// `record.Record` on a read: only a bare value one of these flags
+/// carried, so this validates the value directly. `subject` selects both
+/// the message text and the error returned, mirroring `checkRoleAllowed`'s
+/// own two-case naming (`UndeclaredRole`/`UndeclaredTo`) rather than
+/// collapsing them into one.
+///
+/// **Not used by `list`** — see `checkDeclaredValueHistory` below. `list
+/// --role`/`--to` filter history rather than assert an identity, and the
+/// latest header is the wrong vocabulary to validate history against
+/// (architect ruling, DEVLOG `## 6`, actioned after the section 6
+/// supervisor's re-review: this project's own `orchestrator` → `architect`
+/// retirement is the proof — `list --role orchestrator` must still find
+/// what that role actually authored).
 fn checkDeclaredValue(
     records: []const record.Record,
     comptime subject: []const u8,
@@ -769,16 +779,100 @@ fn checkDeclaredValue(
     }
 }
 
-/// `resume --role <r>`'s identity and `list --role <r>`'s filter: refuses
-/// an undeclared role in the same shape as the write side's own refusal
-/// (blocker 1).
+/// `resume --role <r>`'s identity: refuses an undeclared role in the same
+/// shape as the write side's own refusal (blocker 1), against the
+/// **latest** header only — see `checkDeclaredValue`.
 pub fn checkDeclaredRole(records: []const record.Record, value: []const u8, diag: ?*record.Diagnostics) !void {
     return checkDeclaredValue(records, "role", value, diag);
 }
 
-/// `list --to <r>`'s filter: refuses an undeclared addressee, same shape.
-pub fn checkDeclaredTo(records: []const record.Record, value: []const u8, diag: ?*record.Diagnostics) !void {
-    return checkDeclaredValue(records, "--to", value, diag);
+/// True when `value` was declared in **any** `header` record's `roles` —
+/// the union across the whole log's header history, not merely the
+/// latest. No allocation: membership needs no joined list, only
+/// `checkDeclaredValueHistory`'s refusal message does.
+fn declaredInAnyHeader(records: []const record.Record, value: []const u8) bool {
+    for (records) |r| {
+        if (r == .header and containsString(r.header.roles, value)) return true;
+    }
+    return false;
+}
+
+/// Every role declared across all `header` records `records` carries, in
+/// first-seen order, deduplicated — built only to render
+/// `checkDeclaredValueHistory`'s refusal message (membership itself is
+/// `declaredInAnyHeader`, which allocates nothing). Returns `null` on
+/// allocation failure so the caller can fall back to a message with no
+/// role list, exactly as a failed `std.mem.join` already does inside
+/// `setUndeclaredMessage`. Caller owns the returned slice.
+fn rolesFromEveryHeader(allocator: Allocator, records: []const record.Record) ?[]const []const u8 {
+    var list: std.ArrayList([]const u8) = .empty;
+    for (records) |r| {
+        if (r != .header) continue;
+        for (r.header.roles) |role| {
+            if (containsString(list.items, role)) continue;
+            list.append(allocator, role) catch {
+                list.deinit(allocator);
+                return null;
+            };
+        }
+    }
+    defer list.deinit(allocator);
+    return list.toOwnedSlice(allocator) catch null;
+}
+
+/// `list --role`/`--to`'s filter (architect ruling, DEVLOG `## 6`, actioned
+/// after the section 6 supervisor's re-review, correcting the `list` half
+/// of ruling 1). Unlike `checkDeclaredValue`, which asks "is this the
+/// project's identity right now" against the **latest** header, this asks
+/// "did the project ever declare this" — the union of every `header`
+/// record's `roles`. `list` filters *history*, and a role the project has
+/// since retired still authored records that remain in the log; validating
+/// against only the latest header would make the tool refuse to search its
+/// own past — reproduced on this project's own `orchestrator` → `architect`
+/// retirement. A role never declared in any header is still a typo and is
+/// still refused, in the same message shape as `checkDeclaredValue` and the
+/// write side.
+fn checkDeclaredValueHistory(
+    records: []const record.Record,
+    comptime subject: []const u8,
+    value: []const u8,
+    diag: ?*record.Diagnostics,
+) !void {
+    if (latestHeader(records) == null) {
+        if (diag) |d| d.set("no header declared for this log yet — run 'devlog header' first", .{});
+        return error.NoHeader;
+    }
+    if (declaredInAnyHeader(records, value)) return;
+
+    if (diag) |d| {
+        if (rolesFromEveryHeader(d.allocator, records)) |all_roles| {
+            defer d.allocator.free(all_roles);
+            setUndeclaredMessage(
+                diag,
+                subject ++ " '{s}' is not declared for this project — declared roles: {s}",
+                subject ++ " '{s}' is not declared",
+                value,
+                all_roles,
+            );
+        } else {
+            d.set(subject ++ " '{s}' is not declared", .{value});
+        }
+    }
+    return if (comptime std.mem.eql(u8, subject, "role")) error.UndeclaredRole else error.UndeclaredTo;
+}
+
+/// `list --role <r>`'s filter: refuses a role never declared in any header
+/// this log carries; a role declared once and later retired is still
+/// queryable, because its records are still in the log — see
+/// `checkDeclaredValueHistory`.
+pub fn checkDeclaredRoleHistory(records: []const record.Record, value: []const u8, diag: ?*record.Diagnostics) !void {
+    return checkDeclaredValueHistory(records, "role", value, diag);
+}
+
+/// `list --to <r>`'s filter: same rule as `checkDeclaredRoleHistory`,
+/// applied to `--to`.
+pub fn checkDeclaredToHistory(records: []const record.Record, value: []const u8, diag: ?*record.Diagnostics) !void {
+    return checkDeclaredValueHistory(records, "--to", value, diag);
 }
 
 fn containsString(haystack: []const []const u8, needle: []const u8) bool {

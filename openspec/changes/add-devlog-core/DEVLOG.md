@@ -9153,24 +9153,334 @@ supervisor's own two notes on an `Approve`d section; a third section-level pass 
 recommendations. The section closes on that `Approve` plus these two, with the reviewer's audit as the
 gate — stated plainly so the record shows what was and was not re-reviewed.
 
+**[worker]** **Both of the architect's two actioned notes, implemented. No new `N.M`, nothing ticked.**
+
+**Fix 1 — `list --role`/`--to` now validate against every header the log ever carried, not merely the
+latest; `resume --role` is untouched.** `log.zig` gains `checkDeclaredValueHistory` (and its
+`checkDeclaredRoleHistory`/`checkDeclaredToHistory` wrappers), parallel to the existing
+`checkDeclaredValue`/`checkDeclaredRole`: `declaredInAnyHeader` decides membership by scanning every
+`header` record's `roles` (no allocation), and `rolesFromEveryHeader` builds the deduplicated union only
+for the refusal message, falling back to a role-less message on `OutOfMemory` exactly as
+`setUndeclaredMessage`'s own `std.mem.join` fallback already does. The old latest-header-only
+`checkDeclaredTo` is gone — nothing but `list --to` ever called it, and that call site now uses the
+history-checking twin. `runResume` (`main.zig:1750`) is byte-for-byte unchanged — still `checkDeclaredRole`
+against the latest header, because there `--role` is identity, not a filter. `runList` (`main.zig:2034,
+2039`) now calls `checkDeclaredRoleHistory`/`checkDeclaredToHistory`.
+
+**Fix 2 — the blocker-2 test now pins all seven `--json` forms, not three.** Added `show --seq --json`,
+`show --item --json`, `list --json` (bare) and `refs --json` alongside the existing `status`, `resume`,
+`list --state open` blocks, via a shared `expectExactlyOneJsonLine` helper. No production change here —
+the newline contract was already correct everywhere; only three of its four emitting call sites
+(`record.write`+call-site newline, `writeItemJson`+call-site newline, `writeCurrentStateJson`'s internal
+`"}\n"`, `writeItemListJson`'s internal `"]\n"`) had a test. `writeRecordListJson`'s internal `"]\n"`
+(shared by `list` and `refs`) had none at all until this fix.
+
+**Verified by mutation, on a scratch copy outside the tree, three separate runs, each discarded after:**
+
+- **Fix 1**, `declaredInAnyHeader` reverted to check only `latestHeader` (the exact bug ruling 1 had):
+  seeded a log that declares `orchestrator`, has it author/receive two records, then re-declares the
+  header without it (this project's own `orchestrator` → `architect` retirement, in miniature). Result:
+  **251/252 — exactly the new retired-role test failed**, `expected 0, found 1` on `list --role
+  orchestrator`'s exit code. The never-declared-role test in the same pair still passed, as it should —
+  that path is unchanged by the fix.
+- **Fix 2a**, deleted `writeRecordListJson`'s `"]\n"` → `"]"` (main.zig, the `list`/`refs` shared
+  emitter): **249/252, 3 failed** — the two pre-existing empty-result tests that happened to assert
+  `"[]\n"` literally, **and** the new widened test, independently. The widened test's own failure proves
+  it does not depend on those two for coverage.
+- **Fix 2b**, deleted the call-site `stdout.writeByte('\n')` after `show --seq --json`'s `record.write`
+  (main.zig:1888, restored after 2a): **251/252 — exactly the new widened test failed.** No other test in
+  the suite pinned this call site before now, reproducing the supervisor's own finding.
+
+`src/log.zig` and `src/main.zig` are the only files touched — `Makefile`, `tasks.md`, `record.zig`,
+`state.zig` untouched.
+
+**Gates.** `BUILD_EXIT:0` `TEST_EXIT:0` `FORMAT_EXIT:0` `VALIDATE_EXIT:0` `GATES_EXIT:0` —
+**252/252** tests pass (2 new), counted via `zig build test --summary all`.
+
+No commit, no ticks. → @reviewer
+
+**[reviewer]** **Section 6 follow-up (architect's two actioned notes) audited. Verdict: Approve.**
+
+Reviewed as the gate the architect named — this follow-up implements the supervisor's own two
+`## NEXT` notes on an already-`Approve`d section, so no third supervisor pass; my audit is the check
+before it closes.
+
+**Gates, re-run independently.** `BUILD_EXIT:0` `TEST_EXIT:0` `FORMAT_EXIT:0` `VALIDATE_EXIT:0`
+`GATES_EXIT:0`. Test total counted, not quoted: `zig build test --summary all` →
+**252/252 tests passed**, matching the worker's number exactly.
+
+**Fix 1 — `list` validates against the union of every header; `resume` is untouched. Confirmed by
+reading and by three independent checks the brief specifically asked for.**
+
+- **`runResume` is byte-for-byte unchanged.** `src/main.zig:1750` still calls `log.checkDeclaredRole`
+  (the latest-header-only check) — the only diff touching this function is a widened comment
+  (`main.zig:1745-1749`).
+- **`runList` now calls the history-checking twins.** `src/main.zig:2037-2044`:
+  `log.checkDeclaredRoleHistory` for `--role`, `log.checkDeclaredToHistory` for `--to`. Both route
+  through `reportLogError` exactly as before, so the write side's message shape is preserved (see
+  below).
+- **`checkDeclaredValueHistory` (`src/log.zig:834-861`)** checks `latestHeader(records) == null` first
+  (refusing a headerless log with the identical `"no header declared for this log yet…"` text used at
+  `log.zig:715`, `:767`, and by `checkRoleAllowed` itself — byte-identical across all three sites, not
+  just similar), then `declaredInAnyHeader` (`log.zig:793-798`) — a plain, unconditional loop over
+  every record where `r == .header`, order-independent, not special-cased to "first" or "last".
+- **A never-declared role is still refused, same message shape as the write side.** Verified live on
+  the built binary: `list --role neverDeclared` against a 3-header log refused with `role
+  'neverDeclared' is not declared for this project — declared roles: architect, worker, middleRole`,
+  exit 1 — the union-of-all-headers vocabulary in the message, not merely the latest.
+- **A retired role is queryable through `list` and refused by `resume` — both halves, verified two
+  ways.** (1) By mutation: reverted `declaredInAnyHeader` to check only `latestHeader` on a scratch
+  copy and reran — **251/252**, exactly the worker's new retired-role test failed (`expected 0, found
+  1` on `list --role orchestrator`'s exit code), matching the worker's reported count exactly. (2) By
+  driving the real binary end to end, independent of the worker's fixture: built `zig-out/bin/devlog`,
+  hand-constructed a **3-header** log (`header` → `header` adding `middleRole` → `post --role
+  middleRole` → `header` retiring `middleRole`), then confirmed `list --role middleRole --json` returns
+  the post (exit 0, body present in the JSON array) while `resume --role middleRole` refuses (exit 1) —
+  the exact split the ruling calls for.
+- **The union is genuinely over all headers, including a role declared only in a middle one.** The
+  3-header scratch run above is precisely that case: `middleRole` appears only in the second of three
+  headers (retired by the third), and both `declaredInAnyHeader` and `rolesFromEveryHeader`'s message
+  found it. Confirmed the log carried no stray file afterward — only `DEVLOG.jsonl` in the directory.
+- **`checkDeclaredTo`'s removal left nothing dangling.** `grep -rn "checkDeclaredTo\b" src/` (excluding
+  `checkDeclaredToHistory`) returns nothing — no stale caller, no leftover wrapper.
+
+**Fix 2 — the newline contract, now genuinely pinned at all seven `--json` call sites. Verified by
+mutation at two of them independently, not by re-running the worker's own scratch copy.**
+
+- **All seven forms are present in the widened test** (`src/main.zig:7264-7420`, `expectExactlyOneJsonLine` at `:7247-7251`): `show --seq --json`, `show --item --json`, `status --json`, `resume --json`,
+  `list --state open --json`, `list --json` (bare), `refs --json`. The last two are new — confirming
+  the worker's claim that `writeRecordListJson`'s internal `"]\n"` (shared by `list` and `refs`) had no
+  pinning test before this fix.
+- **Mutation 1 — deleted `writeRecordListJson`'s `"]\n"` → `"]"`** (the call site the worker's report
+  names as previously unpinned): **249/252, exactly 3 failed** — the widened test plus the two
+  pre-existing empty-result tests that happened to assert the literal `"[]\n"`. Matches the worker's
+  reported count and its claim that the widened test's own failure doesn't depend on those two.
+- **Mutation 2 — deleted the `show --seq --json` call-site newline** (`stdout.writeByte('\n')` after
+  `record.write`, the exact gap the supervisor's `## NEXT` note named as still open at 250/250 before
+  this fix): **251/252 — exactly the widened test failed**, on the `show --seq --json` sub-block.
+  Confirms the supervisor's finding is now closed, independently of the worker's own report of the same
+  result.
+
+**Regressions — none found.** `runList`/all other reads still load via `log.openReadOnly`
+(`main.zig:1740, 1810, 1878, 2024, 2163` — unchanged call sites). No write-side output rendering
+touched (`grep` for confirmation/"appended" strings in the diff is empty). `tasks.md`, `Makefile`,
+`build.zig.zon` all show no diff; `git status --porcelain` lists only `DEVLOG.md`, `src/log.zig`,
+`src/main.zig`. D15 parity and the seven-call-site newline contract are the two things this follow-up
+exists to re-confirm, and both hold.
+
+**Ownership across the new helpers — clean.** `checkDeclaredValue`/`checkDeclaredRole` (identity, latest
+header) and `checkDeclaredValueHistory`/`checkDeclaredRoleHistory`/`checkDeclaredToHistory` (filter,
+union of all headers) are clearly separated, each documented with which commands use it and why, and
+the doc comment on `checkDeclaredValue` now cross-references `checkDeclaredValueHistory` so a future
+reader lands on the distinction rather than rediscovering it (`log.zig:753-759`).
+
+**One nit, not blocking.**
+
+1. **A narrow, real memory leak on a compound-OOM path in `rolesFromEveryHeader`
+   (`src/log.zig:807-820`).** The function builds `list: std.ArrayList([]const u8)` incrementally via
+   `append`, `errdefer`-freeing it if an `append` itself fails — correct. But the final line,
+   `return list.toOwnedSlice(allocator) catch null;` (`log.zig:819`), has no matching cleanup: Zig
+   0.16's unmanaged `ArrayList.toOwnedSlice` (`array_list.zig:654-663`) first attempts `remap`, and on
+   that failing falls through to a fresh `alignedAlloc` — if that *also* fails, the function returns the
+   error **without freeing `self.allocatedSlice()`**, leaving `list`'s original backing buffer
+   allocated with nothing left pointing at it once this function's `list` goes out of scope. This
+   differs from the codebase's one existing comparable pattern, `setUndeclaredMessage`'s
+   `std.mem.join(...) catch { … }` (`log.zig:902`), which allocates in one shot and therefore has
+   nothing to leak on failure — the two "degrade gracefully on OOM" paths aren't actually the same
+   shape, and the doc comment's claim ("exactly as a failed `std.mem.join` already does") slightly
+   overstates the parity. Reachable only on a genuine double allocator failure while formatting an
+   already-fatal error message — no test in the suite exercises it (no `FailingAllocator` harness
+   exists in this codebase) — so I'm not blocking on it, but a `defer list.deinit(allocator)` ahead of
+   the `toOwnedSlice` call (harmless once ownership transfers, since `toOwnedSlice` on success already
+   empties `list`) would close it for free.
+
+**Architectural notes — none new.** The supervisor's remaining `## NEXT` items (the spec home for the
+read-side validation rule, `matchesListFilters`' argv coupling, the six-hand-maintained-list shape in
+`parseArgs`, and thread hygiene) are all explicitly deferred to `7.x`/`8.4` by the architect's own
+ruling and are unaffected by this follow-up; I have nothing to add to that list from this diff.
+
+No production-code scope beyond the two named fixes — `record.zig`, `state.zig`, `Makefile`, `tasks.md`
+untouched, no new dependency, nothing ticked.
+
+Section 6 is clear to close, per the architect's own gate.
+
+**[architect]** **Take the nit — it is one `defer`, and this module has shipped this exact bug twice.**
+
+`rolesFromEveryHeader` (`src/log.zig:807-820`) leaks its backing buffer on a double-OOM path. The
+reviewer is right that it is a genuine edge case and right that no `FailingAllocator` harness exists to
+test it, so my "untested branch closes in-block" rule does **not** apply — the branch is untestable with
+the harness this project has, which is the same waiver I gave the `runList` sort.
+
+**But the rule about tests is not the only rule.** Section 5 shipped an `errdefer` armed over `undefined`
+memory and a leaked `items_slice`, both `OutOfMemory`-only, both invisible to a green `TEST_EXIT:0`, and
+both found by reading with ownership as the question rather than by any gate. That is the same class and
+the same file's discipline. **The fix is a `defer list.deinit(allocator)` before the final
+`toOwnedSlice`** — free, correct on every path, and consistent with the pattern the rest of `derive`
+already uses. Untestable is a reason not to demand a test; it is not a reason to leave a known leak.
+
+Do it, re-run the gates, and I will verify the diff directly. No commit, no ticks.
+
+**[worker]** Took the nit — `rolesFromEveryHeader` (`src/log.zig:807-820`): added
+`defer list.deinit(allocator)` immediately before the final `toOwnedSlice` call. No-op on the success
+path (`toOwnedSlice` already empties the list); closes the double-OOM leak on the `remap`-then-
+`alignedAlloc` fallback failure. No other production or test edits.
+
+`make gates` → `BUILD_EXIT:0 TEST_EXIT:0 FORMAT_EXIT:0 VALIDATE_EXIT:0 GATES_EXIT:0`. `zig build test
+--summary all`: **252/252** tests passed. No commit, no ticks — architect verifying the diff directly.
+
+**[architect]** **Verified the `defer` myself** (`src/log.zig:819`): placed after the loop, so the
+early-return path's own explicit `deinit` cannot double-free, and a successful `toOwnedSlice` leaves the
+list empty so the deferred call is a no-op. Correct on every path. Gates re-run by me: `BUILD_EXIT:0`,
+`TEST_EXIT:0`, `FORMAT_EXIT:0`, `VALIDATE_EXIT:0`, `GATES_EXIT:0`, **252** tests — counted, not quoted.
+
+**[architect]** **Incident — I deleted the `## NEXT` heading, and it is the incident `## NEXT` warns
+about.**
+
+Posting the "take the nit" ruling above, I matched `## NEXT` as the anchor for an append and did not put
+the heading back. The section's content survived; the heading did not. The next worker then appended its
+post to the **end of the file**, below what had been `## NEXT`'s content — correctly, since there was no
+heading left to append above. Repaired by trimming that trailing post and restoring it here, in order,
+with the heading.
+
+**The standing fact in `## NEXT` says to match `^## NEXT$` at start of line, and I did exactly that.**
+The rule is not wrong; it is aimed at the wrong hazard. Matching the heading is safe when you are
+*replacing* the section and reinstating the heading yourself. It is not safe when you are *appending
+above* it, which is what every ordinary post does — there the anchor should be the last line of the post
+you are following, never the heading, because the heading is not yours to consume. Updating the standing
+fact accordingly.
+
+**And it is worth naming what this is evidence for.** This whole change exists to replace a hand-edited
+Markdown file whose `## NEXT` fragility is the stated motivation (`CLAUDE.md`: "Expect the `## NEXT`
+fragility that motivated the project"). The tool being built has `devlog next` as an **append**, with the
+most recent record winning and no heading to lose. Two sections of that tool are now written and I still
+lost the heading by hand. That is not embarrassment; it is the project's own case, demonstrated on the
+project.
+
+**[architect]** **Section 6 is CLOSED** — supervisor `Approve` on the second pass, after one remediation
+block, plus two of the supervisor's own notes actioned and audited by the reviewer, plus one leak nit.
+Base was `31eb5e3`.
+
+Landed: `c8a3f25` (opened, **D15**, carve, 6A brief), `778acb6` (6A, `6.6`/`6.2`), `6b35241` (6A closed,
+6B brief), `731b772` (6B, `6.1`/`6.5`), `f92102a` (6B closed, 6C brief), `39f2442` (6C, `6.3`/`6.4`),
+`6f5dfa6` (supervisor findings and rulings), `3a1a889` (remediation, ticks nothing), `606503c`
+(re-review, two notes actioned). Gates `GATES_EXIT:0`, **252** tests — counted, not quoted. All six boxes
+ticked.
+
 ## NEXT
 
-**[architect]** **Section 5 is CLOSED** — supervisor `Approve` on the **first** pass, no remediation
-round, the first section in this change to close in one. Base was `270a680`.
+**[architect]** **Sections 1–6 are CLOSED and fully ticked** — 39 of 52 boxes, no outstanding
+human-in-the-loop items. Section 6 closed on `606503c` + the leak nit; section 5 on `31eb5e3`; see the two
+close posts immediately above this heading for each section's landed commits and test counts.
 
-Landed: `2a35cb3` (section opened, carve, 5A brief), `378e979` (5A, `5.1`–`5.3`), `9368348` (5A closed, 5B
-brief), `a127b2c` (5B, `5.4`–`5.6`). Gates `GATES_EXIT:0`, **180** tests, **23** of them in
-`src/state.zig` — counted, not quoted. All six boxes ticked. Two review rounds per block; both blockers
-were found by review, neither by a gate.
+**Section 7 is next** — search (`7.1`–`7.4`). It is the last section that adds a command; `8.x` is
+documentation and release, `9.x` is validation and handoff.
 
-**Sections 1–5 are fully ticked, with no outstanding human-in-the-loop items.**
+**Five things bind section 7, and three of them were written before it started:**
 
-**Section 6 is next** — read commands (`6.1`–`6.6`). Everything it renders already exists in
-`src/state.zig`; what section 6 adds is the read-only load path and the command surface. Before briefing
-it, read the section-5 close post immediately above this heading: the block-identity ruling binds `6.1`
-and `6.3` directly, and carried item 17 belongs in its **first** block.
+- **`7.2` reopens B1 unless it is handled.** `takes_positional` is a **boolean**, so `search a b c`
+  silently drops `b` and `c` — the exact silent-acceptance defect section 4's supervisor found and its
+  remediation fixed, reintroduced by the mechanism that fixed it. Either `search` takes exactly one
+  positional and refuses a second, or the property becomes a count. **Decide it in `7.2`'s brief, not in
+  its review.**
+- **Carried 21 — the `runList` combined-filter sort is currently unreachable**, kept as documented
+  insurance (`src/main.zig:2114` names this ruling). **`7.3` is the change most likely to make it
+  reachable**: combining search with `6.3`'s filters produces results ranked by relevance rather than log
+  order. When it does, it stops being insurance and earns a test with real power.
+- **What `search --state open` means is an open design question.** `--state`/`--blocking` narrow `list`
+  from records to items; `search` ranks records. Answer it in `7.3`'s brief while `runList` is still the
+  only consumer of those filters.
+- **`7.3` inherits `list`'s role validation**, which is now split deliberately: `resume` validates
+  identity against the **latest** header, `list` validates history filters against the **union of every**
+  header. Search filters are history filters. Match `list`, not `resume`.
+- **D15 binds `search` too** — text by default, the same content on `--json`, one derivation and two
+  renderers. Reuse the renderers; do not add a seventh JSON shape without saying so.
 
-**Four things are owed to section 6 specifically, three of them re-homed rather than new:**
+**Owed to `8.x`, all of it discovered rather than planned:**
+
+- **Six undocumented top-level JSON shapes** — `show --seq` a bare record, `show --item` a
+  `{number,state,item,closes}` object, `resume` `{next,items,brief}`, `status` `{next,items}`, `list` an
+  array of records *or* of item objects depending on flags, `refs` an array of records. `8.4` owes a prose
+  description precise enough to reimplement; this is the inventory.
+- **The newline is the caller's, and that is now contract** — every `--json` payload is exactly one line,
+  pinned across all seven forms. `8.4` documents it; `9.4` hands it to a plugin.
+- **The read-side role-validation rule has no spec home.** `append-only-log` states the *reason* in terms
+  of the derived per-role view; the rule itself lives only in DEVLOG rulings and code.
+- **C4, still owed** — the spec scopes the UTF-8 `SHALL` to `body` while the code validates every string
+  field. `8.4` must carry the field-level breadth or a reimplementer reintroduces the hazard through
+  `--to`.
+- **`headerUnchanged` excludes `change` from header identity** — one sentence in D13 before `8.4`.
+- **P1 — "removed before the command exits" is loose on the success path** (`design.md:110`,
+  `specs/durable-format/spec.md:43`): on success the temp file is *renamed*, not removed. A reimplementer
+  who reads "removed" as `unlink` after a successful rename **deletes the log**.
+- **`8.5`** — `zig build test -Dversion=X` fails (the override makes `build_options.version` and
+  `manifest.version` disagree); pin the umask in the permissions test, which is otherwise
+  environment-dependent.
+
+**Owed to `9.x`:**
+
+- **`9.1` is not a replay exercise** — it is the only automated mechanism this project has that would
+  catch the two classes that have escaped review: a defect in a branch nothing executes, and a defect only
+  visible when the built binary runs. Brief it as such.
+- **`9.4` must tell consumers to ignore the temp-name pattern**, not merely record that it exists.
+  Consumers inherit the orphan risk with none of this repo's `.gitignore` mitigation.
+
+**Carried, none blocking:**
+
+- **The derive-level write-boundary fault rule covers `verdict` and `brief` but not `section`.**
+  `runSection` requires `--section`, so by the standing rule it is the same class; it has simply never
+  been reached. Close it or record why not.
+- **`matchesListFilters` is coupled to argv**, and `parseArgs` maintains six hand-written flag lists.
+  Both are `7.x` territory if `search` extends them.
+- **D13's body text never mentions `closers`**; the decision is everywhere except `## Decisions`.
+- **Supervisor notes N1–N9** are in section 1's first supervisor post, including `main.zig:146` citing a
+  `tasks.md` path that moves under `archive/` when this change ships.
+
+**What six sections have taught about where defects actually live** — worth more than any single finding:
+
+1. **In branches nothing executes.** Section 4's `post stray-token` exiting `0`; 6A's five untested record
+   kinds; 6B's missing-NEXT branch. Hence the standing rule: **an untested branch in a block's binding
+   constraint closes in that block**, waived only when the branch is genuinely *unreachable* (the
+   `runList` sort) or untestable with this harness (the double-OOM leak — where the fix still landed).
+2. **On `OutOfMemory` paths a green `TEST_EXIT:0` cannot see.** Section 5 shipped two; section 6's
+   follow-up found a third. All three were found by reading with **ownership as the question**.
+3. **Only when the built binary runs.** Section 4's two bugs, 6B's SIGABRT on a hand-written log, and
+   every one of section 6's three supervisor blockers. `9.1` is the only mechanism that would catch these.
+4. **Across commands, where no block review can see them.** All three section-6 blockers spanned blocks by
+   construction. This is the outer loop's entire justification.
+
+**The technique that works, three sections running: prove a test's power by mutation.** Copy the tree to a
+scratch directory outside the working tree, delete the branch the test exists to pin, rebuild, and count
+which tests fail. It has converted "there is a test" into "the test catches this" every time, and it
+caught one case where a ruling's own test would have passed without the fix.
+
+**Standing facts for a cold start:**
+
+- **Appending a post to the DEVLOG: anchor on the last line of the post you are following, never on
+  `## NEXT`.** Matching the heading is safe only when you are replacing the whole section and reinstating
+  it yourself. I consumed the heading by anchoring on it for an append — see the incident post above.
+- Gates run via `make`; reports quote `LABEL_EXIT:<n>`. Gates run **in-sandbox** — `~/.cache/zig` is on
+  the write allowlist. A `manifest_create PermissionDenied` means that entry went missing, not a broken
+  toolchain.
+- **Version is single-source**: `build.zig.zon:3` is the only semver literal in tracked source.
+- **Zig 0.16 changed `main`'s signature** — `pub fn main(init: std.process.Init) !void`. Write against
+  0.16's API, never a remembered one; check the installed stdlib source when a fix rests on its
+  semantics.
+- **Parse-ambiguity errors beat `--help`/`--version`.**
+- **Roles are declared per project in the `header`** (D13), which carries no role and also declares
+  `closers`. `orchestrator` is retired — the main session is `analyst` and `architect`.
+- **The `dmons` tripwire is inert in this harness** (agents run in the background; the call returns on
+  launch), so its detection half reports "all clear" unconditionally. The guard's prevention half works.
+  **The architect's own repo-wide grep before committing is the only control covering `.claude/agents/`.**
+- **Sweep repo-wide, case-insensitively, when a decision amends an invariant** — one amendment once left
+  seven restatements across five files, and three separate audits each missed some.
+- **Commit the DEVLOG when a post lands, not only when a block does.**
+
+<!-- Superseded section-5 notes retained below for provenance. -->
+
+**Section 6 was next** — read commands (`6.1`–`6.6`). Everything it renders already existed in
+`src/state.zig`; what section 6 added is the read-only load path and the command surface.
+
+**Four things were owed to section 6 specifically, three of them re-homed rather than new:**
 
 - **Carried 17 — `DeriveError` has no reporting path.** `reportLogError` covers `log`'s error set, not
   `state`'s, so section 5's three faults are unreachable from the CLI today. First block of section 6.

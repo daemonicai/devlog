@@ -2026,17 +2026,21 @@ fn runList(
     };
     defer opened.close(allocator);
 
-    // Blocker 1 (section 6 supervisor): `--role`/`--to` are filters here,
-    // not identity, but an undeclared value is still refused rather than
-    // silently returning an empty result — the same rule `resume` applies
-    // to its own `--role`, checked only when the filter is actually given.
+    // Blocker 1 (section 6 supervisor), corrected by the architect's
+    // ruling-1 follow-up: `--role`/`--to` are filters over **history**
+    // here, not identity, so an undeclared value is still refused — the
+    // same typo hazard `resume` guards on its own `--role` — but "declared"
+    // means declared in *any* header this log carries, not merely the
+    // latest. A role the project has since retired (this project's own
+    // `orchestrator` → `architect`) still authored records that remain in
+    // the log, and must stay queryable through them.
     if (p.role) |r| {
-        log.checkDeclaredRole(opened.log.records, r, &diag) catch |err| {
+        log.checkDeclaredRoleHistory(opened.log.records, r, &diag) catch |err| {
             return reportLogError(stderr, err, &diag);
         };
     }
     if (p.to) |t| {
-        log.checkDeclaredTo(opened.log.records, t, &diag) catch |err| {
+        log.checkDeclaredToHistory(opened.log.records, t, &diag) catch |err| {
             return reportLogError(stderr, err, &diag);
         };
     }
@@ -7068,6 +7072,98 @@ test "list --role and --to each refuse an undeclared value, and a declared value
     }
 }
 
+/// This project's own `orchestrator` → `architect` retirement, in
+/// miniature — the section 6 supervisor's repro for why the *latest*
+/// header is the wrong vocabulary for `list --role`/`--to` to validate
+/// against. The header first declares `orchestrator`; two records are
+/// authored by (and addressed to) it; the header is then re-declared
+/// without `orchestrator`, adding `architect` in its place. `orchestrator`
+/// is now retired — undeclared by the **latest** header — but its two
+/// records remain in the log.
+fn seedRetiredRoleFixture(allocator: Allocator, dir: Io.Dir, io: Io, diag: *record.Diagnostics) !void {
+    _ = try log.appendHeader(
+        allocator,
+        io,
+        dir,
+        "DEVLOG.jsonl",
+        "t0",
+        "devlog 0.1.0",
+        .{ .change = "x", .roles = &.{ "orchestrator", "worker" }, .closers = &.{"orchestrator"} },
+        diag,
+    );
+    _ = try log.appendRecord(allocator, io, dir, "DEVLOG.jsonl", record.Record{ .post = .{
+        .common = .{ .seq = 0, .ts = "t1", .role = "orchestrator", .body = "orchestrator's own post, authored while the role was current" },
+    } }, diag);
+    _ = try log.appendRecord(allocator, io, dir, "DEVLOG.jsonl", record.Record{ .post = .{
+        .common = .{ .seq = 0, .ts = "t2", .role = "worker", .to = "orchestrator", .body = "a post addressed to orchestrator" },
+    } }, diag);
+    _ = try log.appendHeader(
+        allocator,
+        io,
+        dir,
+        "DEVLOG.jsonl",
+        "t3",
+        "devlog 0.1.0",
+        .{ .change = "x", .roles = &.{ "architect", "worker" }, .closers = &.{"architect"} },
+        diag,
+    );
+}
+
+test "list --role/--to on a retired role still finds what it authored and was addressed to, while resume --role refuses it (architect ruling, ruling-1 follow-up)" {
+    // The distinction the follow-up drew: resume --role is an identity
+    // (validated against the latest header, unchanged), list --role/--to
+    // is a filter over history (validated against every header the log
+    // ever carried). Same log, same retired role, opposite outcomes.
+    {
+        var result = try runSeeded(std.testing.allocator, seedRetiredRoleFixture, &.{
+            "--log", "DEVLOG.jsonl", "list", "--role", "orchestrator",
+        });
+        defer result.deinit(std.testing.allocator);
+        try std.testing.expectEqual(@as(u8, 0), result.code);
+        try std.testing.expect(std.mem.indexOf(u8, result.stdout, "orchestrator's own post") != null);
+        try std.testing.expectEqualStrings("", result.stderr);
+    }
+    {
+        var result = try runSeeded(std.testing.allocator, seedRetiredRoleFixture, &.{
+            "--log", "DEVLOG.jsonl", "list", "--to", "orchestrator",
+        });
+        defer result.deinit(std.testing.allocator);
+        try std.testing.expectEqual(@as(u8, 0), result.code);
+        try std.testing.expect(std.mem.indexOf(u8, result.stdout, "a post addressed to orchestrator") != null);
+        try std.testing.expectEqualStrings("", result.stderr);
+    }
+    {
+        var result = try runSeeded(std.testing.allocator, seedRetiredRoleFixture, &.{
+            "--log", "DEVLOG.jsonl", "resume", "--role", "orchestrator",
+        });
+        defer result.deinit(std.testing.allocator);
+        try std.testing.expectEqual(@as(u8, 1), result.code);
+        try std.testing.expect(std.mem.indexOf(u8, result.stderr, "'orchestrator' is not declared") != null);
+        try std.testing.expectEqualStrings("", result.stdout);
+    }
+}
+
+test "list --role/--to still refuse a role never declared in any header, even though the rule now checks history (architect ruling, ruling-1 follow-up)" {
+    {
+        var result = try runSeeded(std.testing.allocator, seedRetiredRoleFixture, &.{
+            "--log", "DEVLOG.jsonl", "list", "--role", "wroker",
+        });
+        defer result.deinit(std.testing.allocator);
+        try std.testing.expectEqual(@as(u8, 1), result.code);
+        try std.testing.expect(std.mem.indexOf(u8, result.stderr, "'wroker' is not declared") != null);
+        try std.testing.expectEqualStrings("", result.stdout);
+    }
+    {
+        var result = try runSeeded(std.testing.allocator, seedRetiredRoleFixture, &.{
+            "--log", "DEVLOG.jsonl", "resume", "--role", "wroker",
+        });
+        defer result.deinit(std.testing.allocator);
+        try std.testing.expectEqual(@as(u8, 1), result.code);
+        try std.testing.expect(std.mem.indexOf(u8, result.stderr, "'wroker' is not declared") != null);
+        try std.testing.expectEqualStrings("", result.stdout);
+    }
+}
+
 /// A log the CLI itself could never produce: `checkRoleAllowed` refuses
 /// every write (`appendHeader`/`appendRecord`) until a header exists, so
 /// this writes two ordinary records directly to the file, bypassing the
@@ -7145,7 +7241,17 @@ test "show, status, and refs each refuse --role as an unexpected flag rather tha
     );
 }
 
-test "status --json, resume --json, and list --state open --json carry no embedded newline — one JSON value per line (blocker 2)" {
+/// Asserts `text` is exactly one line: non-empty, ends `\n`, and carries no
+/// other `\n` anywhere in it — the shared shape every block below checks,
+/// factored out once the widened test (below) grew from three call sites
+/// to all seven.
+fn expectExactlyOneJsonLine(text: []const u8) !void {
+    try std.testing.expect(text.len > 0);
+    try std.testing.expectEqual(@as(u8, '\n'), text[text.len - 1]);
+    try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, text, "\n"));
+}
+
+test "every --json form carries no embedded newline — one JSON value per line, all seven call sites (blocker 2; widened per architect ruling, DEVLOG ## 6, after the section 6 supervisor's re-review proved the newline was pinned at only three of them)" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
     var diag: record.Diagnostics = .init(std.testing.allocator);
@@ -7155,6 +7261,55 @@ test "status --json, resume --json, and list --state open --json carry no embedd
     var stdin_file = try openStdinStandin(tmp.dir, std.testing.io, "");
     defer stdin_file.close(std.testing.io);
 
+    // show --seq --json — record.write's own newline-free contract, plus
+    // the call site's own writeByte('\n') (main.zig:1888).
+    {
+        var out: Io.Writer.Allocating = .init(std.testing.allocator);
+        defer out.deinit();
+        var err_out: Io.Writer.Allocating = .init(std.testing.allocator);
+        defer err_out.deinit();
+        const code = run(
+            std.testing.allocator,
+            std.testing.io,
+            tmp.dir,
+            stdin_file,
+            test_ts,
+            &.{ "--log", "DEVLOG.jsonl", "show", "--seq", "2", "--json" },
+            &out.writer,
+            &err_out.writer,
+        );
+        try std.testing.expectEqual(@as(u8, 0), code);
+        const text = out.written();
+        try expectExactlyOneJsonLine(text);
+        var parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, text, .{});
+        defer parsed.deinit();
+        try std.testing.expectEqualStrings("next", parsed.value.object.get("kind").?.string);
+    }
+    // show --item --json — writeItemJson's own newline-free contract, plus
+    // the call site's own writeByte('\n') (main.zig:1911).
+    {
+        var out: Io.Writer.Allocating = .init(std.testing.allocator);
+        defer out.deinit();
+        var err_out: Io.Writer.Allocating = .init(std.testing.allocator);
+        defer err_out.deinit();
+        const code = run(
+            std.testing.allocator,
+            std.testing.io,
+            tmp.dir,
+            stdin_file,
+            test_ts,
+            &.{ "--log", "DEVLOG.jsonl", "show", "--item", "1", "--json" },
+            &out.writer,
+            &err_out.writer,
+        );
+        try std.testing.expectEqual(@as(u8, 0), code);
+        const text = out.written();
+        try expectExactlyOneJsonLine(text);
+        var parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, text, .{});
+        defer parsed.deinit();
+        try std.testing.expectEqual(@as(i64, 1), parsed.value.object.get("number").?.integer);
+    }
+    // status --json — writeCurrentStateJson's own internal "}\n".
     {
         var out: Io.Writer.Allocating = .init(std.testing.allocator);
         defer out.deinit();
@@ -7172,13 +7327,12 @@ test "status --json, resume --json, and list --state open --json carry no embedd
         );
         try std.testing.expectEqual(@as(u8, 0), code);
         const text = out.written();
-        try std.testing.expect(text.len > 0);
-        try std.testing.expectEqual(@as(u8, '\n'), text[text.len - 1]);
-        try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, text, "\n"));
+        try expectExactlyOneJsonLine(text);
         var parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, text, .{});
         defer parsed.deinit();
         try std.testing.expect(parsed.value.object.get("items").?.array.items.len >= 1);
     }
+    // resume --json — the same writeCurrentStateJson as status.
     {
         var out: Io.Writer.Allocating = .init(std.testing.allocator);
         defer out.deinit();
@@ -7196,21 +7350,42 @@ test "status --json, resume --json, and list --state open --json carry no embedd
         );
         try std.testing.expectEqual(@as(u8, 0), code);
         const text = out.written();
-        try std.testing.expect(text.len > 0);
-        try std.testing.expectEqual(@as(u8, '\n'), text[text.len - 1]);
-        try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, text, "\n"));
+        try expectExactlyOneJsonLine(text);
         var parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, text, .{});
         defer parsed.deinit();
         try std.testing.expect(parsed.value.object.get("items").?.array.items.len >= 1);
     }
+    // list --state open --json — writeItemListJson's own internal "]\n".
     {
         var result = try runSeeded(std.testing.allocator, seedListFixture, &.{ "--log", "DEVLOG.jsonl", "list", "--state", "open", "--json" });
         defer result.deinit(std.testing.allocator);
         try std.testing.expectEqual(@as(u8, 0), result.code);
         const text = result.stdout;
-        try std.testing.expect(text.len > 0);
-        try std.testing.expectEqual(@as(u8, '\n'), text[text.len - 1]);
-        try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, text, "\n"));
+        try expectExactlyOneJsonLine(text);
+        var parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, text, .{});
+        defer parsed.deinit();
+        try std.testing.expect(parsed.value.array.items.len >= 1);
+    }
+    // list --json, no filter — writeRecordListJson's own internal "]\n";
+    // shared with refs below, but exercised here over the raw record path.
+    {
+        var result = try runSeeded(std.testing.allocator, seedListFixture, &.{ "--log", "DEVLOG.jsonl", "list", "--json" });
+        defer result.deinit(std.testing.allocator);
+        try std.testing.expectEqual(@as(u8, 0), result.code);
+        const text = result.stdout;
+        try expectExactlyOneJsonLine(text);
+        var parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, text, .{});
+        defer parsed.deinit();
+        try std.testing.expect(parsed.value.array.items.len >= 1);
+    }
+    // refs --json — the same writeRecordListJson as list, over
+    // Indexes.byReference instead of the full record slice.
+    {
+        var result = try runSeeded(std.testing.allocator, seedListFixture, &.{ "--log", "DEVLOG.jsonl", "refs", "--ref", "D:7", "--json" });
+        defer result.deinit(std.testing.allocator);
+        try std.testing.expectEqual(@as(u8, 0), result.code);
+        const text = result.stdout;
+        try expectExactlyOneJsonLine(text);
         var parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, text, .{});
         defer parsed.deinit();
         try std.testing.expect(parsed.value.array.items.len >= 1);
