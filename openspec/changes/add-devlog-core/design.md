@@ -307,6 +307,33 @@ exotic body) and charges for it in the one place this project cannot afford comp
 format be reimplementable from the prose specification alone, and "a body is a string, except when it is
 an array of integers" is exactly the kind of clause a second implementation gets wrong.
 
+### D15 — Reads render for a human by default and emit JSON on `--json`
+
+Every read command (`resume`, `show`, `list`, `refs`, `status`) prints rendered, agent-readable text by
+default, and the same content as JSON on `stdout` when given `--json`. The default is what a person or an
+agent reads in a terminal or pastes into a thread; `--json` is what a consumer parses.
+
+**Decided by the Product Owner during section 6**, because nothing in this document, the specs or the
+proposal had settled it, and all five read commands emit something. Recorded here rather than in a review
+because the output format is a contract: `9.4` hands the `dmon-dev` plugin a way to consume this tool, and
+`8.4` requires the surface be documented precisely enough to reimplement.
+
+The two forms are one derivation with two renderers, never two derivations. Anything a `--json` payload
+carries that the text form cannot show is a signal the text form is under-rendering, not a licence for the
+two to diverge — a consumer that parses `--json` and a human reading the default must never be told
+different things about the same log.
+
+`--json` is a flag on the read commands only. The write commands' output is a confirmation, not a query
+result, and is out of scope for this decision.
+
+**Rejected — text only**, which the tasks' wording implies (`6.5` says "the rendered current state") and
+which is the smaller surface. It leaves every consumer parsing prose, and the first consumer is a plugin
+in another repository whose breakage would show up as a workflow that silently stops resuming correctly.
+
+**Rejected — JSON only**, which is unambiguous for machines and unreadable in the terminal where the
+Product Owner checks the tool by hand. It also makes an agent reformat before pasting a status into a
+thread, which is the tool's most common use.
+
 ## Record schema
 
 One JSON object per line. Three fields are carried by every kind without exception:

@@ -7351,6 +7351,107 @@ the answer is not to make them the same, because they are answering different qu
 Carried item 15 (the `toOwnedSlice` comment wording) was **discharged in 5B**. Carried items 10 and 13
 remain **section 6's**, as re-homed when this section opened.
 
+## 6. Read commands
+
+**[architect]** Base: `31eb5e3` — the read surface: the read-only load path, and the five commands that
+render what section 5 derives.
+
+**[architect]** **Product Owner amendment, before the first block — D15: reads render text by default and
+emit JSON on `--json`.**
+
+I put this to the Product Owner rather than deciding it, because **nothing in `design.md`, the specs or
+`proposal.md` said what a read emits**, and all five commands in this section emit something. It is not a
+detail that can be settled in a review: `9.4` hands the `dmon-dev` plugin a way to consume this tool, so
+the output format is a contract, and `8.4` requires the surface be documented precisely enough to
+reimplement.
+
+**The Product Owner chose text plus `--json`** over text-only (which the tasks' own wording implies —
+`6.5` says "the rendered current state") and over JSON-only. Landed as **D15** in `design.md` and as a new
+requirement, *"Every read is available both rendered and machine-readable"*, in
+`specs/log-retrieval/spec.md`. `VALIDATE_EXIT:0`.
+
+**What this changes for the section.** `6.1`–`6.5` keep their numbers and their wording; their scope now
+includes both renderings. No new `N.M` tasks — the same precedent as section 2's `durable-format`
+amendment and section 4's addressee-validation amendment, both of which widened existing tasks rather than
+adding numbered ones.
+
+**The binding part of D15, and the thing to review every block against:** *one derivation, two
+renderers, never two derivations*. If a `--json` payload can carry something the text form cannot show,
+the text form is under-rendering — that is not licence for the two to diverge. A consumer parsing `--json`
+and a human reading the default must never be told different things about the same log. `--json` is a
+read-command flag only; the write commands' output is a confirmation, not a query result, and is
+untouched.
+
+**[architect]** **Section 6 is carved into three blocks.**
+
+- **6A — `6.6`, `6.2`**: the read foundation. The read-only load path that never creates the log, the
+  reporting path for `DeriveError` (carried 17), and `show --item` / `show --seq` as the first consumer
+  that drives it end to end. Carried items 10 and 13 discharge here.
+- **6B — `6.1`, `6.5`**: `resume` and `status` — the two renderings of current state, which share
+  most of their content (D8's three things, and `next-state`'s narrative-plus-open-items).
+- **6C — `6.3`, `6.4`**: `list` and `refs` — the two index consumers, plus the `by_block_label` rename and
+  the `--block` semantics the section-5 close ruled on.
+
+**6A first, and deliberately so.** It is the only block that adds file I/O, and every later block in the
+section rides on it. Both of the read path's known hazards (carried 10, carried 13) are its, and carried
+17 makes section 5's three faults reachable from the CLI for the first time. If that foundation is wrong,
+6B and 6C are built on it before anyone notices.
+
+**[architect]** **Brief — block 6A (`6.6`, `6.2`) → @worker.**
+
+**Tasks.**
+
+- `6.6` Report plainly when the log file does not exist on a read, and never create it silently
+  (`durable-format`).
+- `6.2` `devlog show --item <n>` and `devlog show --seq <n>` — retrieve one item or record with its
+  current state and closure.
+
+**Four carried obligations discharge in this block. They are not extras; they are why it is first.**
+
+1. **Carried 13 — do not duplicate `openLocked`'s read-and-parse.** `openLocked` (`src/log.zig`) creates
+   the log if it is missing, which is right for a write and **wrong for every read**. Factor the shared
+   read-and-parse rather than copying it, and make the create-or-not an explicit property of the call, not
+   a difference between two near-identical functions. This is the shape most likely to be got wrong by
+   copy-paste, which is exactly why it was carried.
+2. **Carried 10 — `durable-format`'s "a read ignores a temporary file" scenario has no task and becomes
+   dischargeable here.** A read opens the log path; the temp file is a different path
+   (`src/log.zig:206–212`'s pattern) and must never be picked up. Write the test that pins it. It cannot
+   be discharged anywhere earlier and nothing else in the change will cover it.
+3. **Carried 17 — `DeriveError` has no reporting path.** `reportLogError` (`main.zig`) covers `log`'s
+   error set, not `state`'s, so `ItemNumberMismatch`, `CloseTargetMissing` and `VerdictMissingKey` are
+   currently unreachable from the CLI. Give them one with **the same message shape and exit code** as the
+   existing faults. This project's standing hazard is a surface that behaves differently depending on
+   which subcommand you called.
+4. **Carried 16 — a read that enumerates a whole index inherits unstable hash ordering.** `show` looks up
+   by key, so it is safe; the rule is recorded here so 6B and 6C inherit it, and so that if you *do*
+   enumerate anything, you impose an order as the grid does with `block_order`.
+
+**`6.6` — the read-only load.** `durable-format` is the spec. The two behaviours: a read of a missing log
+**reports plainly and creates nothing** — no file, no directory, no temp file, nothing on disk changed —
+and a read **ignores any temporary file** beside the log. Both need tests that would fail if the branch
+were deleted; "the file was not created" is only convincing if the test asserts the absence rather than
+merely not crashing.
+
+**`6.2` — `show`.** `--item <n>` retrieves one item *with its current state and closure* — `work-items`'
+*"who closed it, when, and why are all recoverable"* is the requirement, and `state.Item` already retains
+every close, so this renders what 5A derived rather than re-deriving it. `--seq <n>` retrieves one record.
+Decide and state what each does when the target does not exist: a plain report and a non-zero exit, in the
+same shape as the existing refusals — not an empty success. The two flags are mutually exclusive; a
+`show` with both, or with neither, is a parse fault in the existing first-fault-wins style (A6).
+
+**D15 applies from this block onward.** `show` renders text by default and the same content as JSON on
+`--json`. One derivation, two renderers. Build the JSON output with the writer already in `record.zig`
+rather than a second hand-rolled emitter, and make sure the text form shows everything the JSON carries —
+if it cannot, say so in your report rather than letting them drift.
+
+**Constraints that have not changed.** Zig 0.16 against the real API, never a remembered one. No
+third-party dependencies (ADR-0001/0002). Nothing persisted — the indexes stay per-invocation. Argument
+parsing extends the existing two-phase, command-scoped-arity parser (A5); `--json` is a flag on read
+commands only. Parse-ambiguity errors still beat `--help`/`--version`.
+
+**Done-gates.** `make gates` → `GATES_EXIT:0`, quoting every individual `LABEL_EXIT:<n>` line, and the
+counted test total. Then `→ @reviewer`. No commit, no ticks.
+
 ## NEXT
 
 **[architect]** **Section 5 is CLOSED** — supervisor `Approve` on the **first** pass, no remediation

@@ -68,3 +68,26 @@ reader can ask a precise question and receive a precise answer.
 
 - **WHEN** an agent asks for items that are open and blocking
 - **THEN** only those items are returned, regardless of kind or addressee
+
+### Requirement: Every read is available both rendered and machine-readable
+
+Each read SHALL present its result as rendered text by default, for a reader working in a terminal or
+quoting the result into prose, and SHALL present the same result as JSON when asked, for a consumer that
+parses it. Both SHALL be produced from one derivation, so that the rendered and machine-readable forms can
+never report different things about the same log.
+
+#### Scenario: Reading in a terminal
+
+- **WHEN** an agent or a person performs a read without asking for JSON
+- **THEN** the result is rendered as text meant to be read, and can be quoted directly into a record's
+  prose
+
+#### Scenario: A consumer parses a read
+
+- **WHEN** a program performs the same read asking for JSON
+- **THEN** it receives the result as JSON on standard output
+
+#### Scenario: The two forms agree
+
+- **WHEN** the same read is performed in both forms against an unchanged log
+- **THEN** they describe the same records, items and state, differing only in presentation
