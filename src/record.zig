@@ -247,6 +247,23 @@ pub const Record = union(Kind) {
         };
     }
 
+    /// The record's prose — the one field lexical search indexes (D3,
+    /// architect ruling R4, DEVLOG `## 7`). `null` only for `header`,
+    /// which carries no `Attributed` to hold one; a record with no body is
+    /// not a document.
+    ///
+    /// Mirrors `role()` and `to()`: this union owns which of its fields is
+    /// its body, so `search.zig` never switches on the tag itself. A
+    /// `section`'s `title`, a `verdict`'s `commit` and a `close`'s `state`
+    /// are metadata rather than prose and are deliberately not part of the
+    /// answer.
+    pub fn body(self: Record) ?[]const u8 {
+        return switch (self) {
+            .header => null,
+            inline .section, .brief, .post, .item, .close, .verdict, .next => |r| r.common.body,
+        };
+    }
+
     pub fn deinit(self: Record, allocator: Allocator) void {
         switch (self) {
             .header => |r| r.free(allocator),
@@ -934,6 +951,33 @@ test "header round-trips and carries no role field" {
     try testing.expectEqualStrings("add-devlog-core", parsed.header.change);
     try testing.expectEqual(@as(usize, 2), parsed.header.roles.len);
     try testing.expectEqualStrings("architect", parsed.header.closers[0]);
+}
+
+test "body() answers for every kind: the common body, and null only for header (R4)" {
+    const common: Attributed = .{ .seq = 1, .ts = "t", .role = "worker", .body = "the prose" };
+    const cases = [_]Record{
+        .{ .section = .{ .common = common, .title = "Search", .base = "abc123" } },
+        .{ .brief = .{ .common = common } },
+        .{ .post = .{ .common = common } },
+        .{ .item = .{ .common = common, .item = 1, .type = .question, .blocking = true } },
+        .{ .close = .{ .common = common, .item = 1, .state = .resolved } },
+        .{ .verdict = .{ .common = common, .outcome = .approve, .commit = "abc123" } },
+        .{ .next = .{ .common = common } },
+    };
+    for (cases) |rec| try testing.expectEqualStrings("the prose", rec.body().?);
+
+    // The header's own `change`/`tool` are metadata, not prose: it has no
+    // body at all, so it is never a search document.
+    const header = Record{ .header = .{
+        .seq = 1,
+        .ts = "t",
+        .format = 1,
+        .tool = "devlog 0.1.0",
+        .change = "add-devlog-core",
+        .roles = &.{"worker"},
+        .closers = &.{"architect"},
+    } };
+    try testing.expectEqual(@as(?[]const u8, null), header.body());
 }
 
 test "section round-trips with title, base, and a common field" {

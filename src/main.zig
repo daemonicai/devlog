@@ -16,11 +16,13 @@ const body = @import("body.zig");
 // `--state` value) — Zig refuses that shadowing outright. `runShow`
 // (block 6A) is the first command to derive read-side state.
 const state_mod = @import("state.zig");
+const search = @import("search.zig");
 test {
     _ = record;
     _ = log;
     _ = body;
     _ = state_mod;
+    _ = search;
 }
 
 /// One subcommand of the surface. `section` names the `tasks.md` section
@@ -40,6 +42,13 @@ const CommandSpec = struct {
     /// this way. A property on the spec rather than a name check against
     /// `"search"`, so the exemption is structural and does not have to be
     /// remembered when a future command adds one too.
+    ///
+    /// Deliberately a **boolean, not a count** (architect ruling R1, DEVLOG
+    /// `## 7`): "exactly one" is the only arity a positional has here, and
+    /// it is enforced where the value is *stored* (`setPositional`), the
+    /// same shape `setOnce` gives an exactly-once flag. A second bare token
+    /// is `unexpected_argument`, exactly as it is for a command that takes
+    /// none at all — B1's silent-acceptance defect stays fixed for both.
     takes_positional: bool = false,
 };
 
@@ -351,6 +360,41 @@ const refs_usage =
     \\Takes no body: never reads stdin.
 ;
 
+const search_usage =
+    \\USAGE
+    \\    devlog --log <path> search <query> [--json]
+    \\
+    \\Searches the bodies of this log's records for the query's words and
+    \\returns the matching records, most relevant first (D3: lexical BM25,
+    \\no embeddings and no persisted index — the index is built in memory
+    \\on each invocation and discarded on exit).
+    \\
+    \\ARGUMENTS
+    \\    <query>  The words to search for. Exactly one argument: quote a
+    \\             multi-word query. A second bare token is refused rather
+    \\             than silently dropped.
+    \\
+    \\FLAGS
+    \\    --json   Emit the same result as JSON instead of rendered text
+    \\             (D15). One derivation, two renderings — never two
+    \\             derivations.
+    \\
+    \\The result is the same shape 'list' and 'refs' emit, and the ranking
+    \\is the order it arrives in: there is no score field. A record matches
+    \\when its body contains at least one of the query's words; matching
+    \\folds ASCII case and does no stemming. Records are ranked by BM25,
+    \\ties broken by seq ascending, so the same log and query always give
+    \\the same order.
+    \\
+    \\Only the log named by --log is searched — a search never reaches
+    \\another change's log.
+    \\
+    \\Finding nothing is an ordinary success (an empty list), not a
+    \\refusal.
+    \\
+    \\Takes no body: never reads stdin.
+;
+
 /// Names only, from sections 4, 6 and 7 of the change's `tasks.md`. This
 /// block dispatches to them and gives each a `--help`; their behaviour is
 /// those sections' to build. `header`, `post`, `section`, `brief`, and
@@ -369,7 +413,7 @@ const commands = [_]CommandSpec{
     .{ .name = "list", .summary = "List records, filtered by section, block, role, kind, state, or addressee.", .section = "6", .usage = list_usage },
     .{ .name = "refs", .summary = "Show every record carrying a given external reference.", .section = "6", .usage = refs_usage },
     .{ .name = "status", .summary = "Show the rendered current state: NEXT plus open items.", .section = "6", .usage = status_usage },
-    .{ .name = "search", .summary = "Search record bodies, ranked by relevance.", .section = "7", .takes_positional = true },
+    .{ .name = "search", .summary = "Search record bodies, ranked by relevance.", .section = "7", .usage = search_usage, .takes_positional = true },
 };
 
 /// The one place that owns the `devlog: ` prefix, the trailing newline,
@@ -583,6 +627,11 @@ const Parsed = struct {
     /// permitted set in `runList`, not here — same split A5 draws for every
     /// other flag's arity-vs-value-validity distinction.
     kind: ?[]const u8 = null,
+    /// The bare positional argument of a `takes_positional` command —
+    /// `search`'s query (7.2), the only one this surface has. Exactly-once
+    /// by construction: `setPositional` is where that arity is enforced
+    /// (ruling R1), so `CommandSpec.takes_positional` stays a boolean.
+    query: ?[]const u8 = null,
 
     fn deinit(self: *Parsed, allocator: Allocator) void {
         self.roles.deinit(allocator);
@@ -626,6 +675,28 @@ fn setOnce(p: *Parsed, field: *?[]const u8, name: []const u8, value: []const u8)
         return;
     }
     field.* = value;
+}
+
+/// Stores the one bare positional argument a `takes_positional` command
+/// accepts, and refuses everything else about it (ruling R1, DEVLOG
+/// `## 7`). The same shape as `setOnce`, and for the same reason: a second
+/// value is an ambiguity the caller must be told about, never a silently
+/// dropped token (B1). Checks "already given" before "empty", exactly as
+/// `setOnce` does, so the two report the same way on the same line.
+///
+/// The empty case reuses `empty_value_for`'s wording, naming the argument
+/// as the usage line names it (`<query>`) rather than inventing a second
+/// phrasing for "you gave me nothing to work with".
+fn setPositional(p: *Parsed, value: []const u8) void {
+    if (p.query != null) {
+        p.setFault(.{ .unexpected_argument = value });
+        return;
+    }
+    if (value.len == 0) {
+        p.setFault(.{ .empty_value_for = "<query>" });
+        return;
+    }
+    p.query = value;
 }
 
 /// Appends to a repeatable flag (`--role`/`--closer` on `header`) — no
@@ -675,11 +746,12 @@ fn appendRef(p: *Parsed, allocator: Allocator, list: *std.ArrayList(record.Ref),
 /// is found (unconditionally — there is no command yet to defer to) *or*
 /// when the command is one this dispatcher already builds (`header`,
 /// `post`, `section`, `brief`, `next` as of blocks 4A/4B, `show`,
-/// `resume`, `status`, `list`, `refs` as of section 6 — their grammars
-/// are enforced everywhere on the line, not just before the bare word);
-/// an unrecognised flag after any other command's bare token is left
-/// alone, for that command's own section to validate once it exists
-/// (unchanged pre-4A behaviour).
+/// `resume`, `status`, `list`, `refs` as of section 6, `search` as of
+/// block 7A — their grammars are enforced everywhere on the line, not
+/// just before the bare word); an unrecognised flag after any other
+/// command's bare token is left alone, for that command's own section to
+/// validate once it exists (unchanged pre-4A behaviour — now reachable
+/// only for a command word `findCommand` does not recognise at all).
 fn parseArgs(allocator: Allocator, args: []const [:0]const u8) Allocator.Error!Parsed {
     var p: Parsed = .{};
     const command_hint = findCommandToken(args);
@@ -696,9 +768,14 @@ fn parseArgs(allocator: Allocator, args: []const [:0]const u8) Allocator.Error!P
     const wants_status = command_hint != null and std.mem.eql(u8, command_hint.?, "status");
     const wants_list = command_hint != null and std.mem.eql(u8, command_hint.?, "list");
     const wants_refs = command_hint != null and std.mem.eql(u8, command_hint.?, "refs");
+    const wants_search = command_hint != null and std.mem.eql(u8, command_hint.?, "search");
+    // `search` joins this set as of block 7A (ruling R1): its grammar is
+    // now built, so a flag it does not recognise — `--section` and the
+    // other filters 7.3 will add among them — is refused here rather than
+    // accepted and ignored.
     const strict = wants_header or wants_post or wants_section_cmd or wants_brief or wants_next or
         wants_item or wants_close or wants_verdict or wants_show or wants_resume or wants_status or
-        wants_list or wants_refs;
+        wants_list or wants_refs or wants_search;
     // Whether the hinted command recognises a bare positional argument at
     // all (B1: `CommandSpec.takes_positional`). Looked up structurally,
     // not by name, so a future command that takes one only has to set the
@@ -785,7 +862,7 @@ fn parseArgs(allocator: Allocator, args: []const [:0]const u8) Allocator.Error!P
             if (takeFlagValue(&p, args, &i, "--seq")) |v| setOnce(&p, &p.seq_num, "--seq", v);
         } else if (wants_list and std.mem.eql(u8, arg, "--kind")) {
             if (takeFlagValue(&p, args, &i, "--kind")) |v| setOnce(&p, &p.kind, "--kind", v);
-        } else if ((wants_show or wants_resume or wants_status or wants_list or wants_refs) and std.mem.eql(u8, arg, "--json")) {
+        } else if ((wants_show or wants_resume or wants_status or wants_list or wants_refs or wants_search) and std.mem.eql(u8, arg, "--json")) {
             p.json = true;
         } else if (wants_section_flag and std.mem.eql(u8, arg, "--section")) {
             if (takeFlagValue(&p, args, &i, "--section")) |v| setOnce(&p, &p.section, "--section", v);
@@ -799,18 +876,25 @@ fn parseArgs(allocator: Allocator, args: []const [:0]const u8) Allocator.Error!P
             p.command = arg;
         } else if (startsWithDash(arg) and (strict or p.command == null)) {
             p.setFault(.{ .unknown_flag = arg });
-        } else if (p.command != null and !startsWithDash(arg) and strict and !takes_positional) {
-            // A bare token after the command, for a command that does not
-            // take one (B1): silent success here is the one outcome this
-            // tool must never produce, so it is a parse fault through the
-            // same first-fault-wins structure as every other one (A6),
-            // not a branch that does nothing.
-            p.setFault(.{ .unexpected_argument = arg });
+        } else if (p.command != null and !startsWithDash(arg) and strict) {
+            // A bare token after the command. Either the command takes one
+            // — `setPositional` stores it and enforces its exactly-once
+            // arity (R1) — or it does not, and this is B1's stray token:
+            // silent success here is the one outcome this tool must never
+            // produce, so it is a parse fault through the same
+            // first-fault-wins structure as every other one (A6), not a
+            // branch that does nothing.
+            if (takes_positional) {
+                setPositional(&p, arg);
+            } else {
+                p.setFault(.{ .unexpected_argument = arg });
+            }
         }
-        // else: a bare token after the command on a command that takes
-        // one (`search`, once 7.2 builds it) or a flag belonging to a
-        // command this block does not build, left untouched for that
-        // command's own section to validate once it exists.
+        // else: a flag belonging to a command this dispatcher does not
+        // build, left untouched for that command's own section to validate
+        // once it exists. Every command in `commands` is built as of block
+        // 7A, so nothing reaches this today except a token following an
+        // *unknown* command word, which `run` refuses by name.
     }
 
     return p;
@@ -895,6 +979,10 @@ fn printCommandHelp(w: *Io.Writer, spec: CommandSpec) void {
         w.print("devlog {s} — {s}\n\n{s}\n", .{ spec.name, spec.summary, usage }) catch {};
         return;
     }
+    // Unreachable from `commands` as of block 7A — every command now
+    // carries its own usage. Kept for the same reason as `run`'s
+    // not-implemented arm: a spec added ahead of its behaviour must say so
+    // rather than print an invented promise.
     w.print(
         \\devlog {s} — {s}
         \\
@@ -2180,6 +2268,60 @@ fn runRefs(
     return 0;
 }
 
+/// `devlog search <query>` (7.2, `log-retrieval`: "The log can be searched
+/// by meaning"). Builds `search.Index` over the records already in memory,
+/// ranks them, and renders the result through the same two renderers
+/// `list` and `refs` use — no score field and no seventh JSON shape
+/// (ruling R3, D15: one derivation, two renderings).
+///
+/// **Scoping needs no code.** `log-retrieval` requires that "only records
+/// belonging to the change being searched are considered"; this tool only
+/// ever opens the single file `--log` names, so the property is structural
+/// — a guard for it could only ever be true, and asserting it here would
+/// suggest the tool has some other log in reach. It has none.
+///
+/// Opened with `openReadOnly`, which never creates the log: a search
+/// against a change that has none is a plain refusal, not a fresh empty
+/// file (carried 13, D5). No `state_mod.derive` — nothing here reads
+/// derived state; `7.3` adds it when `--state` first needs it.
+fn runSearch(
+    allocator: Allocator,
+    io: Io,
+    dir: Io.Dir,
+    log_path: []const u8,
+    p: *const Parsed,
+    stdout: *Io.Writer,
+    stderr: *Io.Writer,
+) u8 {
+    const query = p.query orelse return fail(stderr, "'search' requires a query — see --help", .{});
+
+    var diag: record.Diagnostics = .init(allocator);
+    defer diag.deinit();
+
+    var opened = log.openReadOnly(allocator, io, dir, log_path, &diag) catch |err| {
+        return reportLogError(stderr, err, &diag);
+    };
+    defer opened.close(allocator);
+
+    var index = search.Index.build(allocator, opened.log.records) catch
+        return fail(stderr, "out of memory", .{});
+    defer index.deinit();
+
+    const ranked = index.rank(allocator, query) catch
+        return fail(stderr, "out of memory", .{});
+    defer allocator.free(ranked);
+
+    // Finding nothing is an ordinary empty success, exactly as `refs`
+    // rules it: a search that matches no record is an answer about the
+    // log, not a failure of the request.
+    if (p.json) {
+        writeRecordListJson(stdout, ranked, &diag) catch |err| return reportLogError(stderr, err, &diag);
+    } else {
+        writeRecordListText(stdout, ranked);
+    }
+    return 0;
+}
+
 /// Dispatches one invocation and returns the process exit code.
 fn run(
     allocator: Allocator,
@@ -2277,10 +2419,17 @@ fn run(
     if (std.mem.eql(u8, spec.name, "refs")) {
         return runRefs(allocator, io, dir, log_path, &p, stdout, stderr);
     }
+    if (std.mem.eql(u8, spec.name, "search")) {
+        return runSearch(allocator, io, dir, log_path, &p, stdout, stderr);
+    }
 
-    // No other subcommand is wired yet (`search` — section 7). Fail
-    // honestly rather than silently succeed, and touch nothing on the way
-    // out (D5).
+    // Every command in `commands` is now dispatched above, so this is no
+    // longer reachable from the command surface. It stays as the honest
+    // failure for a `CommandSpec` added to that table ahead of its
+    // dispatch arm — an internal mistake rather than a user one, but one
+    // whose only alternative is silent success, which is the single
+    // outcome this tool must never produce. Touches nothing on the way out
+    // (D5).
     return fail(stderr, "'{s}' is not implemented yet", .{spec.name});
 }
 
@@ -2418,18 +2567,21 @@ test "a recognised command without --log is an error, not an attempt" {
     try expectRun(std.testing.allocator, &.{"post"}, 1, null, "requires --log");
 }
 
-test "a recognised but unimplemented command with --log fails honestly as not implemented" {
-    // search (7.2) is the only command left unbuilt past block 6C — list
-    // and refs became real in this block, retargeted here for the same
-    // reason 4A's original status target was retargeted at 6A, 6B, and now
-    // 6C; every command this change has not yet built must still fail this
-    // way rather than silently succeed.
+test "a recognised command with --log that cannot proceed fails honestly, never silently succeeds" {
+    // Was "a recognised but unimplemented command…", retargeted at 4C, 6A,
+    // 6B and 6C as each section built its commands, and finally landing
+    // here: block 7A builds `search`, the last placeholder, so there is no
+    // unimplemented command left to point at. The coverage it carries is
+    // what matters and is unchanged — a recognised command given --log
+    // that cannot do its job says so and exits non-zero, rather than
+    // exiting 0 having done nothing. `search` with no query is now that
+    // case (R1: no positional at all is a refusal).
     try expectRun(
         std.testing.allocator,
         &.{ "--log", "DEVLOG.jsonl", "search" },
         1,
         null,
-        "'search' is not implemented yet",
+        "'search' requires a query",
     );
 }
 
@@ -2596,29 +2748,58 @@ test "an unrecognised global flag before the command is rejected" {
     try expectRun(std.testing.allocator, &.{ "--nope", "post" }, 1, null, "unknown flag '--nope'");
 }
 
-test "flags after the subcommand are left for its own section, not rejected here" {
-    // show is real as of block 6A, resume/status as of block 6B, list/refs
-    // as of block 6C, so this test (from block 4A, retargeted at 4C, 6A,
-    // 6B, and now again here) moves to the one command this change never
-    // builds — search (7.2), still a placeholder past section 6.
-    // `--section` is not one of `--role`'s global flags, so this pins that
-    // it is left for `search`'s own section rather than rejected here.
+test "flags after an unknown command word are left alone, not rejected as unknown flags" {
+    // From block 4A, retargeted at 4C, 6A, 6B and 6C as each section built
+    // its commands. Its subject — a command whose grammar this dispatcher
+    // does not yet enforce — no longer exists among the *known* commands:
+    // block 7A builds `search`, the last one, so every entry in `commands`
+    // is strict. What remains of that state is an unrecognised command
+    // word, and the coverage the test carries is unchanged: its trailing
+    // flags are not parsed against anyone's grammar, so the refusal names
+    // the command, not the flag.
+    try expectRun(
+        std.testing.allocator,
+        &.{ "--log", "DEVLOG.jsonl", "frobnicate", "--section", "6" },
+        1,
+        null,
+        "unknown command 'frobnicate'",
+    );
+}
+
+test "search joins the strict set: a filter flag 7.3 has not built yet is refused, not ignored (R1)" {
+    // The other half of the retarget above, and the reason for it: while
+    // `search` was a placeholder this exact line reached the
+    // not-implemented message, silently accepting `--section`. It is now a
+    // parse fault like any other unknown flag.
     try expectRun(
         std.testing.allocator,
         &.{ "--log", "DEVLOG.jsonl", "search", "--section", "6" },
         1,
         null,
-        "'search' is not implemented yet",
+        "unknown flag '--section'",
     );
 }
 
 test "--log and --role are recognised in any position relative to the command" {
+    // Retargeted in block 7A: `search` (the old subject) is strict now and
+    // recognises neither `--role` nor a second positional, so the pair
+    // moves to commands that do recognise them. Both assertions still
+    // prove the same thing — the flag was picked up *after* the command
+    // word rather than refused or ignored, since a missing `--log` and an
+    // unrecognised `--role` each produce a different message.
     try expectRun(
         std.testing.allocator,
-        &.{ "search", "--log", "DEVLOG.jsonl", "--role", "architect" },
+        &.{ "search", "--log", "DEVLOG.jsonl", "concurrency" },
         1,
         null,
-        "'search' is not implemented yet",
+        "no log at this path yet",
+    );
+    try expectRun(
+        std.testing.allocator,
+        &.{ "list", "--log", "DEVLOG.jsonl", "--role", "architect" },
+        1,
+        null,
+        "no log at this path yet",
     );
 }
 
@@ -7446,4 +7627,248 @@ test "list --state open --to <role> agrees with resume --role <role> on the same
     for (resume_items, list_items) |ri, li| {
         try std.testing.expectEqual(ri.object.get("number").?.integer, li.object.get("number").?.integer);
     }
+}
+
+// --- Section 7: search (7.1, 7.2) ----------------------------------------
+
+/// A corpus small enough to rank by hand, and diverse enough to catch what
+/// a search that indexed the wrong thing would get away with: bodies of
+/// several kinds, a non-ASCII word, and one record whose body never
+/// mentions the term the tests query for.
+///
+/// Records, in append order (kind, seq, body in brief):
+///   1. header  seq 1  — no body at all: never a document (R4)
+///   2. post    seq 2  — "lock" once, 12 tokens
+///   3. post    seq 3  — "lock" twice, 11 tokens
+///   4. brief   seq 4  — about ranking, no "lock"
+///   5. post    seq 5  — carries the non-ASCII word "naïve"
+///   6. item    seq 6  — an item's body is prose too, and is indexed
+///   7. next    seq 7  — so is a next's
+fn seedSearchFixture(allocator: Allocator, dir: Io.Dir, io: Io, diag: *record.Diagnostics) !void {
+    _ = try log.appendHeader(
+        allocator,
+        io,
+        dir,
+        "DEVLOG.jsonl",
+        "t0",
+        "devlog 0.1.0",
+        .{ .change = "add-devlog-core", .roles = &.{ "architect", "worker" }, .closers = &.{"architect"} },
+        diag,
+    );
+
+    _ = try log.appendRecord(allocator, io, dir, "DEVLOG.jsonl", record.Record{ .post = .{
+        .common = .{
+            .seq = 0,
+            .ts = "t1",
+            .role = "architect",
+            .section = "7",
+            .body = "The write path takes the lock, assigns seq, and appends one line.",
+        },
+    } }, diag);
+
+    _ = try log.appendRecord(allocator, io, dir, "DEVLOG.jsonl", record.Record{ .post = .{
+        .common = .{
+            .seq = 0,
+            .ts = "t2",
+            .role = "worker",
+            .section = "7",
+            .body = "Lock, write, rename: the lock is what makes the write atomic.",
+        },
+    } }, diag);
+
+    _ = try log.appendRecord(allocator, io, dir, "DEVLOG.jsonl", record.Record{ .brief = .{
+        .common = .{
+            .seq = 0,
+            .ts = "t3",
+            .role = "architect",
+            .section = "7",
+            .to = "worker",
+            .body = "Ranking is the order, never a score field.",
+        },
+    } }, diag);
+
+    _ = try log.appendRecord(allocator, io, dir, "DEVLOG.jsonl", record.Record{ .post = .{
+        .common = .{
+            .seq = 0,
+            .ts = "t4",
+            .role = "worker",
+            .body = "A naïve prose search would rescan the file.",
+        },
+    } }, diag);
+
+    _ = try log.appendItem(allocator, io, dir, "DEVLOG.jsonl", record.Record{ .item = .{
+        .common = .{
+            .seq = 0,
+            .ts = "t5",
+            .role = "worker",
+            .to = "architect",
+            .body = "Does the temp file count as state?",
+        },
+        .item = 0,
+        .type = .question,
+        .blocking = false,
+    } }, diag);
+
+    _ = try log.appendRecord(allocator, io, dir, "DEVLOG.jsonl", record.Record{ .next = .{
+        .common = .{ .seq = 0, .ts = "t6", .role = "architect", .body = "Resume at section 7." },
+    } }, diag);
+}
+
+test "search returns only the records whose bodies match, ranked by relevance (7.2)" {
+    var result = try runSeeded(std.testing.allocator, seedSearchFixture, &.{ "--log", "DEVLOG.jsonl", "search", "lock" });
+    defer result.deinit(std.testing.allocator);
+    try std.testing.expectEqual(@as(u8, 0), result.code);
+
+    const text = result.stdout;
+    try std.testing.expect(std.mem.indexOf(u8, text, "records (2):") != null);
+
+    // Hand-checked BM25: the second post says "lock" twice in 11 tokens,
+    // the first once in 12, so two occurrences beat the small extra length
+    // penalty and it ranks first. The other five documents never say it and
+    // are absent entirely — this is not `list` with a highlight.
+    const pos_twice = std.mem.indexOf(u8, text, "Lock, write, rename") orelse return error.TestUnexpectedResult;
+    const pos_once = std.mem.indexOf(u8, text, "The write path takes") orelse return error.TestUnexpectedResult;
+    try std.testing.expect(pos_twice < pos_once);
+    try std.testing.expect(std.mem.indexOf(u8, text, "Ranking is the order") == null);
+}
+
+test "search indexes every kind's body, and the header's absence of one (R4)" {
+    // An item's body and a next's body are prose and are searchable; the
+    // header carries no body, so a query for a word only its own metadata
+    // fields hold ("add-devlog-core", its change) finds nothing.
+    {
+        var result = try runSeeded(std.testing.allocator, seedSearchFixture, &.{ "--log", "DEVLOG.jsonl", "search", "temp state resume" });
+        defer result.deinit(std.testing.allocator);
+        try std.testing.expectEqual(@as(u8, 0), result.code);
+        try std.testing.expect(std.mem.indexOf(u8, result.stdout, "Does the temp file count as state?") != null);
+        try std.testing.expect(std.mem.indexOf(u8, result.stdout, "Resume at section 7.") != null);
+    }
+    {
+        var result = try runSeeded(std.testing.allocator, seedSearchFixture, &.{ "--log", "DEVLOG.jsonl", "search", "add-devlog-core" });
+        defer result.deinit(std.testing.allocator);
+        try std.testing.expectEqual(@as(u8, 0), result.code);
+        try std.testing.expect(std.mem.indexOf(u8, result.stdout, "records (0):") != null);
+    }
+}
+
+test "search folds ASCII case and leaves a multi-byte word whole, end to end" {
+    for ([_][:0]const u8{ "naïve", "Naïve" }) |query| {
+        var result = try runSeeded(std.testing.allocator, seedSearchFixture, &.{ "--log", "DEVLOG.jsonl", "search", query });
+        defer result.deinit(std.testing.allocator);
+        try std.testing.expectEqual(@as(u8, 0), result.code);
+        try std.testing.expect(std.mem.indexOf(u8, result.stdout, "records (1):") != null);
+        try std.testing.expect(std.mem.indexOf(u8, result.stdout, "A naïve prose search") != null);
+    }
+}
+
+test "search with no matches is an ordinary empty success, in both forms (as refs rules it)" {
+    {
+        var result = try runSeeded(std.testing.allocator, seedSearchFixture, &.{ "--log", "DEVLOG.jsonl", "search", "zebra" });
+        defer result.deinit(std.testing.allocator);
+        try std.testing.expectEqual(@as(u8, 0), result.code);
+        try std.testing.expect(std.mem.indexOf(u8, result.stdout, "records (0):") != null);
+        try std.testing.expect(std.mem.indexOf(u8, result.stdout, "(none)") != null);
+        try std.testing.expectEqualStrings("", result.stderr);
+    }
+    {
+        var result = try runSeeded(std.testing.allocator, seedSearchFixture, &.{ "--log", "DEVLOG.jsonl", "search", "zebra", "--json" });
+        defer result.deinit(std.testing.allocator);
+        try std.testing.expectEqual(@as(u8, 0), result.code);
+        try std.testing.expectEqualStrings("[]\n", result.stdout);
+    }
+}
+
+test "search --json is the same bare array list emits, in rank order and with no score field (R3, D15)" {
+    var result = try runSeeded(std.testing.allocator, seedSearchFixture, &.{ "--log", "DEVLOG.jsonl", "search", "lock", "--json" });
+    defer result.deinit(std.testing.allocator);
+    try std.testing.expectEqual(@as(u8, 0), result.code);
+    try expectExactlyOneJsonLine(result.stdout);
+
+    var parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, result.stdout, .{});
+    defer parsed.deinit();
+    const arr = parsed.value.array;
+    try std.testing.expectEqual(@as(usize, 2), arr.items.len);
+
+    // The ranking is the array order and nothing else: no seventh JSON
+    // shape, no score field for a consumer to depend on — which is what
+    // keeps BM25's k1/b tunable later without breaking one.
+    try std.testing.expectEqual(@as(i64, 3), arr.items[0].object.get("seq").?.integer);
+    try std.testing.expectEqual(@as(i64, 2), arr.items[1].object.get("seq").?.integer);
+    for (arr.items) |v| try std.testing.expect(v.object.get("score") == null);
+
+    // Both forms describe the same records (D15).
+    var text_result = try runSeeded(std.testing.allocator, seedSearchFixture, &.{ "--log", "DEVLOG.jsonl", "search", "lock" });
+    defer text_result.deinit(std.testing.allocator);
+    try std.testing.expect(std.mem.indexOf(u8, text_result.stdout, arr.items[0].object.get("body").?.string) != null);
+}
+
+test "search with no query at all is a refusal, not a whole-log dump (R1)" {
+    var result = try runSeeded(std.testing.allocator, seedSearchFixture, &.{ "--log", "DEVLOG.jsonl", "search" });
+    defer result.deinit(std.testing.allocator);
+    try std.testing.expectEqual(@as(u8, 1), result.code);
+    try std.testing.expect(std.mem.indexOf(u8, result.stderr, "'search' requires a query") != null);
+    try std.testing.expectEqualStrings("", result.stdout);
+}
+
+test "search with an empty query is a refusal, worded as an empty flag value is (R1)" {
+    var result = try runSeeded(std.testing.allocator, seedSearchFixture, &.{ "--log", "DEVLOG.jsonl", "search", "" });
+    defer result.deinit(std.testing.allocator);
+    try std.testing.expectEqual(@as(u8, 1), result.code);
+    try std.testing.expect(std.mem.indexOf(u8, result.stderr, "<query> requires a non-empty value") != null);
+    try std.testing.expectEqualStrings("", result.stdout);
+}
+
+test "search takes exactly one positional: a second bare token is refused, never silently dropped (R1, B1)" {
+    // The defect this closes: `search a b c` under a boolean
+    // takes_positional could have searched for "a" and thrown "b" and "c"
+    // away without a word. A multi-word query is the caller's to quote.
+    var result = try runSeeded(std.testing.allocator, seedSearchFixture, &.{ "--log", "DEVLOG.jsonl", "search", "lock", "atomic" });
+    defer result.deinit(std.testing.allocator);
+    try std.testing.expectEqual(@as(u8, 1), result.code);
+    try std.testing.expect(std.mem.indexOf(u8, result.stderr, "unexpected argument 'atomic'") != null);
+    try std.testing.expectEqualStrings("", result.stdout);
+
+    // And a quoted multi-word query is one argument, which works.
+    var quoted = try runSeeded(std.testing.allocator, seedSearchFixture, &.{ "--log", "DEVLOG.jsonl", "search", "lock atomic" });
+    defer quoted.deinit(std.testing.allocator);
+    try std.testing.expectEqual(@as(u8, 0), quoted.code);
+    try std.testing.expect(std.mem.indexOf(u8, quoted.stdout, "records (2):") != null);
+}
+
+test "search against a missing log reports plainly, exits non-zero, and creates nothing (carried 13, D5)" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var stdin_file = try openStdinStandin(tmp.dir, std.testing.io, "");
+    defer stdin_file.close(std.testing.io);
+    var out: Io.Writer.Allocating = .init(std.testing.allocator);
+    defer out.deinit();
+    var err_out: Io.Writer.Allocating = .init(std.testing.allocator);
+    defer err_out.deinit();
+
+    const code = run(
+        std.testing.allocator,
+        std.testing.io,
+        tmp.dir,
+        stdin_file,
+        test_ts,
+        &.{ "--log", "DEVLOG.jsonl", "search", "lock" },
+        &out.writer,
+        &err_out.writer,
+    );
+    try std.testing.expectEqual(@as(u8, 1), code);
+    try std.testing.expect(std.mem.indexOf(u8, err_out.written(), "devlog header") != null);
+
+    var count: usize = 0;
+    var it = tmp.dir.iterate();
+    while (try it.next(std.testing.io)) |entry| {
+        try std.testing.expectEqualStrings("stdin-standin", entry.name);
+        count += 1;
+    }
+    try std.testing.expectEqual(@as(usize, 1), count);
+}
+
+test "search --help prints its own usage, naming the one-argument rule and the absent score" {
+    try expectRun(std.testing.allocator, &.{ "search", "--help" }, 0, "devlog search", null);
+    try expectRun(std.testing.allocator, &.{ "search", "--help" }, 0, "Exactly one argument", null);
+    try expectRun(std.testing.allocator, &.{ "search", "--help" }, 0, "there is no score field", null);
 }
