@@ -364,12 +364,13 @@ const search_usage =
     \\USAGE
     \\    devlog --log <path> search <query> [--section <s>] [--block <b>]
     \\        [--role <r>] [--to <role>] [--kind <k>] [--state <s>]
-    \\        [--blocking] [--json]
+    \\        [--blocking] [--limit <n>] [--json]
     \\
     \\Searches the bodies of this log's records for the query's words and
-    \\returns the matching records, most relevant first (D3: lexical BM25,
-    \\no embeddings and no persisted index — the index is built in memory
-    \\on each invocation and discarded on exit).
+    \\returns the most relevant of the matching records, best first, at
+    \\most 10 of them unless --limit says otherwise (D3: lexical BM25, no
+    \\embeddings and no persisted index — the index is built in memory on
+    \\each invocation and discarded on exit).
     \\
     \\ARGUMENTS
     \\    <query>  The words to search for. Exactly one argument: quote a
@@ -402,24 +403,48 @@ const search_usage =
     \\    --blocking     Only the records that opened items flagged
     \\                   blocking. There is no --no-blocking: absent means
     \\                   no filtering on it.
+    \\    --limit <n>    Return at most n records — the n most relevant.
+    \\                   Defaults to 10. --limit 0 asks for every match,
+    \\                   deliberately and with no cap at all. n is plain
+    \\                   digits: a sign, a separator or a leading zero is
+    \\                   refused rather than quietly reinterpreted, so
+    \\                   '-0' cannot pass for 'no bound'.
     \\    --json         Emit the same result as JSON instead of rendered
     \\                   text (D15). One derivation, two renderings — never
     \\                   two derivations.
     \\
-    \\The filters are 'list''s, and they narrow the query *before* it is
-    \\ranked: relevance is computed over the records that survive them, so
-    \\a word that is rare in the section you are searching ranks as rare
-    \\even if it is common across the whole change. Every given filter must
-    \\match — filters combine with AND. Unlike 'list', --state and
-    \\--blocking do not change what is returned: a search always returns
-    \\records, under every combination of flags.
+    \\The filters are the ones 'list' takes, and they narrow the query
+    \\*before* it is ranked: relevance is computed over the records that
+    \\survive them, so a word that is rare in the section you are searching
+    \\ranks as rare even if it is common across the whole change. Every
+    \\given filter must match — filters combine with AND. Unlike
+    \\'list', --state and --blocking do not change what is returned:
+    \\a search always returns records, under every combination of flags.
     \\
-    \\The result is the same shape 'list' and 'refs' emit, and the ranking
-    \\is the order it arrives in: there is no score field. A record matches
-    \\when its body contains at least one of the query's words; matching
-    \\folds ASCII case and does no stemming. Records are ranked by BM25,
-    \\ties broken by seq ascending, so the same log and query always give
-    \\the same order.
+    \\The ranking is the order the records arrive in and nothing else:
+    \\there is no score field. A record matches when its body contains
+    \\at least one of the query's words; matching folds ASCII case and
+    \\does no stemming. Records are ranked by BM25, ties broken by seq
+    \\ascending, so the same log and query always give the same order —
+    \\and, under a limit, the same prefix of it.
+    \\
+    \\Why the limit exists: a question asked in natural language is mostly
+    \\common words, and one matching word is enough, so an uncapped search
+    \\of a real log returns nearly all of it — the whole-log read this
+    \\command exists to replace. When the result was capped the rendered
+    \\text says 'records (10 of 156):', and 'records (10):' when it was
+    \\not, so the count never claims to be the whole answer.
+    \\
+    \\--json is an object, not the bare array 'list' and 'refs' emit:
+    \\{"total":156,"limit":10,"records":[...]} — 'total' is how many
+    \\records matched before the cap, 'limit' the cap that was in force,
+    \\and 'records' the same record shape 'list' emits, in rank order.
+    \\Truncation is 'records' being shorter than 'total'.
+    \\
+    \\Under --limit 0 that field is 'limit':null, not 0: the flag is an
+    \\input idiom for "no bound", but the field reports what actually
+    \\happened, and there was no bound. A zero there would read as a limit
+    \\of zero beside a full result.
     \\
     \\Only the log named by --log is searched — a search never reaches
     \\another change's log.
@@ -672,6 +697,11 @@ const Parsed = struct {
     /// by construction: `setPositional` is where that arity is enforced
     /// (ruling R1), so `CommandSpec.takes_positional` stays a boolean.
     query: ?[]const u8 = null,
+    /// `search`-only, exactly-once (ruling R7): the cap on how many ranked
+    /// records are returned. The raw digits; parsed to a `usize` in
+    /// `runSearch`, where `0` means "no cap" — the same arity-here,
+    /// value-validity-there split `--kind`/`--state` are held to (A5).
+    limit: ?[]const u8 = null,
 
     fn deinit(self: *Parsed, allocator: Allocator) void {
         self.roles.deinit(allocator);
@@ -906,6 +936,8 @@ fn parseArgs(allocator: Allocator, args: []const [:0]const u8) Allocator.Error!P
             if (takeFlagValue(&p, args, &i, "--seq")) |v| setOnce(&p, &p.seq_num, "--seq", v);
         } else if ((wants_list or wants_search) and std.mem.eql(u8, arg, "--kind")) {
             if (takeFlagValue(&p, args, &i, "--kind")) |v| setOnce(&p, &p.kind, "--kind", v);
+        } else if (wants_search and std.mem.eql(u8, arg, "--limit")) {
+            if (takeFlagValue(&p, args, &i, "--limit")) |v| setOnce(&p, &p.limit, "--limit", v);
         } else if ((wants_show or wants_resume or wants_status or wants_list or wants_refs or wants_search) and std.mem.eql(u8, arg, "--json")) {
             p.json = true;
         } else if (wants_section_flag and std.mem.eql(u8, arg, "--section")) {
@@ -1511,6 +1543,41 @@ fn parsePositiveSeq(s: []const u8) ?u64 {
     return if (n > 0) n else null;
 }
 
+/// How many ranked records `search` returns when `--limit` is not given
+/// (ruling R7). Ten because the section 7 supervisor measured the right
+/// record in the top three on all seven of its probe queries, so this is
+/// headroom over what the ranking actually needs, not a guess at it.
+const search_default_limit: usize = 10;
+
+/// Why `--limit` cannot be a plain `parseInt`: that function accepts a
+/// leading sign and `_` separators, so `-0`, `+0`, `+10`, `1_0` and `010`
+/// all parse, and `-0` parses to zero — which this command reads as "no
+/// bound" and answers with the entire log. A flag silently accepted while
+/// producing exactly the unbounded output R7 exists to prevent is the B1
+/// family again, on the output side: not a typo someone makes and notices,
+/// but a typo that looks like it worked. So the *shape* is validated here
+/// rather than inherited.
+///
+/// `NotACount` is anything but plain ASCII digits — no sign, no separator,
+/// no leading zero beyond `0` itself. `TooLarge` is separate because it is
+/// a different fault and deserves a different sentence: a value that is
+/// digits all the way down really is a non-negative integer, it is just
+/// bigger than this tool can count to.
+const LimitFault = error{ NotACount, TooLarge };
+
+/// Parses a `--limit <n>` value. Zero is legal and means "no cap": the two
+/// sibling parsers above reject it because there is no record #0 or seq 0,
+/// but "return everything" is a request a caller can genuinely make.
+fn parseLimit(s: []const u8) LimitFault!usize {
+    if (s.len == 0) return error.NotACount;
+    for (s) |c| {
+        if (!std.ascii.isDigit(c)) return error.NotACount;
+    }
+    if (s.len > 1 and s[0] == '0') return error.NotACount;
+    // Only digits reach here, so the one remaining failure is range.
+    return std.fmt.parseInt(usize, s, 10) catch error.TooLarge;
+}
+
 /// Writes `common`'s three lead fields shared by every attributed kind —
 /// mirrors `record.zig`'s private `writeAttributedHead`, one field over,
 /// so the text renderer below can never show a field the JSON form
@@ -1652,15 +1719,25 @@ fn writeItemJson(w: *Io.Writer, item: state_mod.Item, diag: ?*record.Diagnostics
     try w.writeAll("]}");
 }
 
-/// The text form of a `list`/`refs` result over raw records — "a list is a
-/// sequence of things that already know how to render themselves" (the
-/// block's brief): reuses `renderRecordText`, the exact renderer `show
+/// The text form of a `list`/`refs`/`search` result over raw records — "a
+/// list is a sequence of things that already know how to render themselves"
+/// (the block's brief): reuses `renderRecordText`, the exact renderer `show
 /// --seq` already exercises for every one of the eight kinds, once per
 /// element. Mirrors `renderCurrentStateText`'s own "count header, `(none)`
 /// on empty, numbered `--- ... ---` separators" shape below, so every list-
 /// shaped read in this tool renders the same way.
-fn writeRecordListText(w: *Io.Writer, records: []const record.Record) void {
-    w.print("records ({d}):\n", .{records.len}) catch {};
+///
+/// `matched` is how many records the command found before any cap was
+/// applied, and exists for `search`'s bound alone (ruling R7): given, the
+/// header reads `records (10 of 156):`, so a truncated result cannot report
+/// a count that reads like the whole answer. `list` and `refs` have no cap
+/// and pass `null`, which is the pre-R7 header byte for byte.
+fn writeRecordListText(w: *Io.Writer, records: []const record.Record, matched: ?usize) void {
+    if (matched) |total| {
+        w.print("records ({d} of {d}):\n", .{ records.len, total }) catch {};
+    } else {
+        w.print("records ({d}):\n", .{records.len}) catch {};
+    }
     if (records.len == 0) w.writeAll("(none)\n") catch {};
     for (records, 0..) |rec, idx| {
         w.print("\n--- record {d} of {d} ---\n", .{ idx + 1, records.len }) catch {};
@@ -1668,15 +1745,53 @@ fn writeRecordListText(w: *Io.Writer, records: []const record.Record) void {
     }
 }
 
-/// The JSON form of a `list`/`refs` result over raw records — a bare array,
-/// each element written by `record.write` (D15: no second record emitter).
-fn writeRecordListJson(w: *Io.Writer, records: []const record.Record, diag: ?*record.Diagnostics) record.WriteError!void {
+/// The JSON array of records, with no trailing newline — the one emitter
+/// behind both `list`/`refs`' bare array and `search`'s envelope, so the two
+/// cannot describe a record differently (D15: no second record emitter).
+fn writeRecordArrayJson(w: *Io.Writer, records: []const record.Record, diag: ?*record.Diagnostics) record.WriteError!void {
     try w.writeAll("[");
     for (records, 0..) |rec, idx| {
         if (idx != 0) try w.writeAll(",");
         try record.write(w, rec, diag);
     }
-    try w.writeAll("]\n");
+    try w.writeAll("]");
+}
+
+/// The JSON form of a `list`/`refs` result over raw records — the bare array
+/// above, on its own line.
+fn writeRecordListJson(w: *Io.Writer, records: []const record.Record, diag: ?*record.Diagnostics) record.WriteError!void {
+    try writeRecordArrayJson(w, records, diag);
+    try w.writeAll("\n");
+}
+
+/// The JSON form of a `search` result (ruling R7). The one shape on this
+/// surface that is not the bare array its records would otherwise be: a
+/// bounded result must be able to say it was bounded, and the consumer at
+/// `9.4` is a plugin rather than a human who can notice a short list.
+/// `total` is the match count before the cap, and truncation is
+/// `records.length < total`.
+///
+/// **`limit` is `null` when there was no bound, never `0`** (the architect's
+/// ruling on R7). `--limit 0` is an input idiom — a human deliberately
+/// asking for everything — but this field describes what happened, and
+/// `"limit":0` beside 159 returned records describes something that did
+/// not. A consumer writing `records.length < limit` gets a wrong answer
+/// from `0` and a type error from `null`, and only one of those gets fixed.
+/// The same principle that produced R7 itself: the machine-readable
+/// rendering must not be able to mislead a consumer who cannot see the
+/// human one.
+fn writeSearchResultJson(
+    w: *Io.Writer,
+    records: []const record.Record,
+    total: usize,
+    limit: ?usize,
+    diag: ?*record.Diagnostics,
+) record.WriteError!void {
+    try w.print("{{\"total\":{d},\"limit\":", .{total});
+    if (limit) |n| try w.print("{d}", .{n}) else try w.writeAll("null");
+    try w.writeAll(",\"records\":");
+    try writeRecordArrayJson(w, records, diag);
+    try w.writeAll("}\n");
 }
 
 /// The text form of a `list --state`/`--blocking` result — the item-
@@ -2165,15 +2280,37 @@ fn resolveFilterSpec(p: *const Parsed, stderr: *Io.Writer) FilterSpecResult {
     return .{ .ok = .{ .kind = kind_filter, .state = state_filter, .item_only = item_only } };
 }
 
-/// How many record-level filters are active. `list` alone needs the count
-/// — for its `seq` sort — but it lives beside the seed selection it
-/// describes so the two cannot drift apart.
-fn activeRecordFilterCount(p: *const Parsed, kind_filter: ?record.Kind) usize {
-    return @as(usize, @intFromBool(p.section != null)) +
-        @as(usize, @intFromBool(p.block != null)) +
-        @as(usize, @intFromBool(p.role != null)) +
-        @as(usize, @intFromBool(p.to != null)) +
-        @as(usize, @intFromBool(kind_filter != null));
+/// Validates `--role`/`--to` as filters over the log's **history**, for the
+/// two commands that take them as filters — `null` when both pass, the exit
+/// code of the already-printed refusal otherwise.
+///
+/// Blocker 1 (section 6 supervisor), corrected by the architect's ruling-1
+/// follow-up: an undeclared value is refused, the same typo hazard `resume`
+/// guards on its own `--role`, but "declared" means declared in *any* header
+/// this log carries, not merely the latest. A role the project has since
+/// retired (this project's own `orchestrator` → `architect`) still authored
+/// records that remain in the log and must stay queryable through them.
+///
+/// One place rather than two identical blocks in `runList` and `runSearch`
+/// (section 7 supervisor): the two must refuse the same values with the same
+/// message, and a copy is how that stops being true.
+fn checkHistoryFilters(
+    records: []const record.Record,
+    p: *const Parsed,
+    diag: *record.Diagnostics,
+    stderr: *Io.Writer,
+) ?u8 {
+    if (p.role) |r| {
+        log.checkDeclaredRoleHistory(records, r, diag) catch |err| {
+            return reportLogError(stderr, err, diag);
+        };
+    }
+    if (p.to) |t| {
+        log.checkDeclaredToHistory(records, t, diag) catch |err| {
+            return reportLogError(stderr, err, diag);
+        };
+    }
+    return null;
 }
 
 /// The one answer to "which records match these filters", appended to
@@ -2194,9 +2331,9 @@ fn activeRecordFilterCount(p: *const Parsed, kind_filter: ?record.Kind) usize {
 /// between runs, which is what makes `7.4`'s determinism requirement hold
 /// for a filtered search as well as an unfiltered one.
 ///
-/// The `seq` sort deliberately stays *outside* this function (ruling R6):
-/// it is `list`'s, and it is wasted work for `search`, which re-sorts every
-/// result by score.
+/// Both callers therefore receive their candidates in `seq` order, and
+/// neither sorts: `search` re-sorts by score, and `list` has nothing left to
+/// do (the architect's ruling on carried 21 — see `runList`).
 fn selectCandidates(
     allocator: Allocator,
     records: []const record.Record,
@@ -2224,18 +2361,14 @@ fn selectCandidates(
     }
 }
 
-fn recordSeqLessThan(_: void, a: record.Record, b: record.Record) bool {
-    return a.seq() < b.seq();
-}
-
 /// `devlog list` (6.3, `log-retrieval`). An index consumer, not a deriving
 /// command: every filter reads off `state_mod`'s already-built indexes or
 /// the raw parsed `records` slice, never a second derivation.
 ///
 /// **Carried 16** lives in `selectCandidates`, which this shares with
 /// `search` (ruling R6) — the seed-and-intersect selection and its order
-/// guarantees are documented there. What stays here is the sort that
-/// selection deliberately leaves behind, and the item-narrowed half below.
+/// guarantees are documented there. What stays here is the item-narrowed
+/// half below.
 ///
 /// **`--state`/`--blocking` narrow the result to items** (the block's
 /// ruling): they are properties only a derived item has, so their presence
@@ -2270,24 +2403,7 @@ fn runList(
     };
     defer opened.close(allocator);
 
-    // Blocker 1 (section 6 supervisor), corrected by the architect's
-    // ruling-1 follow-up: `--role`/`--to` are filters over **history**
-    // here, not identity, so an undeclared value is still refused — the
-    // same typo hazard `resume` guards on its own `--role` — but "declared"
-    // means declared in *any* header this log carries, not merely the
-    // latest. A role the project has since retired (this project's own
-    // `orchestrator` → `architect`) still authored records that remain in
-    // the log, and must stay queryable through them.
-    if (p.role) |r| {
-        log.checkDeclaredRoleHistory(opened.log.records, r, &diag) catch |err| {
-            return reportLogError(stderr, err, &diag);
-        };
-    }
-    if (p.to) |t| {
-        log.checkDeclaredToHistory(opened.log.records, t, &diag) catch |err| {
-            return reportLogError(stderr, err, &diag);
-        };
-    }
+    if (checkHistoryFilters(opened.log.records, p, &diag, stderr)) |code| return code;
 
     var derived = state_mod.derive(allocator, opened.log.records, &diag) catch |err| {
         return reportLogError(stderr, err, &diag);
@@ -2314,31 +2430,17 @@ fn runList(
     selectCandidates(allocator, opened.log.records, derived.indexes, p, filters.kind, &matching) catch
         return fail(stderr, "out of memory", .{});
 
-    // A single filter's bucket, or the raw positional slice with none
-    // active, is already in log order by construction — sorting only does
-    // real work, and is only needed at all, once two or more filters
-    // intersect (carried 16).
-    //
-    // Carried 21, answered by block 7B rather than carried further: this
-    // sort cannot change `list`'s output, and now provably so rather than
-    // by inspection of `buildIndexes` alone. `record.parseLog` refuses any
-    // log whose `seq` is not strictly increasing and contiguous from 1
-    // (`validateSeqOrder`), so for every log that opens at all, log order
-    // *is* `seq` order; `buildIndexes` builds each bucket as an
-    // order-preserving subsequence of one forward pass; and
-    // `selectCandidates` only ever drops elements from that subsequence.
-    // Nor does 7.3 change this, contrary to what this comment predicted:
-    // `search` re-sorts by score and so never routes a ranked result
-    // through here at all. Kept as documented insurance — its removal is
-    // the architect's call, not this block's.
-    if (activeRecordFilterCount(p, filters.kind) >= 2) {
-        std.mem.sort(record.Record, matching.items, {}, recordSeqLessThan);
-    }
+    // Combined-filter results already arrive in `seq` order, so the sort
+    // that used to stand here was doing nothing: `validateSeqOrder` makes
+    // log order and `seq` order the same thing for every log that opens at
+    // all, and both the buckets and `selectCandidates` only ever take
+    // order-preserving subsequences of it — so if that validation is ever
+    // relaxed, the sort has to come back.
 
     if (p.json) {
         writeRecordListJson(stdout, matching.items, &diag) catch |err| return reportLogError(stderr, err, &diag);
     } else {
-        writeRecordListText(stdout, matching.items);
+        writeRecordListText(stdout, matching.items, null);
     }
     return 0;
 }
@@ -2388,16 +2490,31 @@ fn runRefs(
     if (p.json) {
         writeRecordListJson(stdout, matching, &diag) catch |err| return reportLogError(stderr, err, &diag);
     } else {
-        writeRecordListText(stdout, matching);
+        writeRecordListText(stdout, matching, null);
     }
     return 0;
 }
 
 /// `devlog search <query>` (7.2, `log-retrieval`: "The log can be searched
 /// by meaning"). Builds `search.Index` over the records already in memory,
-/// ranks them, and renders the result through the same two renderers
-/// `list` and `refs` use — no score field and no seventh JSON shape
-/// (ruling R3, D15: one derivation, two renderings).
+/// ranks them, caps the result, and renders it — text through the same
+/// renderer `list` and `refs` use, JSON through an envelope of its own
+/// (ruling R7, amending R3). Still no score field: the ranking is the order.
+///
+/// **The cap is the point of the command, not a convenience** (ruling R7,
+/// from the section 7 supervisor's measurement). A record matches on *any*
+/// one of the query's words and a question asked in natural language is
+/// mostly common words, so an uncapped `search` of a 191-record log returned
+/// 156 of them — 96% of the log, the whole-log read `log-retrieval` says
+/// this command exists to avoid. Ten by default, `--limit <n>` to change it,
+/// `--limit 0` to ask for everything deliberately. The cap is applied once,
+/// below, between the ranking and the renderers.
+///
+/// **`--json` is the one shape on this surface that is not the bare array
+/// its records would otherwise be.** A capped result has to be able to say
+/// so, and the consumer is a plugin (`9.4`), not a human who would notice a
+/// short list — silent loss in the machine-readable rendering is the one
+/// outcome this tool must never produce.
 ///
 /// **Scoping needs no code.** `log-retrieval` requires that "only records
 /// belonging to the change being searched are considered"; this tool only
@@ -2447,6 +2564,11 @@ fn runSearch(
         .refused => |code| return code,
     };
 
+    const limit: usize = if (p.limit) |s| parseLimit(s) catch |err| switch (err) {
+        error.NotACount => return fail(stderr, "--limit '{s}' must be a non-negative integer (0 for no limit)", .{s}),
+        error.TooLarge => return fail(stderr, "--limit '{s}' is too large — the most it can be is {d}", .{ s, std.math.maxInt(usize) }),
+    } else search_default_limit;
+
     var diag: record.Diagnostics = .init(allocator);
     defer diag.deinit();
 
@@ -2455,22 +2577,7 @@ fn runSearch(
     };
     defer opened.close(allocator);
 
-    // `--role`/`--to` are filters over *history* here, exactly as they are
-    // for `list`: an undeclared value is refused (the same typo hazard),
-    // but "declared" means declared in any header this log carries, since a
-    // role the project has since retired still authored records that must
-    // stay queryable through them. Settled in section 6; reused, not
-    // re-derived.
-    if (p.role) |r| {
-        log.checkDeclaredRoleHistory(opened.log.records, r, &diag) catch |err| {
-            return reportLogError(stderr, err, &diag);
-        };
-    }
-    if (p.to) |t| {
-        log.checkDeclaredToHistory(opened.log.records, t, &diag) catch |err| {
-            return reportLogError(stderr, err, &diag);
-        };
-    }
+    if (checkHistoryFilters(opened.log.records, p, &diag, stderr)) |code| return code;
 
     var derived = state_mod.derive(allocator, opened.log.records, &diag) catch |err| {
         return reportLogError(stderr, err, &diag);
@@ -2501,13 +2608,23 @@ fn runSearch(
         return fail(stderr, "out of memory", .{});
     defer allocator.free(ranked);
 
+    // The cap, applied to the one derivation — after the ranking and before
+    // either renderer, so the two cannot disagree about what was dropped
+    // (D15). `ranked` is already a total order (BM25, ties by `seq`
+    // ascending), so a prefix of it is deterministic even when scores tie
+    // across the boundary.
+    const shown = if (limit == 0 or limit >= ranked.len) ranked else ranked[0..limit];
+
     // Finding nothing is an ordinary empty success, exactly as `refs`
     // rules it: a search that matches no record is an answer about the
     // log, not a failure of the request.
     if (p.json) {
-        writeRecordListJson(stdout, ranked, &diag) catch |err| return reportLogError(stderr, err, &diag);
+        // `--limit 0` is an input idiom for "no bound"; the output field
+        // reports the bound that was actually in force, and there was none.
+        writeSearchResultJson(stdout, shown, ranked.len, if (limit == 0) null else limit, &diag) catch |err|
+            return reportLogError(stderr, err, &diag);
     } else {
-        writeRecordListText(stdout, ranked);
+        writeRecordListText(stdout, shown, if (shown.len == ranked.len) null else ranked.len);
     }
     return 0;
 }
@@ -6986,7 +7103,10 @@ test "list --role and --section together is an intersection, sorted by seq (carr
     const text = result.stdout;
     // worker authored the section-6 item records (#1, #3, #4's opening
     // record) but not the section-6 brief (architect) or verdict
-    // (reviewer) — the intersection, in ascending seq (append) order.
+    // (reviewer) — the intersection, in ascending seq (append) order. This
+    // is now the guard on that order rather than a test of the explicit
+    // sort, which the architect's ruling on carried 21 removed as provably
+    // idle: the order it asserts is the one `selectCandidates` produces.
     const pos_1 = std.mem.indexOf(u8, text, "blocking question for 6C") orelse return error.TestUnexpectedResult;
     const pos_3 = std.mem.indexOf(u8, text, "open nit for 6A") orelse return error.TestUnexpectedResult;
     const pos_4 = std.mem.indexOf(u8, text, "blocking but later deferred") orelse return error.TestUnexpectedResult;
@@ -7840,6 +7960,9 @@ test "list --state open --to <role> agrees with resume --role <role> on the same
 ///   2. post    seq 2  — "lock" once, 12 tokens
 ///   3. post    seq 3  — "lock" twice, 11 tokens
 ///   4. brief   seq 4  — about ranking, no "lock"
+///   5. post    seq 5  — carries the non-ASCII word "naïve"
+///   6. item    seq 6  — an item's body is prose too, and is indexed
+///   7. next    seq 7  — so is a next's
 ///
 /// The `brief` carries a `block` as of block 7B, not because any 7.1/7.2
 /// assertion needs one but because `search` derives as of `7.3` and
@@ -7848,9 +7971,6 @@ test "list --state open --to <role> agrees with resume --role <role> on the same
 /// it requires both. The fixture was legal only while `search` was the one
 /// read command that skipped `derive`; a dedicated test below now pins that
 /// fault reaching `search` deliberately rather than through this fixture.
-///   5. post    seq 5  — carries the non-ASCII word "naïve"
-///   6. item    seq 6  — an item's body is prose too, and is indexed
-///   7. next    seq 7  — so is a next's
 fn seedSearchFixture(allocator: Allocator, dir: Io.Dir, io: Io, diag: *record.Diagnostics) !void {
     _ = try log.appendHeader(
         allocator,
@@ -7982,11 +8102,11 @@ test "search with no matches is an ordinary empty success, in both forms (as ref
         var result = try runSeeded(std.testing.allocator, seedSearchFixture, &.{ "--log", "DEVLOG.jsonl", "search", "zebra", "--json" });
         defer result.deinit(std.testing.allocator);
         try std.testing.expectEqual(@as(u8, 0), result.code);
-        try std.testing.expectEqualStrings("[]\n", result.stdout);
+        try std.testing.expectEqualStrings("{\"total\":0,\"limit\":10,\"records\":[]}\n", result.stdout);
     }
 }
 
-test "search --json is the same bare array list emits, in rank order and with no score field (R3, D15)" {
+test "search --json is an envelope around the array list emits, in rank order and with no score field (R7 amending R3, D15)" {
     var result = try runSeeded(std.testing.allocator, seedSearchFixture, &.{ "--log", "DEVLOG.jsonl", "search", "lock", "--json" });
     defer result.deinit(std.testing.allocator);
     try std.testing.expectEqual(@as(u8, 0), result.code);
@@ -7994,7 +8114,10 @@ test "search --json is the same bare array list emits, in rank order and with no
 
     var parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, result.stdout, .{});
     defer parsed.deinit();
-    const arr = parsed.value.array;
+    // The envelope R7 added so a bounded result can say it was bounded.
+    try std.testing.expectEqual(@as(i64, 2), parsed.value.object.get("total").?.integer);
+    try std.testing.expectEqual(@as(i64, 10), parsed.value.object.get("limit").?.integer);
+    const arr = parsed.value.object.get("records").?.array;
     try std.testing.expectEqual(@as(usize, 2), arr.items.len);
 
     // The ranking is the array order and nothing else: no seventh JSON
@@ -8321,17 +8444,19 @@ test "search --state/--blocking narrow the candidates to item records and never 
         try std.testing.expect(std.mem.indexOf(u8, result.stdout, c.body) != null);
     }
 
-    // And the same narrowing in JSON is still the bare record array, not a
-    // seventh shape (R3, D15).
+    // And the same narrowing in JSON still carries plain records inside the
+    // envelope — the narrowing changes which records, never their shape
+    // (R2, R7, D15).
     var as_json = try runSeeded(std.testing.allocator, seedSearchFilterFixture, &.{ "--log", "DEVLOG.jsonl", "search", "lock", "--state", "open", "--json" });
     defer as_json.deinit(std.testing.allocator);
     try std.testing.expectEqual(@as(u8, 0), as_json.code);
     try expectExactlyOneJsonLine(as_json.stdout);
     var parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, as_json.stdout, .{});
     defer parsed.deinit();
-    try std.testing.expectEqual(@as(usize, 1), parsed.value.array.items.len);
-    try std.testing.expectEqualStrings("item", parsed.value.array.items[0].object.get("kind").?.string);
-    try std.testing.expect(parsed.value.array.items[0].object.get("state") == null);
+    const records = parsed.value.object.get("records").?.array;
+    try std.testing.expectEqual(@as(usize, 1), records.items.len);
+    try std.testing.expectEqualStrings("item", records.items[0].object.get("kind").?.string);
+    try std.testing.expect(records.items[0].object.get("state") == null);
 }
 
 test "the --kind/--state conflict is one guard with one message, not a copy per command (R6)" {
@@ -8507,4 +8632,351 @@ test "search --help documents the filters and the leading-dash limit of its posi
     try expectRun(std.testing.allocator, &.{ "search", "--help" }, 0, "cannot begin with '-'", null);
     try expectRun(std.testing.allocator, &.{ "search", "--help" }, 0, "there is no '--'", null);
     try expectRun(std.testing.allocator, &.{ "search", "--help" }, 0, "a search always returns", null);
+}
+
+// --- Section 7 remediation: the bounded result set (R7) ------------------
+
+/// The natural-language question the section 7 supervisor measured with,
+/// against which an uncapped `search` returned 96% of a real 191-record log.
+const bounded_query = "what was decided about closing items";
+
+/// A corpus sized so that `7.4`'s property can *fail*. That is the whole
+/// point of it: the nine-record fixture above asserts the same requirement
+/// honestly and cannot catch an unbounded result set, because at nine
+/// records "the relevant records" and "the entire log" are not visibly
+/// different answers. Here they are — 40 documents, every one of which
+/// matches at least one word of `bounded_query`, so an uncapped search
+/// returns 40 of the log's 41 records.
+///
+/// Thirty-seven filler bodies cycle eight sentences, each carrying only the
+/// question's *function* words ("what", "was", "about") and none of its
+/// content words, plus a unique sigil so a test can name one. Three bodies
+/// carry "decided", "closing" and "items" — the words that actually answer
+/// the question — so the cap has to keep the relevant records and drop the
+/// tail, not merely truncate log order.
+fn seedBoundedCorpusFixture(allocator: Allocator, dir: Io.Dir, io: Io, diag: *record.Diagnostics) !void {
+    _ = try log.appendHeader(
+        allocator,
+        io,
+        dir,
+        "DEVLOG.jsonl",
+        "t0",
+        "devlog 0.1.0",
+        .{ .change = "x", .roles = &.{ "architect", "worker" }, .closers = &.{"architect"} },
+        diag,
+    );
+
+    const filler = [_][]const u8{
+        "What the parser does with a stray token was settled earlier.",
+        "The write path was described in full, and nothing about it changed.",
+        "Nobody asked what the tokenizer should fold, so it folds ASCII only.",
+        "The temporary file was renamed into place, which is all it was for.",
+        "There was a long argument about the exit code and it went nowhere.",
+        "What follows is the reasoning about the derive pass, in order.",
+        "The header was appended first, as every log about a change begins.",
+        "It was never clear what a plugin would do with a truncated read.",
+    };
+    for (0..37) |i| {
+        const prose = try std.fmt.allocPrint(allocator, "{s} Marker sigil{d}.", .{ filler[i % filler.len], i });
+        defer allocator.free(prose);
+        _ = try log.appendRecord(allocator, io, dir, "DEVLOG.jsonl", record.Record{ .post = .{
+            .common = .{ .seq = 0, .ts = "t1", .role = "worker", .section = "7", .body = prose },
+        } }, diag);
+    }
+
+    const answers = [_][]const u8{
+        "We decided that closing items belongs to the declared closer alone. Marker answerone.",
+        "The ruling on closing items: only a role the header names may close one. Marker answertwo.",
+        "What was decided about closing items is recorded in this post. Marker answerthree.",
+    };
+    for (answers) |answer| {
+        _ = try log.appendRecord(allocator, io, dir, "DEVLOG.jsonl", record.Record{ .post = .{
+            .common = .{ .seq = 0, .ts = "t2", .role = "architect", .section = "7", .body = answer },
+        } }, diag);
+    }
+}
+
+/// The count header a list-shaped read prints — its first line, which is
+/// the only line R7's bound changes. Isolating it matters: the `--- record
+/// 1 of 5 ---` separators below it have always said "of", so a bare search
+/// for that word cannot tell a capped header from an ordinary body.
+fn countHeaderOf(text: []const u8) []const u8 {
+    const end = std.mem.indexOfScalar(u8, text, '\n') orelse text.len;
+    return text[0..end];
+}
+
+/// The `seq` of every record in a `search --json` result, in the order the
+/// envelope carries them — so a test can assert one result is a prefix of
+/// another rather than eyeballing two renderings.
+fn searchResultSeqs(allocator: Allocator, json_text: []const u8) ![]i64 {
+    var parsed = try std.json.parseFromSlice(std.json.Value, allocator, json_text, .{});
+    defer parsed.deinit();
+    const records = parsed.value.object.get("records").?.array;
+    const out = try allocator.alloc(i64, records.items.len);
+    for (records.items, 0..) |v, i| out[i] = v.object.get("seq").?.integer;
+    return out;
+}
+
+test "search bounds its result set, so a natural-language question does not return the log (log-retrieval, 7.4 re-cut under R7)" {
+    // The requirement is "it receives the relevant records rather than the
+    // entire log", and this is the fixture where the two differ: 41 records,
+    // 40 of them matching at least one word of the question. Remove the cap
+    // and the first assertion below reads "records (40):" and fails.
+    var capped = try runSeeded(std.testing.allocator, seedBoundedCorpusFixture, &.{ "--log", "DEVLOG.jsonl", "search", bounded_query });
+    defer capped.deinit(std.testing.allocator);
+    try std.testing.expectEqual(@as(u8, 0), capped.code);
+    try std.testing.expect(std.mem.indexOf(u8, capped.stdout, "records (10 of 40):") != null);
+
+    // The ten kept are the ten most relevant, not the first ten of anything:
+    // the three records that actually answer the question lead the result.
+    const first = std.mem.indexOf(u8, capped.stdout, "answerone") orelse return error.TestUnexpectedResult;
+    const second = std.mem.indexOf(u8, capped.stdout, "answertwo") orelse return error.TestUnexpectedResult;
+    const third = std.mem.indexOf(u8, capped.stdout, "answerthree") orelse return error.TestUnexpectedResult;
+    const fourth = std.mem.indexOf(u8, capped.stdout, "sigil0") orelse return error.TestUnexpectedResult;
+    try std.testing.expect(first < fourth);
+    try std.testing.expect(second < fourth);
+    try std.testing.expect(third < fourth);
+
+    // What the cap is measured against: the same query with the bound
+    // deliberately lifted returns 40 of the log's 41 records — the
+    // whole-log read this command exists to avoid.
+    var uncapped = try runSeeded(std.testing.allocator, seedBoundedCorpusFixture, &.{ "--log", "DEVLOG.jsonl", "search", bounded_query, "--limit", "0" });
+    defer uncapped.deinit(std.testing.allocator);
+    try std.testing.expectEqual(@as(u8, 0), uncapped.code);
+    try std.testing.expect(std.mem.indexOf(u8, uncapped.stdout, "records (40):") != null);
+
+    var listed = try runSeeded(std.testing.allocator, seedBoundedCorpusFixture, &.{ "--log", "DEVLOG.jsonl", "list" });
+    defer listed.deinit(std.testing.allocator);
+    try std.testing.expectEqual(@as(u8, 0), listed.code);
+    try std.testing.expect(std.mem.indexOf(u8, listed.stdout, "records (41):") != null);
+    try std.testing.expect(uncapped.stdout.len * 4 < listed.stdout.len * 5);
+}
+
+test "the capped result is the ranking's prefix, so the bound's boundary is deterministic (R7 on R3's tiebreak)" {
+    var capped = try runSeeded(std.testing.allocator, seedBoundedCorpusFixture, &.{ "--log", "DEVLOG.jsonl", "search", bounded_query, "--json" });
+    defer capped.deinit(std.testing.allocator);
+    var uncapped = try runSeeded(std.testing.allocator, seedBoundedCorpusFixture, &.{ "--log", "DEVLOG.jsonl", "search", bounded_query, "--limit", "0", "--json" });
+    defer uncapped.deinit(std.testing.allocator);
+    try std.testing.expectEqual(@as(u8, 0), capped.code);
+    try std.testing.expectEqual(@as(u8, 0), uncapped.code);
+
+    const capped_seqs = try searchResultSeqs(std.testing.allocator, capped.stdout);
+    defer std.testing.allocator.free(capped_seqs);
+    const uncapped_seqs = try searchResultSeqs(std.testing.allocator, uncapped.stdout);
+    defer std.testing.allocator.free(uncapped_seqs);
+
+    try std.testing.expectEqual(@as(usize, 10), capped_seqs.len);
+    try std.testing.expectEqual(@as(usize, 40), uncapped_seqs.len);
+    // Most of these 37 filler documents score identically, so the cap falls
+    // in the middle of a run of ties: only R3's seq tiebreak makes which
+    // ten survive it reproducible.
+    try std.testing.expectEqualSlices(i64, capped_seqs, uncapped_seqs[0..capped_seqs.len]);
+}
+
+test "--limit sets the bound, 0 lifts it, and the text count never claims to be the whole answer (R7)" {
+    const cases = [_]struct { limit: [:0]const u8, expect: []const u8 }{
+        .{ .limit = "1", .expect = "records (1 of 40):" },
+        .{ .limit = "3", .expect = "records (3 of 40):" },
+        .{ .limit = "39", .expect = "records (39 of 40):" },
+        // A limit at or above the match count is not a cap, so the header
+        // is the plain one `list` and `refs` print.
+        .{ .limit = "40", .expect = "records (40):" },
+        .{ .limit = "999", .expect = "records (40):" },
+        .{ .limit = "0", .expect = "records (40):" },
+    };
+    for (cases) |c| {
+        var result = try runSeeded(std.testing.allocator, seedBoundedCorpusFixture, &.{ "--log", "DEVLOG.jsonl", "search", bounded_query, "--limit", c.limit });
+        defer result.deinit(std.testing.allocator);
+        try std.testing.expectEqual(@as(u8, 0), result.code);
+        try std.testing.expect(std.mem.indexOf(u8, result.stdout, c.expect) != null);
+    }
+
+    // A result smaller than the bound is unbounded in practice and says so:
+    // the nine-record fixture's five "lock" hits still read "records (5):".
+    var small = try runSeeded(std.testing.allocator, seedSearchFilterFixture, &.{ "--log", "DEVLOG.jsonl", "search", "lock" });
+    defer small.deinit(std.testing.allocator);
+    try std.testing.expectEqual(@as(u8, 0), small.code);
+    try std.testing.expectEqualStrings("records (5):", countHeaderOf(small.stdout));
+}
+
+test "search --json says what it dropped: total, limit, and the records themselves (R7)" {
+    // The reason R3's bare array had to go: a plugin cannot see a short
+    // list, so the truncation has to be in the value, not in the length.
+    {
+        var result = try runSeeded(std.testing.allocator, seedBoundedCorpusFixture, &.{ "--log", "DEVLOG.jsonl", "search", bounded_query, "--json" });
+        defer result.deinit(std.testing.allocator);
+        try std.testing.expectEqual(@as(u8, 0), result.code);
+        try expectExactlyOneJsonLine(result.stdout);
+        var parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, result.stdout, .{});
+        defer parsed.deinit();
+        try std.testing.expectEqual(@as(i64, 40), parsed.value.object.get("total").?.integer);
+        try std.testing.expectEqual(@as(i64, 10), parsed.value.object.get("limit").?.integer);
+        try std.testing.expectEqual(@as(usize, 10), parsed.value.object.get("records").?.array.items.len);
+    }
+    // Under --limit 0 the field is null, never 0 (the architect's ruling on
+    // R7): the flag is an input idiom for "no bound", but this field says
+    // what bound was in force, and there was none. `"limit":0` beside 40
+    // returned records would describe something that did not happen, and a
+    // consumer writing `records.length < limit` would be told the wrong
+    // thing rather than given the type error that gets fixed.
+    {
+        var result = try runSeeded(std.testing.allocator, seedBoundedCorpusFixture, &.{ "--log", "DEVLOG.jsonl", "search", bounded_query, "--limit", "0", "--json" });
+        defer result.deinit(std.testing.allocator);
+        try std.testing.expectEqual(@as(u8, 0), result.code);
+        try expectExactlyOneJsonLine(result.stdout);
+        try std.testing.expect(std.mem.indexOf(u8, result.stdout, "\"limit\":null,") != null);
+        try std.testing.expect(std.mem.indexOf(u8, result.stdout, "\"limit\":0") == null);
+        var parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, result.stdout, .{});
+        defer parsed.deinit();
+        try std.testing.expectEqual(@as(i64, 40), parsed.value.object.get("total").?.integer);
+        try std.testing.expect(parsed.value.object.get("limit").? == .null);
+        try std.testing.expectEqual(@as(usize, 40), parsed.value.object.get("records").?.array.items.len);
+    }
+    // The whole line, byte for byte, on an empty result under each of the
+    // two bounds — the shape a plugin parses, pinned rather than described.
+    {
+        var bounded = try runSeeded(std.testing.allocator, seedBoundedCorpusFixture, &.{ "--log", "DEVLOG.jsonl", "search", "zzzznomatch", "--json" });
+        defer bounded.deinit(std.testing.allocator);
+        try std.testing.expectEqualStrings("{\"total\":0,\"limit\":10,\"records\":[]}\n", bounded.stdout);
+
+        var unbounded = try runSeeded(std.testing.allocator, seedBoundedCorpusFixture, &.{ "--log", "DEVLOG.jsonl", "search", "zzzznomatch", "--limit", "0", "--json" });
+        defer unbounded.deinit(std.testing.allocator);
+        try std.testing.expectEqualStrings("{\"total\":0,\"limit\":null,\"records\":[]}\n", unbounded.stdout);
+    }
+    // Both renderings describe the same result (D15): the cap is applied
+    // once, before either of them, so they cannot disagree about it.
+    {
+        var as_json = try runSeeded(std.testing.allocator, seedBoundedCorpusFixture, &.{ "--log", "DEVLOG.jsonl", "search", bounded_query, "--limit", "3", "--json" });
+        defer as_json.deinit(std.testing.allocator);
+        var as_text = try runSeeded(std.testing.allocator, seedBoundedCorpusFixture, &.{ "--log", "DEVLOG.jsonl", "search", bounded_query, "--limit", "3" });
+        defer as_text.deinit(std.testing.allocator);
+        var parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, as_json.stdout, .{});
+        defer parsed.deinit();
+        const records = parsed.value.object.get("records").?.array;
+        try std.testing.expectEqual(@as(usize, 3), records.items.len);
+        try std.testing.expect(std.mem.indexOf(u8, as_text.stdout, "records (3 of 40):") != null);
+        for (records.items) |v| {
+            try std.testing.expect(std.mem.indexOf(u8, as_text.stdout, v.object.get("body").?.string) != null);
+        }
+    }
+}
+
+test "a --limit that is not a count is refused, and the refusal comes before the log is opened (A3, A6)" {
+    // `-0`, `+0`, `+10`, `1_0` and `010` are the cases a bare `parseInt`
+    // waves through (it accepts a sign and `_` separators), and `-0` is the
+    // dangerous one: it parses to zero, which this command reads as "no
+    // bound" and answers with the entire log — the unbounded output R7
+    // exists to prevent, reached by a flag that looked accepted. `-1` is
+    // kept alongside them precisely because it is the negative `parseInt`
+    // *does* reject, which is why testing it alone proved nothing.
+    const bad = [_][:0]const u8{ "abc", "-1", "-0", "+0", "+10", "1_0", "010", "1.5", "10x", " 5", "5 ", "٣" };
+    for (bad) |value| {
+        var result = try runSeeded(std.testing.allocator, seedBoundedCorpusFixture, &.{ "--log", "DEVLOG.jsonl", "search", bounded_query, "--limit", value });
+        defer result.deinit(std.testing.allocator);
+        try std.testing.expectEqual(@as(u8, 1), result.code);
+        try std.testing.expect(std.mem.indexOf(u8, result.stderr, "must be a non-negative integer") != null);
+        try std.testing.expectEqualStrings("", result.stdout);
+    }
+
+    // The one that would have been silent: `--limit -0` must not come out
+    // the far side as the whole log. Asserting the count is absent as well
+    // as the exit code, because the failure mode here is a *successful*
+    // unbounded answer, not a crash.
+    var minus_zero = try runSeeded(std.testing.allocator, seedBoundedCorpusFixture, &.{ "--log", "DEVLOG.jsonl", "search", bounded_query, "--limit", "-0" });
+    defer minus_zero.deinit(std.testing.allocator);
+    try std.testing.expectEqual(@as(u8, 1), minus_zero.code);
+    try std.testing.expect(std.mem.indexOf(u8, minus_zero.stdout, "records (40):") == null);
+    try std.testing.expectEqualStrings("", minus_zero.stdout);
+
+    // A value that is digits all the way down but too big is a different
+    // fault and says so: it *is* a non-negative integer, so the message
+    // above would be describing something the caller can see is false.
+    var too_large = try runSeeded(std.testing.allocator, seedBoundedCorpusFixture, &.{ "--log", "DEVLOG.jsonl", "search", bounded_query, "--limit", "99999999999999999999" });
+    defer too_large.deinit(std.testing.allocator);
+    try std.testing.expectEqual(@as(u8, 1), too_large.code);
+    try std.testing.expect(std.mem.indexOf(u8, too_large.stderr, "is too large") != null);
+    try std.testing.expect(std.mem.indexOf(u8, too_large.stderr, "must be a non-negative integer") == null);
+    try std.testing.expectEqualStrings("", too_large.stdout);
+
+    // The largest value that still fits is an ordinary uncapped success —
+    // the boundary is a refusal on one side and a result on the other.
+    var at_max = try runSeeded(std.testing.allocator, seedBoundedCorpusFixture, &.{ "--log", "DEVLOG.jsonl", "search", bounded_query, "--limit", "18446744073709551615" });
+    defer at_max.deinit(std.testing.allocator);
+    try std.testing.expectEqual(@as(u8, 0), at_max.code);
+    try std.testing.expectEqualStrings("records (40):", countHeaderOf(at_max.stdout));
+
+    // The arity faults are the parser's, in the shape every other
+    // value-carrying flag already has (A5/A6): empty, missing, repeated.
+    var empty = try runSeeded(std.testing.allocator, seedBoundedCorpusFixture, &.{ "--log", "DEVLOG.jsonl", "search", bounded_query, "--limit", "" });
+    defer empty.deinit(std.testing.allocator);
+    try std.testing.expectEqual(@as(u8, 1), empty.code);
+    try std.testing.expect(std.mem.indexOf(u8, empty.stderr, "--limit requires a non-empty value") != null);
+
+    var missing = try runSeeded(std.testing.allocator, seedBoundedCorpusFixture, &.{ "--log", "DEVLOG.jsonl", "search", bounded_query, "--limit" });
+    defer missing.deinit(std.testing.allocator);
+    try std.testing.expectEqual(@as(u8, 1), missing.code);
+    try std.testing.expect(std.mem.indexOf(u8, missing.stderr, "--limit requires a value") != null);
+
+    var repeated = try runSeeded(std.testing.allocator, seedBoundedCorpusFixture, &.{ "--log", "DEVLOG.jsonl", "search", bounded_query, "--limit", "5", "--limit", "6" });
+    defer repeated.deinit(std.testing.allocator);
+    try std.testing.expectEqual(@as(u8, 1), repeated.code);
+    try std.testing.expect(std.mem.indexOf(u8, repeated.stderr, "--limit given more than once") != null);
+
+    // And the refusal never reaches the filesystem: the same bad value
+    // against a log that does not exist reports the flag, not the log.
+    var no_log = try runSeeded(std.testing.allocator, seedBoundedCorpusFixture, &.{ "--log", "absent.jsonl", "search", bounded_query, "--limit", "abc" });
+    defer no_log.deinit(std.testing.allocator);
+    try std.testing.expectEqual(@as(u8, 1), no_log.code);
+    try std.testing.expect(std.mem.indexOf(u8, no_log.stderr, "--limit 'abc'") != null);
+}
+
+test "list and refs keep their whole-log contract and their bare array: the shared renderer's change is additive (R7)" {
+    // `writeRecordListText` gained an optional match count for `search`.
+    // These two pass `null` and must render exactly as they did before it
+    // existed — no ' of ' in the header, no envelope in JSON, and no
+    // --limit to give them.
+    var listed = try runSeeded(std.testing.allocator, seedBoundedCorpusFixture, &.{ "--log", "DEVLOG.jsonl", "list" });
+    defer listed.deinit(std.testing.allocator);
+    try std.testing.expectEqual(@as(u8, 0), listed.code);
+    try std.testing.expectEqualStrings("records (41):", countHeaderOf(listed.stdout));
+
+    var listed_json = try runSeeded(std.testing.allocator, seedBoundedCorpusFixture, &.{ "--log", "DEVLOG.jsonl", "list", "--json" });
+    defer listed_json.deinit(std.testing.allocator);
+    try std.testing.expectEqual(@as(u8, 0), listed_json.code);
+    try expectExactlyOneJsonLine(listed_json.stdout);
+    try std.testing.expectEqual(@as(u8, '['), listed_json.stdout[0]);
+    try std.testing.expect(std.mem.endsWith(u8, listed_json.stdout, "]\n"));
+    try std.testing.expect(std.mem.indexOf(u8, listed_json.stdout, "\"total\"") == null);
+
+    var refs_text = try runSeeded(std.testing.allocator, seedListFixture, &.{ "--log", "DEVLOG.jsonl", "refs", "--ref", "D:7" });
+    defer refs_text.deinit(std.testing.allocator);
+    try std.testing.expectEqual(@as(u8, 0), refs_text.code);
+    try std.testing.expectEqualStrings("records (1):", countHeaderOf(refs_text.stdout));
+
+    var refs_json = try runSeeded(std.testing.allocator, seedListFixture, &.{ "--log", "DEVLOG.jsonl", "refs", "--ref", "D:7", "--json" });
+    defer refs_json.deinit(std.testing.allocator);
+    try std.testing.expectEqual(@as(u8, 0), refs_json.code);
+    try std.testing.expectEqual(@as(u8, '['), refs_json.stdout[0]);
+    try std.testing.expect(std.mem.endsWith(u8, refs_json.stdout, "]\n"));
+
+    // `--limit` is `search`'s alone. `list` refuses it as an unknown flag,
+    // which is what keeps "dumping everything is what listing is" true.
+    for ([_][:0]const u8{ "list", "refs" }) |command| {
+        var refused = try runSeeded(std.testing.allocator, seedBoundedCorpusFixture, &.{ "--log", "DEVLOG.jsonl", command, "--limit", "5" });
+        defer refused.deinit(std.testing.allocator);
+        try std.testing.expectEqual(@as(u8, 1), refused.code);
+        try std.testing.expect(std.mem.indexOf(u8, refused.stderr, "unknown flag '--limit'") != null);
+        try std.testing.expectEqualStrings("", refused.stdout);
+    }
+}
+
+test "search --help documents the bound, its default, and how to lift it (8.4 is written from this)" {
+    try expectRun(std.testing.allocator, &.{ "search", "--help" }, 0, "--limit <n>", null);
+    try expectRun(std.testing.allocator, &.{ "search", "--help" }, 0, "Defaults to 10", null);
+    try expectRun(std.testing.allocator, &.{ "search", "--help" }, 0, "--limit 0 asks for every match", null);
+    try expectRun(std.testing.allocator, &.{ "search", "--help" }, 0, "{\"total\":156,\"limit\":10,\"records\":[...]}", null);
+    try expectRun(std.testing.allocator, &.{ "search", "--help" }, 0, "records (10 of 156):", null);
+    try expectRun(std.testing.allocator, &.{ "search", "--help" }, 0, "'limit':null, not 0", null);
+    try expectRun(std.testing.allocator, &.{ "search", "--help" }, 0, "n is plain", null);
+    try expectRun(std.testing.allocator, &.{ "search", "--help" }, 0, "'-0' cannot pass for 'no bound'", null);
 }

@@ -10258,6 +10258,367 @@ lands; it is not yours to edit and the block does not need it.
 `→ @reviewer`. If R7 is ambiguous, or the shared-renderer change cannot be made without moving `list`'s
 output, **stop and post `❓ @architect`** rather than choosing.
 
+**[worker]** **Remediation block (section 7 supervisor) implemented.** Gates: `BUILD_EXIT:0 TEST_EXIT:0
+FORMAT_EXIT:0 VALIDATE_EXIT:0 GATES_EXIT:0` — `GATES_EXIT:0` in one `-k` pass. **294 tests**, all green
+(+7 this block). One file changed: `src/main.zig`. No box ticked, nothing committed.
+
+**The blocker, measured on the corpus the supervisor used.** I rebuilt it the same way — this change's
+own `DEVLOG.md`, one `post` per attributed entry: **194 records, 820 KB**, three posts larger than the
+supervisor's 191 because three more have landed since. Its four probe queries, before → after:
+
+| query | was | now | `--json` bytes |
+|---|---|---|---|
+| `what was decided about closing items` | 159 / 194 | **10 of 159** | 788 KB → **55.7 KB** |
+| `atomic replace temporary file` | 111 / 194 | **10 of 111** | 653 KB → **57.8 KB** |
+| `utf-8 validation` | 79 / 194 | **10 of 79** | 518 KB → **76.9 KB** |
+| `declared closers` | 62 / 194 | **10 of 62** | 415 KB → **57.0 KB** |
+
+96% of the log becomes 6.8% of it. **Ranking is untouched** and I checked the records that survive are
+still the right ones: `atomic replace temporary file` → the interrupted-write ruling (`seq 57`),
+`utf-8 validation` → the Product Owner's B1 decision (`seq 81`), `what was decided about closing items`
+→ the supervisor's own post (`seq 189`). Top hit, not top ten.
+
+**What I built.**
+
+1. **The cap, in the one derivation.** `runSearch` slices `ranked` after `index.rank` and before either
+   renderer, so text and JSON cannot disagree about what was dropped (D15). Default 10
+   (`search_default_limit`), `--limit <n>` to change it, `--limit 0` for unbounded. Because `ranked` is
+   already a total order — BM25 with R3's `seq` tiebreak — the cap is a prefix of it, which is what makes
+   the boundary deterministic when scores tie across it. There is a test for exactly that: the capped
+   result's ten `seq`s equal the first ten of the uncapped result's forty, over a fixture where the
+   filler documents score identically and the cap therefore falls inside a run of ties.
+2. **`--limit` parses like `--kind`/`--state`.** Arity in `parseArgs` (`setOnce`, `search`-only), value
+   validity in `runSearch` — the A5 split — refusing through `fail` before `openReadOnly` (A3), so a bad
+   `--limit` against a missing log reports the flag, not the log. `abc`, `-1`, `1.5`, `10x` and a
+   non-ASCII digit all refuse; empty / missing / repeated are the parser's own A6 faults, unchanged in
+   shape from every other value-carrying flag.
+3. **`search --json` is the envelope.** `{"total":159,"limit":10,"records":[…]}`, one line, `total` the
+   match count before the cap. `writeRecordListJson` split into `writeRecordArrayJson` (the array, no
+   newline) plus a one-line wrapper, so `list`/`refs` keep the bare array and the envelope reuses the
+   same emitter — there is still exactly one place that writes a record array.
+4. **The renderer change is additive.** `writeRecordListText` gained a trailing `matched: ?usize`;
+   `list` and `refs` pass `null` and take the untouched `records (N):` branch.
+
+**Byte-identity, proved rather than asserted.** I built the pre-change binary from `HEAD`'s `src/main.zig`
+in a scratch tree and diffed the two binaries' **stdout + stderr + exit code** across **166 probe pairs**:
+100 over the 194-record corpus (`list` bare and `--json` × every filter, every `--kind`, every `--state`,
+`--blocking`, two- and three-filter intersections, both refusal paths, `refs` hit/miss/malformed/absent,
+plus both `--help`s) and 66 over a second log seeded with items, closes, verdicts and real `--ref`s so the
+`refs` half is non-vacuous (`refs --ref D:5` → `records (2):`, not an empty list). **166 identical, 0
+different.** Two further pairs worth naming: `search --limit 0` reproduces the old binary's default
+`search` output **byte for byte** across 18 query/filter combinations, and the envelope's `records` array
+is byte-identical to the old bare array. The cap is the only behavioural change on the command.
+
+**`7.4` re-cut so the property can fail.** `seedBoundedCorpusFixture` is 41 records — 37 filler bodies
+carrying only the question's *function* words plus three that carry `decided`/`closing`/`items` — queried
+with the supervisor's own sentence. Uncapped it returns **40 of 41**; capped it returns `records (10 of
+40):` with the three answering records leading. Remove the cap and that first assertion reads
+`records (40):` and fails. The nine-record test stays: it is honest, it just cannot fail this way. That
+was the actual lesson of the finding, so the fixture is sized to it.
+
+**The four queued items, all done as ruled.** Dead `seq` sort gone from `runList`, replaced by the
+one-sentence comment the brief specifies (`activeRecordFilterCount` and `recordSeqLessThan` went with it
+— they had no other caller, and leaving them would just move the dead code). The `list --role --section`
+intersection test now carries a line saying it is the guard on that order. `--role`/`--to` history checks
+are one `checkHistoryFilters`, called by both commands. `seedSearchFixture`'s numbered list is whole
+again. `:409`'s `'list''s` is now `the ones 'list' takes`. `search_usage` documents `--limit`, its
+default, `--limit 0`, both text headers and the exact JSON shape — five new `--help` assertions pin it,
+since `8.4` is written from that text.
+
+**One detail R7 does not name, flagged rather than buried:** what `"limit"` holds under `--limit 0`. I
+emitted `0` and asked. **@architect ruled `null`** — see the amendment below, which is now what the code
+does; this paragraph is left standing as the record of the question, not as the behaviour.
+
+**Also confirming, unchanged:** `search` still writes nothing — directory listing identical before and
+after a capped run and a refused one. No new dependency, no new file, no `Makefile` change needed.
+
+→ @reviewer
+
+**[worker]** **Amendment — `"limit":null` under `--limit 0`, as ruled.** Gates re-run: `BUILD_EXIT:0
+TEST_EXIT:0 FORMAT_EXIT:0 VALIDATE_EXIT:0 GATES_EXIT:0`. **295 tests** — *corrected to 294 in the
+amendment below; I added a declaration count to a runner count.* Scope was the three things named and
+nothing else.
+
+1. **`writeSearchResultJson` takes `limit: ?usize`** and writes `null` for it; `runSearch` passes
+   `if (limit == 0) null else limit` at the single call site. Nothing else in the derivation moved — the
+   input idiom is untouched, `--limit 0` still means unbounded and is still not an error.
+2. **The reasoning is in the code, not just here.** The doc comment on `writeSearchResultJson` and the
+   test's comment both carry it: the flag is an input idiom a human types deliberately, the field
+   describes what happened, and `"limit":0` beside 62 returned records describes something that did not.
+   A consumer writing `records.length < limit` gets a wrong answer from `0` and a type error from
+   `null`, and only one of those gets fixed — the same principle as R7 itself, one size down.
+3. **Pinned three ways.** The parsed value is `.null` and never `0`; the raw line contains
+   `"limit":null,` and does not contain `"limit":0`; and both empty-result lines are asserted whole —
+   `{"total":0,"limit":10,"records":[]}` and `{"total":0,"limit":null,"records":[]}` — so the shape a
+   plugin parses is fixed byte for byte rather than described. `search_usage` gained the clause beside
+   where it already documents `--limit 0`, with a `--help` assertion on it.
+
+On the 194-record corpus: `--json` → `{"total":62,"limit":10,…}`, `--limit 5 --json` →
+`{"total":62,"limit":5,…}`, `--limit 0 --json` → `{"total":62,"limit":null,…}`.
+
+**Evidence re-run against the final binary, not the one from before the amendment.** `list`/`refs`
+byte-identity vs. the `HEAD` binary is now **218 probe pairs across both logs, 218 identical, 0
+different** (stdout + stderr + exit code; the earlier 166 re-run and widened). `search --limit 0` still
+reproduces the pre-change `search` exactly: **36 pairs, 36 identical** — 18 text and 18 `--json`, the
+latter compared after stripping only the envelope prefix, so the record array itself is unchanged byte
+for byte. Probe counts and ranking are as posted above; nothing about the cap or the ordering moved.
+
+One thing I checked because it looked alarming and is not ours: piping `search --json` into `head -c`
+prints `devlog: WriteFailed` on stderr. The `HEAD` binary does the same — it is the closed-pipe path,
+pre-existing and untouched by this block. Written to a file, both bounded and unbounded exit `0` with
+empty stderr.
+
+→ @reviewer
+
+**[worker]** **Second amendment — `--limit` validates its own shape; two cosmetics.** Gates:
+`BUILD_EXIT:0 TEST_EXIT:0 FORMAT_EXIT:0 VALIDATE_EXIT:0 GATES_EXIT:0`. **294 tests**, all green — and
+**294 is the corrected figure for the whole block too**, not 295: I miscounted last time by adding a
+declaration total to a runner total. This amendment adds assertions inside existing tests and no new
+`test` block, so the count is unchanged by it.
+
+**1. `--limit -0` was accepted and returned the whole log. Agreed it is not a nit.** `parseInt` accepts a
+sign and `_` separators, so `-0`, `+0`, `+10`, `1_0` and `010` all got through, and `-0` parsed to
+**zero** — which this command reads as "no bound". A flag that looks accepted, producing exactly the
+unbounded output the block exists to prevent. That is B1 on the output side, and my suite missed it for
+the reason named: `-1` is the one negative `parseInt` rejects, so testing it proved nothing about
+negatives.
+
+`parseLimit` now validates the **shape** and no longer inherits `parseInt`'s liberality: ASCII digits
+only, no sign, no separator, no leading zero beyond `0` itself; only then a range check. Same A6
+refusal, still before `openReadOnly` (A3). Measured on the 194-record corpus, all exit 1 with empty
+stdout: `-0`, `+0`, `+10`, `1_0`, `010`, `-1`, `1.5`, `10x`, `' 5'`, `'5 '`, a non-ASCII digit. The `-0`
+case has its own assertion that the output is not `records (40):`, because the failure mode here is a
+*successful* wrong answer rather than a crash.
+
+**2. The overflow message named the wrong fault.** `99999999999999999999` is non-negative and is an
+integer; it is too large. It now says so — `--limit '…' is too large — the most it can be is
+18446744073709551615` — and the test asserts the two messages do not cross. `18446744073709551615`
+itself is an ordinary uncapped success, so the boundary is a refusal on one side and a result on the
+other, which is the part that would rot silently.
+
+**3. The wrapping.** The two mid-sentence breaks at 54 and 47 characters are gone, and so is a third at
+49 in the paragraph I added and a `'total'.` orphan of 8 — same class, same paragraph, so they travelled
+with it. Every prose line in `search --help` is now 58–71 characters except paragraph-final ones and the
+indented flag column, which is the shape the rest of the usage already had. `--limit`'s own FLAGS entry
+now states the digits-only rule and names `-0` explicitly, since `8.4` is written from this text; two
+more `--help` assertions pin it.
+
+**Evidence re-run against the final binary, not the pre-amendment one.** `list`/`refs` vs. the `HEAD`
+binary: **218 probe pairs, 218 identical, 0 different**. `search --limit 0` still reproduces the
+pre-change command exactly: **36 pairs, 36 identical**. Nothing in the cap, the ranking or the envelope
+moved — this amendment only narrows what `--limit` accepts and rewords two messages.
+
+→ @reviewer
+
+**[reviewer]** **Remediation block (section 7 supervisor) — `Approve with nits`.** No blockers. R7 is
+implemented as ruled, in one derivation, and every claim the worker made that I was asked to distrust I
+re-derived myself rather than read. Gates re-run here and quoted from the exit lines, not the log:
+`BUILD_EXIT:0 TEST_EXIT:0 FORMAT_EXIT:0 VALIDATE_EXIT:0 GATES_EXIT:0`, one `-k` pass. Diff is two files —
+`src/main.zig` and this DEVLOG (purely additive, 111 lines, 0 deleted). No `Makefile`, no `tasks.md`, no
+`build.zig.zon`; nothing ticked; nothing committed.
+
+**1. `list` and `refs` did not move — verified against a binary, not against the number.** I built `HEAD`
+(`e5564df`) from `git archive` into a scratch tree (`make build` → `BUILD_EXIT:0`) and diffed **stdout +
+stderr + exit code** between the two binaries over **268 probe pairs** on two logs I built with the
+`HEAD` binary: a 24-record log carrying every kind, every close state, every verdict outcome, blocking
+and non-blocking items, six distinct `--ref` namespaces and a section-less post; and a 196-record,
+828 KB corpus made from this change's own `DEVLOG.md`, one `post` per attributed entry. The matrix is
+`list` bare and `--json` × every `--kind` (including a bogus one), every `--state`, every declared role
+and an undeclared one on both `--role` and `--to`, four sections, four block labels, `--blocking`, both
+`--kind`/`--state` conflict refusals, two-, three- and four-filter intersections, an empty `--section`,
+a repeated `--section`, eleven `--ref` values including malformed/empty/absent, `refs` with no `--ref`
+and with two, plus `status`, `show --seq`, `show --item`, `resume`, both `--help`s, an unknown flag and
+a missing log. **268 identical, 0 different.** `list --limit 5` and `refs --limit 5` are still
+`unknown flag '--limit'`, byte for byte, on both binaries.
+
+The `checkHistoryFilters` extraction I checked separately on `search`'s side, since the 6.x refusal
+wording is the thing a de-duplication silently rewords: 12 old/new pairs over undeclared `--role`,
+undeclared `--to`, empty `--role`, and both mixed orders — **12 identical, 0 different**. And I confirmed
+the two helpers the worker says had no other caller genuinely had none: at `HEAD`, `activeRecordFilterCount`
+(`:2171`) and `recordSeqLessThan` (`:2227`) are referenced from exactly one place each — `:2334`/`:2335`,
+the sort that was removed — and from nowhere in `log.zig`, `record.zig`, `state.zig`, `search.zig` or
+`body.zig`.
+
+**2. `search --limit 0` reproduces the pre-change command byte for byte.** 224 old/new pairs — 7 queries
+(including all four of the supervisor's, `zebra`-style no-match, and the single word `the`) × 8 filter
+sets × 2 renderings × 2 logs. **0 different.** For `--json` I stripped only the envelope prefix
+`{"total":N,"limit":null,"records":` and the closing `}`, and compared the array against the old bare
+array: identical in all 112 JSON pairs, and `records.length == total` in every one. `--json` is still
+exactly one line.
+
+**3. The cap's boundary is deterministic, including across ties.** On the 196-record corpus the
+supervisor's own question matches 161 records. I pulled the `seq` list from `--limit 0 --json` and
+compared every capped run against its prefix at n = 1, 2, 3, 5, 9, 10, 11, 20, 50, 80, 100, 120, 160,
+**161** (exactly the match count), 162 and 500: **0 mismatches**, so the result is a true prefix at
+every boundary, and the two off-by-one boundaries render correctly (`records (160 of 161):` →
+`records (161):`). Eight repeated runs of the same capped query are byte-identical. Text and JSON agree
+at every one of those points. The default capped `--json` is 51,020 bytes against 790,233 uncapped —
+**6.5%**, which is the blocker closed on the same measurement that opened it.
+
+**4. The tests bite — mutation-tested on a scratch copy, `make test` per mutation.** `const shown =
+ranked;` (cap removed) → **4 tests red**, including the re-cut `7.4` (`records (10 of 40):` becomes
+`records (40):`) — so the fixture is now large enough for the property to fail, which was the point.
+Default `10 → 20` → 5 red. `writeSearchResultJson(… ranked …)` (cap in the text renderer only, the D15
+hazard) → 2 red. `list` passing `matching.items.len` instead of `null` → 5 red, `refs` likewise → 3 red,
+so the shared renderer is pinned from both sides. `"limit": limit` instead of `if (limit == 0) null` → the
+amendment test red. Envelope newline removed → 4 red via `expectExactlyOneJsonLine`. Inverting the `seq`
+tiebreak (`search.zig:123`) → 6 red. Nothing I mutated passed.
+
+**5. The queued cleanups are all done and none of them is a silent behaviour change.** Dead sort gone
+with its two helpers and replaced by the sentence the brief specifies (`main.zig:2411–2416`); the
+`--role`/`--to` de-duplication is behaviourally identical as measured above; `seedSearchFixture`'s
+numbered list is whole (`:7940–7948`); `:409` reads `the ones 'list' takes`. `search` still writes
+nothing: directory listing, sizes and mtimes are unchanged across a capped run, an uncapped run, a
+refused `--limit` and a missing log.
+
+**Nits — none blocking.**
+
+- **`--limit -0`, `+0`, `+10`, `010`, `1_0` are all accepted** (`main.zig:1556`, `parseLimit` →
+  `std.fmt.parseInt`). Zig's integer parser takes a sign and `_` digit separators, so the accepted grammar
+  is wider than the one the help documents at `:405–408` (*"A negative or non-numeric n is refused"*).
+  The one that matters: **`--limit -0` is not refused — it returns the entire log** (161 records,
+  790 KB on my corpus, `"limit":null`), which is precisely the unbounded output this block exists to
+  stop, reached through an input the help says is a refusal. `-1` is refused, so the suite does not
+  catch it. Concrete scenario: a caller that formats its limit from a signed computation and emits `-0`
+  gets the whole log with no diagnostic. Fix is one line — reject a leading `+`/`-`/`_` before
+  `parseInt` — and it wants a case in the existing bad-value table at `:8676`.
+- **The overflow message misdescribes the input.** `--limit 99999999999999999999` is correctly refused,
+  but with *"must be a non-negative integer (0 for no limit)"* (`:2548`) — which it is. "too large" would
+  name the actual fault, and this is the one refusal message whose text is currently wrong about why.
+- **Two ragged lines in `search --help`**, from the reflow: line 58 breaks mid-sentence at 54 chars and
+  line 61 at 47, where every other body line in that usage runs 58–71. Same cosmetic class as the split
+  numbered list this block just repaired, and `8.4` is written from this text.
+- **Test arithmetic, since it was asked.** `main.zig` goes 179 → **186** test declarations: **7 added, 0
+  retired** — the old bare-array R3 test was *renamed and rewritten in place*
+  (`search --json is the same bare array…` → `…is an envelope around the array…`), not retired and
+  replaced. Static total across `src/` is **293** declarations (main 186, log 34, state 25, record 23,
+  search 13, body 12). `make test` prints no count, so 295/294 both look like a miscount of the rename.
+
+**Architectural notes — `## NEXT`, not this block.**
+
+- **`"limit"` reports the bound requested, not the bound that bound.** `--limit 999` over 161 matches
+  emits `"limit":999` while the text prints the uncapped `records (161):`. That is coherent with the doc
+  comment at `:1774` ("the cap that was in force") and truncation is still exactly
+  `records.length < total`, which the help states — but it sits slightly across the grain of the
+  `0 → null` rationale ("the field describes what happened"). Worth one sentence in `8.4` so the plugin
+  author at `9.4` never reaches for `records.length < limit`.
+- **The closed-pipe `WriteFailed` is pre-existing and, if anything, this block reduces exposure to it.**
+  I reproduced it on both binaries with identical output and exit code 1, so nothing here made it worse:
+  the default result is now ~51 KB rather than ~790 KB, i.e. smaller than a typical pipe buffer, so the
+  common `search --json | head` shape is now *less* likely to hit it than before. It is also a loud
+  failure on stderr with a non-zero exit, not a silent truncation. Out of scope; worth naming in `8.x`
+  alongside the exit-code table rather than fixing here.
+- **`--limit` is `search`'s alone and I re-checked the whole surface**, not just `list`/`refs`: all
+  thirteen other commands answer `unknown flag '--limit'`. No side-effect adoption this time.
+
+Verdict stands at `Approve with nits` — the four nits are the worker's or the Architect's call, and none
+of them needs another review round to land. → @architect
+
+**[reviewer]** **Second amendment (`--limit` shape validation, overflow message, help wrapping) —
+`Approve`.** Delta-only re-audit, as asked; I did not re-run the 268/224 matrices in full. Gates re-run
+against the amended tree and quoted from the exit lines: `BUILD_EXIT:0 TEST_EXIT:0 FORMAT_EXIT:0
+VALIDATE_EXIT:0 GATES_EXIT:0`. Still two files, DEVLOG still purely additive (256/0), nothing ticked,
+nothing committed.
+
+**The accept side — the half nobody had checked — is intact.** Sixteen legitimate values, all exit 0 with
+the bound reported correctly: `0` (→ `"limit":null`, 161 records), `1`, `2`, `9`, `10`, `11`, `40`,
+`161` (exactly the match count), `162`, `999`, `65535`, `2147483648`, `4294967296`,
+`9223372036854775807`, `1000000000000000000`, `12345678901234567890`, and
+**`18446744073709551615`** — `usize` max — which returns uncapped and prints `records (161):`.
+`18446744073709551616` is the first refusal above it, and it refuses with the range message, so the
+ceiling is pinned on both sides against the built binary, not only in the suite.
+
+**The refuse side is right and the two messages never cross.** Thirty-four values: your five (`-0`, `+0`,
+`+10`, `1_0`, `010`) plus `-1`, `00`, `0000`, `000001`, `1.5`, `10x`, `abc`, `0x10`, `0b101`, `1e2`,
+`nan`, `∞`, `1,000`, leading/trailing space, tab, newline, and six flavours of non-ASCII digit
+(`٣`, `٠`, `۵`, `０`, `１０`, `١٢٣` — Arabic-Indic, Extended Arabic-Indic and fullwidth, which
+`std.ascii.isDigit` correctly refuses byte-wise). Every one exits 1 with **empty stdout**; 32 take the
+shape message and the 2 genuine overflows take the range message; **0 values produced both**. Refusals
+still precede `openReadOnly`: against a non-existent log, `-0`, `+10`, `1_0`, `010`, `abc` and the
+overflow all report the flag, never the missing log (A3 holds).
+
+**The new validation is load-bearing — mutation-tested on a scratch copy, `make test` per mutation.**
+Dropping the shape loop (back to bare `parseInt`) → red. Dropping *only* the leading-zero check → red.
+Swapping the two messages → red. Collapsing `TooLarge` into `NotACount` → red. Lowering the parse type
+`usize → u32`, which attacks the *accept* side by moving the ceiling → red on the `18446744073709551615`
+assertion. Five mutations, five caught, all by
+`a --limit that is not a count is refused, and the refusal comes before the log is opened (A3, A6)`.
+
+**Nothing else moved — spot-checked as instructed, and it did not need to be more.** 92 old/new probe
+pairs over both logs (`list` bare and `--json` × every `--kind` including a bogus one, `--state open`,
+`--blocking`, an undeclared `--role`, a two-filter intersection, both conflict refusals, `refs` hit and
+miss, `status`, `show --seq`, `resume`, and `list/refs --limit 5` still refusing as unknown flags) —
+**0 different**. `search --limit 0` against the pre-change `search`: 64 pairs (4 queries × 4 filter sets
+× 2 renderings × 2 logs), **0 different**, with the JSON compared after stripping only the envelope, so
+the record array is still byte-identical. The amendment is confined to `parseLimit`, its two messages,
+and the usage string, exactly as reported.
+
+**Help matches behaviour, which is the part `8.4` inherits.** The `--limit` FLAGS entry now states the
+digits-only rule and names `-0`; the old *"A negative or non-numeric n is refused"* sentence — the one
+that was false — is gone. I re-measured the wrapping: **zero short lines that are not paragraph-final**
+in the whole of `search --help` (the eight remaining sub-55 lines each end a paragraph). My 54- and
+47-character breaks are gone, as are the worker's own 49 and the `'total'.` orphan.
+
+**On the count, you are right and I withdraw 293.** My number was `grep -c '^test "'` across `src/`,
+which is 293 named declarations (main 186, log 34, state 25, record 23, search 13, body 12) and misses
+the anonymous `test {` at `main.zig:20` — the block that references the five imported modules and is what
+pulls their tests into the binary in the first place. Zig runs it and counts it, so the runner total is
+**294**, and there is no third number: 293 named + 1 anonymous. I checked for any other test form
+(indented, or `test <identifier>`) and there are none, so the identity holds for future blocks too.
+
+**One note for `## NEXT`, not a finding:** the leading-zero rule means a zero-padded limit (`05`, `007` —
+what a `%02d`-style formatter emits) is now a **refusal** rather than silently working. That is the right
+trade and it fails loudly with exit 1 and a message naming the flag, but the plugin at `9.4` should be
+told to emit bare digits; one clause in `8.4` covers it.
+
+Delta is clean. `Approve`. → @architect
+
+**[architect]** **Remediation block CLOSED**, reviewer `Approve` on the delta after one amendment I asked
+for. Gates green on my own run as well as the worker's and the reviewer's: `BUILD_EXIT:0` `TEST_EXIT:0`
+`FORMAT_EXIT:0` `VALIDATE_EXIT:0` `GATES_EXIT:0`. **294 tests.** No box ticked — this block takes no
+numbers, and section 7's 43 were already ticked and stay so.
+
+**On `--limit -0`, and why I overruled the label.** The reviewer filed it as a nit; I sent it back as a
+defect. The reasoning matters more than the verdict: **`parseLimit` inherited `std.fmt.parseInt`'s
+liberality**, so a sign or a `_` separator sailed through, and `--limit -0` returned the entire log —
+precisely the unbounded output the block exists to prevent, reached through an input the help calls a
+refusal. That is R1's family on the output side. What makes it worth this much thread is *why the suite
+missed it*: the one negative anybody thinks to test is `-1`, and `-1` is the one negative `parseInt`
+rejects — for range, not for shape. A test table that looks thorough was blind on exactly the axis that
+mattered. Same lesson as the nine-record fixture, in a different disguise: **coverage that cannot fail
+proves nothing**, and both of this section's real defects hid behind it.
+
+The fix validates *shape* — ASCII digits only, no sign, no separator, no leading zero beyond `0` — and
+then range-checks, so the two faults have two messages that the reviewer confirmed never cross. The
+ceiling is now pinned against the binary on both sides: `18446744073709551615` is an ordinary uncapped
+success, `18446744073709551616` is the first refusal above it.
+
+**The accept side was the half I could not check myself,** and it is where tightening a parser usually
+breaks something: a validator that correctly refuses `-0` refuses something legitimate just as easily. 16
+legitimate values verified, 34 refusals with empty stdout and **0 producing both messages**, and five
+mutations on a scratch copy all caught — including `usize → u32`, which attacks the accept side by moving
+the ceiling rather than the reject side. That is the mutation I would not have thought to ask for.
+
+**The test count is settled at 294** and will not move again: 293 named `test "…"` declarations plus the
+one anonymous `test {}` at `src/main.zig:20`, which Zig runs. The reviewer withdrew 293 (it had counted
+named declarations only) and the worker's 295 mixed a declaration total with a runner total. The reviewer
+also checked there are no other test forms in `src/` — no indented blocks, no `test <identifier>` — so the
+identity holds for every later block, which is why this is worth a sentence rather than a correction each
+time.
+
+**Carried to `## NEXT` from this block, none blocking:**
+
+- **A zero-padded limit (`05`, `007`) is now a refusal**, not a silent success — the right trade, and it
+  fails loudly, but a `%02d`-style formatter would hit it. `9.4`'s plugin must emit bare digits; one clause
+  in `8.4`.
+- **The closed-pipe `WriteFailed` is pre-existing and now *less* reachable**, not more — the default result
+  is ~51 KB against a typical pipe buffer where it used to be ~790 KB, and it fails loudly at exit 1 rather
+  than truncating silently. I had guessed capping would expose it more often; the reviewer showed the
+  opposite. It belongs beside `8.x`'s exit-code table.
+- **`--state`/`--blocking` returning items from `list` but records from `search`** is the one non-uniform
+  spot on the read surface (supervisor's note). Deliberate under R2, and it needs saying out loud in `8.4`
+  and in what `9.4` hands the plugin.
+
 ## NEXT
 
 **[architect]** **Sections 1–6 are CLOSED and fully ticked** — 39 of 52 boxes, no outstanding
