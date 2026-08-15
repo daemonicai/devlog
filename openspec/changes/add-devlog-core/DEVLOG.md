@@ -8557,6 +8557,227 @@ logic, no tests, no renames — comment only.
 `make gates`: `BUILD_EXIT:0` `TEST_EXIT:0` `FORMAT_EXIT:0` `VALIDATE_EXIT:0` `GATES_EXIT:0` — 243/243 tests
 passed (unchanged from before the comment, as expected for a comment-only diff). No commit, no ticks.
 
+**[supervisor]** **Section 6 review (`c8a3f25..HEAD`, amendment from `31eb5e3`). Verdict: Request
+changes.**
+
+Three blockers, all of them things a block review structurally could not see: each is either an
+asymmetry between a section-6 command and a section-4 rule, or a divergence between two blocks of this
+section. Nothing here re-opens a block the reviewer approved.
+
+**What holds, so it isn't re-litigated.** I checked these by execution against a nine-record log built
+with the real binary, not by reading:
+
+- **D15 holds by sum across all five commands.** For twenty read invocations covering all eight record
+  kinds, both `show` forms, `resume`/`status` with and without a brief, four `list` shapes and two
+  `refs` shapes, I extracted every leaf value from the `--json` payload and checked it appears in the
+  default text output. **Zero JSON leaves are absent from the text form, in any of the twenty.** The
+  fifth command did not diverge from the first: `renderRecordText`/`record.write` is the only
+  record-emitting pair (`main.zig:1387`, `record.zig`), `writeItemText`/`writeItemJson` the only item
+  pair (`:1449`, `:1473`), and 6B's `renderCurrentStateText`/`writeCurrentStateJson` (`:1606`, `:1643`)
+  and 6C's four list wrappers (`:1495`–`:1536`) are envelopes over those two pairs, not new emitters.
+- **The read path never creates, never locks, never writes.** All five commands load through
+  `log.openReadOnly` (`main.zig:1705, 1766, 1834, 1967, 2092`); the only `openLocked` callers left are
+  `appendHeader` and `appendLocked` (`log.zig:522, 586`). After running all six reads against a real
+  log the directory held exactly one file. Missing-log reports are byte-identical across all six
+  commands, exit `1`.
+- **`external-references`' negative half genuinely holds** — a `brief` whose body contains the literal
+  `D7` and carries no ref is absent from `refs --ref design:D7`.
+- **The force-unwrap class is gone.** No `.?` on an `Attributed` optional survives in production code;
+  the only remaining production `.?` on a read path is `runShow`'s `item_target.?` (`:1858`), proven
+  four lines up by its own mutual-exclusion checks — a local invariant, not a write-boundary one. The
+  four `DeriveError` faults are consistent in shape (each sets `diag` naming the record's `seq`,
+  returns through the one `reportLogError` call site, exits `1`).
+- **Scope by sum:** `git diff --name-only c8a3f25..HEAD` is `DEVLOG.md`, `tasks.md`, and the three
+  `src/*.zig` files. `Makefile`, `build.zig`, `build.zig.zon` untouched; `.dependencies = .{}`;
+  `--json` is refused as an unknown flag on write commands; no write command's output changed.
+
+---
+
+**Blocker 1 — the read surface does not hold `--role`/`--to` to the header's declared role set, and
+`resume` therefore answers a typo with a well-formed, exit-`0`, empty orientation.** Blocks 6B and 6C.
+
+```
+$ devlog --log DEVLOG.jsonl resume --role wroker
+next: … open items (0): (none)
+brief: none — no brief has been addressed to this role yet
+exit=0
+```
+
+versus the write side one flag over, which refuses:
+
+```
+$ echo x | devlog --log DEVLOG.jsonl --role worker post --to wroker   →  exit=1
+```
+
+`append-only-log/spec.md`'s *"Every record is attributed to a role"* states the reason for the
+write-side rule in terms of **the read this section just built**: *"a record addressed to a misspelt
+role is addressed to nobody, and every derived per-role view — the open items a role must act on, the
+latest brief for its block — silently omits it."* That sentence is a description of `devlog resume
+--role <r>`. The hole was closed at the write boundary because the read is what goes silently wrong;
+section 6 built the read and left the same hole open from the other side. A legitimate empty resume and
+a mistyped one are byte-identical, and `log-retrieval`'s headline requirement — *"An agent starting
+cold can orient itself in one read"* — is met with "nothing is open for you" for a role that does not
+exist.
+
+Three different behaviours for the same flag across the five commands, none of them validation:
+
+- `main.zig:1700` — `resume`: `--role` is the caller's **identity**, required, unvalidated.
+- `main.zig:1888-1895` — `list`: `--role`/`--to` are **filters**, unvalidated — sitting directly beside
+  `--kind`/`--state`, which *are* validated against their permitted sets and refuse
+  (`main.zig:1943-1953`). Validated vocabulary and unvalidated vocabulary in one command's flag list.
+- `show`/`status`/`refs`: `--role` is recognised by the parser (`main.zig:734-739`, always-on since
+  section 4) and **silently ignored** — `devlog status --role bogus` exits `0`. That is the same class
+  as section 4's own finding B1, one flag over: a stray *positional* is a refused parse fault
+  (`CommandSpec.takes_positional`), a stray `--role` is swallowed.
+
+The declared set is already in the log and already parsed by the read: `derived.indexes.byKind(.header)`
+gives the header records, and `log.zig:713`'s `checkRoleAllowed` is the write-side precedent for the
+message shape ("reports which roles are declared"). No new export is needed.
+
+If you judge that the spec compels this only at the write boundary, that is a Product Owner call rather
+than yours or mine — but I do not think `resume --role <undeclared>` returning `0` is defensible on any
+reading. ❓ @architect — route it if you disagree; at minimum `resume` must refuse.
+
+**Blocker 2 — `writeItemJson`'s trailing newline leaks into every composite, so `--json` is
+line-delimited for four reads and not for three.** Blocks 6A → 6B → 6C.
+
+`record.write` carries **no** trailing newline — `runShow`'s `--seq` path adds one itself
+(`main.zig:1843-1844`). `writeItemJson` (`main.zig:1485`) ends `"]}\n"`, because 6A wrote it for `show
+--item`, where that newline terminates the output. 6B then embedded it inside
+`writeCurrentStateJson`'s `"items":[…]` and 6C inside `writeItemListJson`'s array. Measured on the real
+binary:
+
+| read | embedded newlines in `--json` |
+|---|---|
+| `show --seq`, `show --item`, `list`, `list --kind item`, `refs` | 0 |
+| `status`, `resume`, `list --state open` / `--blocking` | 1 per item |
+
+Still valid JSON, so nothing mis-parses — but this is a JSONL-native tool whose `--json` contract is
+about to be handed to a plugin in another repository (`9.4`) and written down as reimplementable prose
+(`8.4`), and "one JSON document per line" is true for four of the reads and false for three, for no
+reason anyone chose. Two emitters with different newline contracts, composed across three blocks; no
+single block's diff shows it. Fix: drop the `\n` from `writeItemJson` and add it at `runShow`'s
+`--item` call site, exactly as `--seq` already does.
+
+**Blocker 3 — one filter predicate implemented twice, in one command, and `7.3` is about to need a
+third.** Block 6C.
+
+`matchesListFilters` (`main.zig:1879-1900`) answers "does this record match `--section`/`--block`/
+`--role`/`--to`/`--kind`" for the record path. `runList`'s item-only branch (`main.zig:1985-1999`)
+re-answers the same question inline against `it.opened.common`, field by field. They agree today — I
+verified `resume --role worker` and `list --state open --to worker` return the same item set — but this
+is the named hazard verbatim: a later fix to one lands in one and not the other. It matters now rather
+than later because `7.2`/`7.3` combine `search` with exactly these filters, and the current shape
+offers nothing to reuse: the surviving predicate takes `*const Parsed`, so it is coupled to argv rather
+than to a filter value. The item branch should call `matchesListFilters(record.Record{ .item =
+it.opened }, p, null)` — `recordSection`/`recordBlock`/`role()`/`to()` resolve identically for an
+`.item` record, so it is a deletion, not a rewrite.
+
+---
+
+**Suggested remediation shape — one fix block, `fix(add-devlog-core): address supervisor findings
+(section 6)`, no new `N.M` numbers:**
+
+1. Hold `--role`/`--to` to the header's declared set on every read that accepts them, refusing in the
+   write path's shape (`devlog: …`, exit `1`, naming the declared roles). Decide and state one rule for
+   `show`/`status`/`refs`, where `--role` is currently meaningless-but-accepted: either refuse it or
+   make the parser not recognise it there. Tests: `resume --role <undeclared>` refuses; `list --role`/
+   `--to <undeclared>` refuses; a *declared* role with nothing open still returns the ordinary empty
+   result at exit `0` — that distinction is the whole point and must be pinned.
+2. Move `writeItemJson`'s trailing newline to `runShow`'s `--item` call site. Assert no embedded
+   newline in `status --json`, `resume --json` and `list --state open --json`.
+3. Collapse `runList`'s item-only filter branch onto `matchesListFilters`.
+
+**Architectural notes — for `## NEXT`, not the fix block:**
+
+- **The derive-level write-boundary fault rule is now applied in two of three places.** `derive` faults
+  on a `verdict` missing `section`/`block` (`state.zig:519-527`) and, since 6B, on a `brief`
+  (`state.zig:531-540`) — but not on a `section` record, whose `--section` `runSection` requires just
+  as strictly. The 6B ruling's own carried-18 correction cites `runSection` as evidence and then orders
+  only the `brief` fault. No reachable defect today (nothing force-unwraps a `section` record's
+  `section`), which is exactly why it will be discovered the day something does.
+- **Six top-level `--json` shapes across five commands, none self-describing, none documented.**
+  `show --seq` a bare record; `show --item` a `{number,state,item,closes}` object; `resume`
+  `{next,items,brief}`; `status` `{next,items}`; `list` an array of records *or* of item objects
+  depending on the flags; `refs` an array of records. Each `--help` says only "the same result as
+  JSON". D15 does not require an envelope and I am not asking for one — but `8.4` owes a prose
+  description precise enough to reimplement, and this is the inventory it has to describe. Recording it
+  so `8.4` does not rediscover it.
+- **`7.3` readiness, beyond blocker 3.** `--state`/`--blocking` narrow `list` from records to items;
+  `search` ranks records. What `search --state open` means is an unanswered design question, and it is
+  cheaper to answer while `runList` is still the only consumer of these filters.
+- **Carried 21 and the `runList` sort — your ruling holds, and I would not have overturned it.** The
+  distinction you drew is the right one: this is not an untested branch, it is an unreachable one, and
+  a refactor whose only purpose is to synthesize an input the pipeline cannot produce buys a test of
+  the safety net in isolation from the trapeze. The comment at `main.zig:2042-2049` carries all three
+  required points and is sufficient against both failure modes — a reader who finds it will neither
+  delete it as dead nor trust it as tested, because "there is no reachable input on which it changes
+  anything" says plainly that no test exercises it. One refinement worth a line whenever that file is
+  next touched: name carried 21 in the comment, so the next reader can find this ruling rather than
+  re-deriving it.
+- **Thread hygiene, not a defect.** Section 6 has no `[architect]` landing post for block 6C — the
+  thread ends on the worker's comment-only post saying "No commit, no ticks", while `39f2442` carries
+  the comment, both ticks and the commit. 6A and 6B both have one. §3c makes that post the record;
+  worth adding when you close the section.
+
+No human-in-the-loop task in this section, so nothing is ticked without a Product Owner confirmation.
+Gate exit lines are quoted for every block and every round.
+
+→ @architect
+
+**[architect]** **Block 6C landed** — `6.3` and `6.4` ticked, one commit (`39f2442`). Gates re-run by me:
+`BUILD_EXIT:0`, `TEST_EXIT:0`, `FORMAT_EXIT:0`, `VALIDATE_EXIT:0`, `GATES_EXIT:0`. **243** tests —
+counted, not quoted. The supervisor is right that this post was missing; §3c makes it the record, and the
+thread should not have to be reconstructed from `git log`. Added on closing the section.
+
+**[architect]** **All three blockers accepted. Remediation block carved — no new `N.M` numbers, nothing
+ticked.**
+
+Every one of these is invisible to a block review by construction, which is the whole argument for the
+outer loop: **blocker 1 spans five commands** and no block ever saw more than two; **blocker 2 is a
+difference between two blocks' call sites**, each defensible alone; **blocker 3 is a duplication one block
+introduced within itself** while its reviewer was checking it against a brief that did not mention it. The
+supervisor also drove the built binary against a nine-record log covering all eight kinds and extracted
+every leaf of twenty `--json` payloads to check text parity — which is how D15 got confirmed by execution
+rather than by inspection, and how these three got found.
+
+**Ruling on blocker 1 — one rule for `--role`, not three.** The read surface currently has three
+behaviours for one flag: required-but-unvalidated on `resume`, an unvalidated filter on `list` sitting
+beside `--kind`/`--state` which *are* validated, and silently ignored on `show`/`status`/`refs`. Fix it as
+one rule:
+
+- **Where a read takes `--role`/`--to`, validate it against the latest header's declared role set and
+  refuse an undeclared one**, in the same shape and with the same message style as the write side's
+  refusal. `append-only-log`'s spec states the reason in terms of this exact read — *"every derived
+  per-role view … silently omits it"* — so this is the spec's own reasoning, honoured from the side that
+  was left open.
+- **Where a read does not take `--role`, reject it as an unexpected argument** rather than ignoring it,
+  using the command-scoped flag arity from A5 and the first-fault-wins shape from A6. A flag that is
+  silently ignored is a worse answer than a refusal, and this project has already fixed exactly this
+  defect once — section 4's `post stray-token` exiting `0`.
+
+**Ruling on blocker 2 — the newline belongs to the caller, uniformly.** `record.write` carries no newline
+and `runShow` adds it at the call site; `writeItemJson` emits its own, so composites inherit embedded
+newlines while single reads do not. **Remove the trailing `\n` from `writeItemJson`** and let every call
+site add it, matching `record.write`'s existing contract. This is a contract, not a cosmetic: `9.4` hands
+this surface to a plugin and `8.4` must describe it as reimplementable prose, and "JSON, except the
+composite forms contain embedded newlines" is precisely the clause a second implementation gets wrong.
+
+**Ruling on blocker 3 — one predicate, and extract it now rather than at `7.3`.** `matchesListFilters`
+and `runList`'s item branch are the same predicate written twice; they agree today, which is exactly when
+duplication is cheapest to remove and hardest to notice. `7.3` needs a reusable predicate that does not
+currently exist, so extracting it now is not speculative — it is the thing the next section was already
+going to have to do, done while there is one consumer instead of two.
+
+**Also in this block, both from the supervisor and both one-liners:** name **carried 21** in the
+`runList` sort comment so the next reader can find the ruling rather than re-deriving it; that was its
+one refinement to a ruling it otherwise endorsed.
+
+**Parked for `## NEXT`, not this block:** the derive-level write-boundary fault rule covering `verdict`
+and `brief` but not `section`; the six undocumented top-level JSON shapes `8.4` owes a description of;
+and what `search --state open` should mean, which `7.3` must answer while `runList` is still the only
+consumer of those filters.
+
 ## NEXT
 
 **[architect]** **Section 5 is CLOSED** — supervisor `Approve` on the **first** pass, no remediation
