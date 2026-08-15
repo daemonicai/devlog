@@ -10619,330 +10619,264 @@ time.
   spot on the read surface (supervisor's note). Deliberate under R2, and it needs saying out loud in `8.4`
   and in what `9.4` hands the plugin.
 
+**[supervisor]** **Section 7 re-review — `Approve`.** Scope `git diff 6c53fa9..HEAD` (`1216010`), six
+commits, five files. **The blocker is cleared**, measured the way it was found: my own corpus, my own
+probes, built with the **base** binary (`6c53fa9`) — 199 posts plus a header, **200 records, 849,580 B**,
+one `post` per attributed entry of this DEVLOG. Whole-log dump for comparison: `list --json` = 849,582 B.
+
+| query | matches | uncapped `--json` | default (capped) |
+|---|---|---|---|
+| `what was decided about closing items` | 165 / 200 | 817,625 B (**96.2%**) | 51,464 B (**6.0%**) |
+| `atomic replace temporary file` | 113 / 200 | 661,402 B (77.8%) | 57,808 B (6.8%) |
+| `utf-8 validation` | 84 / 200 | 544,951 B (64.1%) | 78,291 B (9.2%) |
+| `declared closers` | 64 / 200 | 430,042 B (50.6%) | 56,970 B (6.7%) |
+| `how does the tool handle stdin when it is a terminal` | 190 / 200 | 847,807 B (99.7%) | 72,284 B (8.5%) |
+| `why is there no database` | 184 / 200 | 845,506 B (99.5%) | 62,787 B (7.3%) |
+
+**The requirement, not the number.** A cap can turn a volume problem into a recall problem — the log stops
+arriving and so does the answer. It has not. For six natural-language questions with an identifiable
+target record I measured the target's rank in the **uncapped** ranking: `who is allowed to close an item`
+→ **3**, `what happens if a write is interrupted` → **2**, `why does the tool refuse invalid utf-8` → **1**,
+`how are item numbers assigned` → **1**, `is there a database` → **1**, `what is the stdin terminal
+behaviour` → **1**. Every answer is inside the default 10 with room to spare, so an agent now receives the
+relevant records *and* not the log. `log-retrieval`'s "The log can be searched by meaning" holds for the
+input class it names.
+
+**No new way to lose information — the three properties, each measured.**
+
+1. **The cap is a true prefix.** Capped `seq` list vs the first *n* of the uncapped list at n = 1, 2, 3, 5,
+   9, 10, 11, 20, 50, 100, 164, **165** (exactly the match count), 166, 500: **0 mismatches**. Eight repeated
+   runs byte-identical; `--limit 0` likewise.
+2. **Both renderings say the same thing, and neither can hide a drop.** Across every probe the two forms
+   returned the identical `seq` sequence; the text header is `records (n of total):` exactly when
+   `records.length < total` and `records (total):` otherwise — including the two boundaries
+   (`records (164 of 165):` → `records (165):` at n = 165, 166 and 500). A `--json`-only consumer always has
+   `records.length < total`.
+3. **`total` is honest, which nobody had checked.** I recomputed the documented match predicate
+   independently over all 200 bodies (fold ASCII case, split on non-alphanumeric, at least one query token)
+   for `the`, `a`, `and`, `of`, `zig`, `supervisor`, `closers`, `database`: **8/8 exact matches** with the
+   tool's `total`. This is worth stating because it was reachable: `rank` keeps a document iff `score > 0`
+   (`search.zig:277`), and that is only equivalent to "contains a query word" because the IDF is the
+   *smoothed* `log(1 + (N-df+0.5)/(df+0.5))` (`search.zig:258`). The textbook unsmoothed form goes negative
+   for a term in more than half the documents — which is precisely the function words that made the tail
+   long — and `total` would then have under-reported exactly the queries the cap exists for, silently, in
+   both renderings. The smoothing is deliberate and commented; the property it buys is real and now
+   measured rather than reasoned.
+
+Refusals re-checked end to end: `-0 +0 +10 1_0 010 00 -1 1.5 10x abc ' 5' '5 '` and both overflows all exit
+1 with **empty stdout**, and against a *missing* log all of them report the flag, never the log (A3).
+`18446744073709551615` is an ordinary uncapped success, `…616` the first refusal. Repeated and empty
+`--limit` are the parser's own faults. A filter conflict still beats a bad `--limit`, matching first-fault
+order everywhere else.
+
+**`list` and `refs` across the whole section — the check only this pass can make.** The block reviewers
+each proved an *adjacent* pair (7A→7B, 7B→remediation). Nobody had composed them. I diffed **stdout +
+stderr + exit code** between the **section base** (`6c53fa9`, which has no `search` at all — the surface as
+it was before this section existed) and `1216010`, over **76 probes × 3 log states**: a purpose-built
+17-record log carrying every kind, all three close states, all three verdict outcomes, blocking and
+non-blocking items, six `--ref` namespaces and a section-less post; the 200-record corpus; and a missing
+log. **228 comparisons, byte-identical, 0 different** — `list` bare and `--json` × every `--kind`
+(including a bogus one), every `--state`, every declared role and an undeclared one on both `--role` and
+`--to`, sections, blocks, `--blocking`, both conflict refusals, two-, three- and four-filter intersections,
+eleven `--ref` values, plus `status`, `show`, `resume`, both `--help`s, an unknown flag and a missing log.
+Two refactors under them and they have not moved a byte. `--limit` is `search`'s alone: all thirteen other
+commands answer `unknown flag '--limit'`.
+
+**Section coherence — it reads as one design, not a design plus a patch.** `--limit` parses in the same
+shape as `--kind`/`--state` and refuses in the same place; `checkHistoryFilters` gives `list` and `search`
+byte-identical role refusals, including a role retired by a later `header` (built a two-header log:
+both accept `orchestrator`, both refuse `ghost` with the same sentence); `writeRecordArrayJson` is the one
+record-array emitter behind both the bare array and the envelope; no filesystem write from any read path
+(directory, sizes and mtimes unchanged across capped, uncapped and refused runs), `.dependencies = .{}`
+untouched, no `build.zig`/`Makefile` change needed because `search.zig` reaches the test binary through
+`main.zig:20`. The `--json` object is the surface's only non-array read result and its help says so
+explicitly.
+
+**The one thing outstanding, and it is yours rather than a block's: `design.md` has not been amended.**
+`grep` finds no `limit`, `cap`, `envelope` or `R7` anywhere in it, and **D15 (`design.md:310`) still
+enumerates the read commands as "(`resume`, `show`, `list`, `refs`, `status`)"** — `search` is not in the
+list, though it is now the sixth read command and the only one whose `--json` is not a bare array. Last
+commit touching `design.md` is `c8a3f25`, section 6. You reserved this explicitly ("Do not touch
+`design.md` … I will do it once this lands") and it has landed; I am recording it because `8.1` and `8.4`
+are written *from* that document, and today the only durable record of R7 is this thread and
+`search --help`. Not a remediation block — no code is wrong — but it should land before section 8 opens.
+
+**One thing for that amendment to answer deliberately, because it sits against D15's own words.** D15 says
+*"Anything a `--json` payload carries that the text form cannot show is a signal the text form is
+under-rendering."* `"limit"` is exactly such a field: the text says *whether* a bound bit, never what it
+was — `--limit 999` over 165 matches emits `"limit":999` while the text prints the uncapped
+`records (165):`. It is not a divergence (same records, truncation visible in both), so it does not block;
+but the amendment has to choose between giving the text form the bound and carving request metadata out of
+that sentence, rather than leaving the two readings both defensible. The reviewer flagged the symptom
+under `## NEXT`; this is the binding sentence it lands on.
+
+**Not re-opened**, as ruled: the kept unreachable arms, the ASCII-only fold, `"limit":null`, zero-padded
+limits as refusals, the pre-existing closed-pipe `WriteFailed`, and the test count (294).
+
+**Architectural notes — `## NEXT`, not a fix.**
+
+- **The cap makes ranking quality load-bearing in a way it was not before.** Rank 11 is now invisible
+  rather than merely late, so any later change to tokenisation or scoring changes *what an agent can find
+  at all*, not just the order it finds it in. D3's revisit trigger should be restated accordingly: it is no
+  longer "lexical search misses it entirely" but "the answer is outside the top 10", which is a far more
+  sensitive test. Today's measurement (targets at ranks 1–3) is the baseline to hold that against.
+- **`list --help` and `search --help` describe one shared check differently.** `list` says `--role` "must
+  be one of the roles declared by `devlog header`"; `search` says the same check accepts a role "including
+  a retired one". One implementation (`checkHistoryFilters`), and `search`'s wording is the accurate one —
+  verified against a two-header log. One clause in `8.1`.
+- **`search` is the bounded read; `list --json` is not, by design.** Whatever `9.4` hands the plugin should
+  say which of the two it is meant to reach for, since `list --json` on this corpus is still 849 KB and
+  that is correct behaviour, not a gap.
+- Carried unchanged: the R2 shape asymmetry, the zero-padded limit, and the closed-pipe `WriteFailed`.
+
+Section 7 is coherent, its spec requirement holds end to end, and nothing in it erodes an ADR or a
+decision. `Approve`. → @architect
+
+
+**[architect]** **SECTION 7 IS CLOSED.** Supervisor `Approve` on the second pass, after one remediation
+block. Base was `6c53fa9`.
+
+Landed: `5616310` (opened, R1–R4, carve, 7A brief), `668ae3b` (7A, `7.1`/`7.2`), `4b3242b` (7A closed,
+carried-21 correction, R5–R6, 7B brief), `e9c9791` (7B, `7.3`/`7.4`), `e5564df` (supervisor findings, R7,
+remediation brief), `1216010` (remediation, ticks nothing). Gates `GATES_EXIT:0`, **294** tests — counted,
+not quoted. All four boxes ticked; **43 of 52**.
+
+**`design.md` is amended, which was the supervisor's one outstanding item and mine to do.** **D16** records
+the bound, the envelope, `"limit": null`, the digits-only rule, and why `list`/`refs` are deliberately not
+bounded. D15's read-command enumeration now includes `search`, and its equivalence sentence gains the
+carve-out the supervisor asked for rather than leaving it ambiguous: **the two forms must agree about what
+was *found*, not about what was *asked*.** `total` and the records are derived from the log and must match
+across both; `limit` is the caller's own input handed back, echoed because the process parsing a payload is
+often not the process that built the command line. Nothing derived from the log may hide behind that
+clause. A risk entry records that the bound makes ranking quality load-bearing.
+
+**What section 7 cost, and what it bought.** Two blocks, three block reviews, two supervisor passes, one
+remediation, two architect amendments mid-block. Two real defects, both of which passed a block review
+clean, and **both hiding behind coverage that could not fail**:
+
+1. **Search returned 96% of a realistic log.** `7.4` asserted exactly the right property — matching records
+   rather than the whole log — over a **nine-record** fixture with a one-word query, where that property is
+   incapable of failing. The re-cut fixture is 41 records with 40 matching, so removing the cap turns it red.
+2. **`--limit -0` was accepted and returned the whole log.** The bad-value table looked thorough. Its only
+   negative was `-1` — the one negative `std.fmt.parseInt` rejects for *range* rather than *shape*, so the
+   entire sign-handling axis was untested by a table that appeared to cover it.
+
+**The rule both of them yield, and the one thing from this section worth carrying into every later block:
+size the fixture so the property can fail, and choose the adversarial case rather than the obvious one.**
+A test that cannot fail is indistinguishable from a test that passes, and this section produced two of
+them, written by careful agents, caught only by a lens wide enough to build a realistic corpus.
+
+**And the near-miss nobody had checked.** The supervisor recomputed the match predicate independently over
+all 200 bodies for 8 terms including `the`/`and`/`a`: 8/8 agreement with `total`. That holds **only**
+because `rank` uses the smoothed IDF `log(1 + (N-df+0.5)/(df+0.5))` (`src/search.zig:258`). The textbook
+unsmoothed form goes negative for terms in more than half the corpus — precisely the function words that
+made the tail long — and `total` would have silently under-reported the very queries the cap exists for, in
+both renderings. Correct and commented since 7A; never measured until now. **A defect that would have
+hidden inside the fix for a defect.**
+
 ## NEXT
 
-**[architect]** **Sections 1–6 are CLOSED and fully ticked** — 39 of 52 boxes, no outstanding
-human-in-the-loop items. Section 6 closed on `606503c` + the leak nit; section 5 on `31eb5e3`; see the two
-close posts immediately above this heading for each section's landed commits and test counts.
+**[architect]** **Sections 1–7 are CLOSED and fully ticked** — **43 of 52 boxes**, no outstanding
+human-in-the-loop items. Section 7 closed on `1216010`; section 6 on `606503c`; section 5 on `31eb5e3`. See
+each section's close post for its landed commits and test counts.
 
-**Section 7 is OPEN** — search (`7.1`–`7.4`), base `6c53fa9`, carved 7A (`7.1`–`7.2`) + 7B
-(`7.3`–`7.4`). It is the last section that adds a command; `8.x` is documentation and release, `9.x` is
-validation and handoff. **Of the five things below, the three that were open questions are now ruled** —
-see R1–R4 under `## 7.`: one positional and `search` joins `strict` (R1), `--state` narrows candidates
-without switching the output shape (R2), the ranking is the array order with ties by `seq` and no seventh
-JSON shape (R3), the indexed document is `common.body` alone (R4).
+**Section 8 is next — documentation and release (`8.1`–`8.5`)**, then `9.x` is validation and handoff.
+Section 7 was the last section that adds a command. **The command surface is complete and frozen**: seven
+write commands, six read commands, fourteen entries in `commands`.
 
-**Five things bind section 7, and three of them were written before it started:**
+**What `8.4` owes, now a closed inventory rather than a growing one.** Seven top-level JSON shapes, not
+six — section 7 added the seventh and it is the only one that is not a bare array or a bare object:
 
-- **`7.2` reopens B1 unless it is handled.** `takes_positional` is a **boolean**, so `search a b c`
-  silently drops `b` and `c` — the exact silent-acceptance defect section 4's supervisor found and its
-  remediation fixed, reintroduced by the mechanism that fixed it. Either `search` takes exactly one
-  positional and refuses a second, or the property becomes a count. **Decide it in `7.2`'s brief, not in
-  its review.**
-- **Carried 21 — the `runList` combined-filter sort is currently unreachable**, kept as documented
-  insurance (`src/main.zig:2114` names this ruling). **`7.3` is the change most likely to make it
-  reachable**: combining search with `6.3`'s filters produces results ranked by relevance rather than log
-  order. When it does, it stops being insurance and earns a test with real power.
-- **What `search --state open` means is an open design question.** `--state`/`--blocking` narrow `list`
-  from records to items; `search` ranks records. Answer it in `7.3`'s brief while `runList` is still the
-  only consumer of those filters.
-- **`7.3` inherits `list`'s role validation**, which is now split deliberately: `resume` validates
-  identity against the **latest** header, `list` validates history filters against the **union of every**
-  header. Search filters are history filters. Match `list`, not `resume`.
-- **D15 binds `search` too** — text by default, the same content on `--json`, one derivation and two
-  renderers. Reuse the renderers; do not add a seventh JSON shape without saying so.
+1. `show --seq` — a bare record.
+2. `show --item` — `{number,state,item,closes}`.
+3. `resume` — `{next,items,brief}`.
+4. `status` — `{next,items}`.
+5. `list` — an array of records **or** of item objects, depending on flags.
+6. `refs` — an array of records.
+7. **`search` — `{"total":N,"limit":L,"records":[…]}`**, with `"limit": null` when unbounded (D16).
 
-**Owed to `8.x`, all of it discovered rather than planned:**
+**Every `--json` payload is exactly one line**, pinned across all seven forms; the newline is the caller's.
+That is contract, and `9.4` hands it to a plugin.
 
-- **Six undocumented top-level JSON shapes** — `show --seq` a bare record, `show --item` a
-  `{number,state,item,closes}` object, `resume` `{next,items,brief}`, `status` `{next,items}`, `list` an
-  array of records *or* of item objects depending on flags, `refs` an array of records. `8.4` owes a prose
-  description precise enough to reimplement; this is the inventory.
-- **The newline is the caller's, and that is now contract** — every `--json` payload is exactly one line,
-  pinned across all seven forms. `8.4` documents it; `9.4` hands it to a plugin.
-- **The read-side role-validation rule has no spec home.** `append-only-log` states the *reason* in terms
-  of the derived per-role view; the rule itself lives only in DEVLOG rulings and code.
-- **C4, still owed** — the spec scopes the UTF-8 `SHALL` to `body` while the code validates every string
-  field. `8.4` must carry the field-level breadth or a reimplementer reintroduces the hazard through
-  `--to`.
-- **`headerUnchanged` excludes `change` from header identity** — one sentence in D13 before `8.4`.
+**Owed to `8.x`, carried and still open:**
+
+- **C4** — the spec scopes the UTF-8 `SHALL` to `body` while the code validates every string field. `8.4`
+  must carry the field-level breadth or a reimplementer reintroduces the hazard through `--to`.
 - **P1 — "removed before the command exits" is loose on the success path** (`design.md:110`,
   `specs/durable-format/spec.md:43`): on success the temp file is *renamed*, not removed. A reimplementer
   who reads "removed" as `unlink` after a successful rename **deletes the log**.
+- **The read-side role-validation rule has no spec home.** It lives only in DEVLOG rulings and code:
+  `resume` validates identity against the **latest** header, `list`/`search` validate history filters
+  against the **union of every** header. Section 7 folded both commands' checks into `checkHistoryFilters`,
+  so there is now one implementation and still no prose.
+- **`headerUnchanged` excludes `change` from header identity** — one sentence in D13.
 - **`8.5`** — `zig build test -Dversion=X` fails (the override makes `build_options.version` and
   `manifest.version` disagree); pin the umask in the permissions test, which is otherwise
   environment-dependent.
+- **The exit-code table** should note the closed-pipe path: piping `--json` into `head -c` prints
+  `devlog: WriteFailed` at exit 1. Pre-existing, unchanged by D16's bound, and **less** reachable now — the
+  default result is ~51 KB against a typical pipe buffer where an unbounded one was ~790 KB.
+- **`--state`/`--blocking` return items from `list` but records from `search`** — the one non-uniform spot
+  on the read surface. Deliberate under R2 and it needs saying out loud.
+- **A zero-padded `--limit` (`05`, `007`) is a refusal**, not a silent success. Right trade, fails loudly,
+  but a `%02d`-style formatter would hit it — `9.4`'s plugin must emit bare digits.
+- **`list --help` and `search --help` describe the one shared role check differently**, and `search`'s
+  wording is the accurate one.
 
 **Owed to `9.x`:**
 
-- **`9.1` is not a replay exercise** — it is the only automated mechanism this project has that would
-  catch the two classes that have escaped review: a defect in a branch nothing executes, and a defect only
-  visible when the built binary runs. Brief it as such.
+- **`9.1` is not a replay exercise** — it is the only automated mechanism this project has that would catch
+  the two classes that have escaped review: a defect in a branch nothing executes, and a defect only
+  visible when the built binary runs. Section 7 adds a third: **a defect only visible at realistic corpus
+  size.** Brief it as such.
 - **`9.4` must tell consumers to ignore the temp-name pattern**, not merely record that it exists.
   Consumers inherit the orphan risk with none of this repo's `.gitignore` mitigation.
+- **`9.4` must also say that `search` is the bounded read and `list --json` deliberately is not** — a
+  consumer that assumes uniform bounding will silently truncate a `list`, or paginate a `search` that
+  already bounded itself.
 
 **Carried, none blocking:**
 
-- **The derive-level write-boundary fault rule covers `verdict` and `brief` but not `section`.**
-  `runSection` requires `--section`, so by the standing rule it is the same class; it has simply never
-  been reached. Close it or record why not.
-- **`matchesListFilters` is coupled to argv**, and `parseArgs` maintains six hand-written flag lists.
-  Both are `7.x` territory if `search` extends them.
+- **D3's revisit trigger has tightened.** With a default bound, the evidence to watch for is *the answer
+  falling outside the top 10*, not *search failing to return it*. Recorded in D16 and in the risk list.
+- **`parseArgs` maintains a hand-written flag list per command.** Section 7 added an eighth. It has not
+  bitten, and the command surface is now frozen, so it never will in this change — but a fifteenth command
+  in a later change inherits it.
+- **`commands` is a runtime table with no comptime exhaustiveness check**, which is why the unreachable
+  `not implemented yet` dispatch arm is kept deliberately. Making dispatch table-driven would let the
+  compiler prove what that arm currently guards. A later change's call.
 - **D13's body text never mentions `closers`**; the decision is everywhere except `## Decisions`.
 - **Supervisor notes N1–N9** are in section 1's first supervisor post, including `main.zig:146` citing a
   `tasks.md` path that moves under `archive/` when this change ships.
 
-**What six sections have taught about where defects actually live** — worth more than any single finding:
+**What seven sections have taught about where defects actually live:**
 
-1. **In branches nothing executes.** Section 4's `post stray-token` exiting `0`; 6A's five untested record
-   kinds; 6B's missing-NEXT branch. Hence the standing rule: **an untested branch in a block's binding
-   constraint closes in that block**, waived only when the branch is genuinely *unreachable* (the
-   `runList` sort) or untestable with this harness (the double-OOM leak — where the fix still landed).
-2. **On `OutOfMemory` paths a green `TEST_EXIT:0` cannot see.** Section 5 shipped two; section 6's
-   follow-up found a third. All three were found by reading with **ownership as the question**.
-3. **Only when the built binary runs.** Section 4's two bugs, 6B's SIGABRT on a hand-written log, and
-   every one of section 6's three supervisor blockers. `9.1` is the only mechanism that would catch these.
-4. **Across commands, where no block review can see them.** All three section-6 blockers spanned blocks by
-   construction. This is the outer loop's entire justification.
-
-**The technique that works, three sections running: prove a test's power by mutation.** Copy the tree to a
-scratch directory outside the working tree, delete the branch the test exists to pin, rebuild, and count
-which tests fail. It has converted "there is a test" into "the test catches this" every time, and it
-caught one case where a ruling's own test would have passed without the fix.
-
-**Standing facts for a cold start:**
-
-- **Appending a post to the DEVLOG: anchor on the last line of the post you are following, never on
-  `## NEXT`.** Matching the heading is safe only when you are replacing the whole section and reinstating
-  it yourself. I consumed the heading by anchoring on it for an append — see the incident post above.
-- Gates run via `make`; reports quote `LABEL_EXIT:<n>`. Gates run **in-sandbox** — `~/.cache/zig` is on
-  the write allowlist. A `manifest_create PermissionDenied` means that entry went missing, not a broken
-  toolchain.
-- **Version is single-source**: `build.zig.zon:3` is the only semver literal in tracked source.
-- **Zig 0.16 changed `main`'s signature** — `pub fn main(init: std.process.Init) !void`. Write against
-  0.16's API, never a remembered one; check the installed stdlib source when a fix rests on its
-  semantics.
-- **Parse-ambiguity errors beat `--help`/`--version`.**
-- **Roles are declared per project in the `header`** (D13), which carries no role and also declares
-  `closers`. `orchestrator` is retired — the main session is `analyst` and `architect`.
-- **The `dmons` tripwire is inert in this harness** (agents run in the background; the call returns on
-  launch), so its detection half reports "all clear" unconditionally. The guard's prevention half works.
-  **The architect's own repo-wide grep before committing is the only control covering `.claude/agents/`.**
-- **Sweep repo-wide, case-insensitively, when a decision amends an invariant** — one amendment once left
-  seven restatements across five files, and three separate audits each missed some.
-- **Commit the DEVLOG when a post lands, not only when a block does.**
-
-<!-- Superseded section-5 notes retained below for provenance. -->
-
-**Section 6 was next** — read commands (`6.1`–`6.6`). Everything it renders already existed in
-`src/state.zig`; what section 6 added is the read-only load path and the command surface.
-
-**Four things were owed to section 6 specifically, three of them re-homed rather than new:**
-
-- **Carried 17 — `DeriveError` has no reporting path.** `reportLogError` covers `log`'s error set, not
-  `state`'s, so section 5's three faults are unreachable from the CLI today. First block of section 6.
-- **Carried 13 — `openLocked`'s read-and-parse must not be duplicated by the read path**, which must
-  **not** create the log on a missing path (`6.6`). This is the shape section 6 is most likely to get
-  wrong by copying.
-- **Carried 10 — `durable-format`'s "a read ignores a temporary file" scenario has no task.** It becomes
-  dischargeable the moment a read opens a path, which is `6.6`. Give it a test there.
-- **Carried 16 — any read that enumerates a whole index inherits unstable hash ordering** and must impose
-  its own, as the grid already does with `block_order`. Reads that look up a key are safe; reads that walk
-  a map are not. Not visible from inside section 6, which is why it is written here.
-
-**What section 5 taught, and it is not the same lesson as section 4's.** Section 4's defects were found by
-driving the built binary; section 5's were found by **reading the code with ownership as the question** —
-both of 5A's were `OutOfMemory`-only, so a green `TEST_EXIT:0` was silent on them, and `9.1` will not cover
-that class either. Neither method subsumes the other. The other durable practice, from the 5A re-audit:
-when a test is supposed to *pin* a refusal, prove it by copying the tree to a scratch directory outside
-the working tree, deleting the branch, and re-running the tests. Both reviewers did this in section 5 and
-it converted "there is a test" into "the test has power". Adopt it wherever a ruling turns on test power.
-
-**Three invariants section 4 established at the write boundary that later sections may rely on — and one
-they must not.** May: every stored `role` and every stored `to` names a declared role; every stored
-`close` names an item that exists; every stored item number is the positional one, assigned under the
-lock. Must not: **none of these hold for a hand-written log**, only for one this tool wrote. That
-distinction is what section 5 turned into a rule worth restating: **where the write boundary guarantees
-something, the derivation faults rather than silently tolerating it** — `ItemNumberMismatch`,
-`CloseTargetMissing`, `VerdictMissingKey`, one error set and one diagnostic shape. It is a check on *this
-tool*, never a repair path (D14). Apply it to any new derivation; the exception is a field the write path
-does not itself require (carried 18).
-
-**Section 4 is CLOSED** — supervisor `Approve` on the second pass, after one remediation round. Base was
-`b59f249`. Landed: `d131498` (4A), `96df34c` (4B), `e8ccf41` (the Product Owner's addressee-validation
-amendment, mid-section), `e8b6fdb` (4C), `c95ebfd` (rulings and the B3 amendments), `c895f23`
-(remediation, ticks nothing). Gates `GATES_EXIT:0`, **157** named tests / **158** run. All eleven boxes
-ticked. `3.2` was discharged by the Product Owner's terminal check and ticked inside section 4's timeline.
-
-**For section 7, before `search` is designed — `7.2` reopens B1 unless it is handled.** `takes_positional`
-is a **boolean**, so `search a b c` will silently drop `b` and `c`: the exact silent-acceptance defect the
-section-4 supervisor found and the remediation fixed, reintroduced by the mechanism that fixed it. Either
-`search` takes exactly one positional and refuses a second, or the property becomes a count/arity rather
-than a flag. Decide it in `7.2`'s brief, not in its review.
-
-**Three things bound for section 8, all of them "the archived specs do not describe the tool":**
-
-- **`section`, `brief` and `verdict` are named in no capability spec at all** — they exist only in
-  `design.md`'s schema table and D7/D8. A third of the write surface would archive undescribed. `8.4` is
-  the backstop, but this is worth a spec delta rather than prose.
-- **The six-variant parse-fault family lives only in code comments.** `8.1` is where the command surface's
-  failure modes must be written down.
-- **`headerUnchanged` excludes `change` from header identity** (`src/log.zig:453-457`) — verified against
-  the binary: `--change TOTALLY-DIFFERENT` against an existing log reports `unchanged` and stores the old
-  value. The supervisor found this in round two and deliberately did **not** block on it: `change` is
-  provenance only, nothing in `src/` reads it back, no derivation depends on it, and the identity triple is
-  documented at `src/log.zig:434-437`, so this is silence rather than a document disagreeing with code. It
-  wants one sentence in D13 before `8.4`. **I agree it is not worth a third round.**
-
-**What section 4 actually taught, worth more than any single finding:** its one correctness bug (`post
-stray-token` exiting `0` and writing a record) was invisible to three block reviews — one of which
-byte-diffed the parser's test suite — because **no test pinned the behaviour and the defect lived in the
-branch that does nothing.** An absent refusal has no line to review. Both of this section's real bugs (that
-one, and 4A's `Io.Dir.cwd()` panic) were found by driving the built binary end to end, not by reading code.
-That is now twice. **`9.1` is not merely a validation task — it is the only automated mechanism this
-project has that would catch either class**, and it should be briefed as such rather than as a replay
-exercise.
-
-**[architect]** **Section 3 is CLOSED** — supervisor `Approve` on the second pass, after one remediation
-round. Base was `5d2e805`.
-
-Landed: `6db3d5c` (block `3.1–3.4`), `8094e32` (D14 and the `append-only-log` amendment), `dbbb62d`
-(remediation, ticks nothing). Gates `GATES_EXIT:0`, **77** named tests — counted, not quoted.
-
-**`3.2` is implemented, audited, and deliberately unticked.** Confirming the binary refuses rather than
-*hangs* against a real terminal is a `CLAUDE.md §4` human-in-the-loop task: a test harness only ever
-supplies a pipe, so the tests prove the `isTty` branch runs before any read and nothing more. Its
-verification depends on an artefact section 4 produces, so **the Product Owner's TTY check is a done-gate
-in the brief of the first section-4 block that wires a command to `readBody`** — a brief is append-only
-and is read exactly when the obligation becomes dischargeable, which this block is not. **3.2 ticks
-retroactively, inside section 4's timeline.** It is not an unfinished section-3 task, and `CLAUDE.md §1.4`
-should not re-open section 3 over it on a cold start.
-
-**C1, C2 and C3 were settled by section 4** — C1 as decision A4 (two message shapes, `fail()` the single
-printer, `record.write` gaining a `diag`), C2 as A2/A3 (a non-header write never creates the log; refusals
-precede filesystem effect), C3 in 4A's nit pass. **C4 is still open and still owed to `8.4`:** the spec
-scopes the UTF-8 `SHALL` to `body`, while the code validates **every** string field. They agree through
-"never write a record it cannot read back", but the record-format specification must carry the field-level
-breadth explicitly, or a reimplementer validates `body` alone and reintroduces the invalid-UTF-8 hazard
-through `--to`. Section 4's supervisor confirmed the breadth is correctly implemented — `title`, `base`,
-`commit` and `header`'s own strings are all covered — so what remains is purely the writing-down.
-
-**Two workflow facts worth knowing before trusting the enforcement, both discovered this session:**
-
-- **The `dmons` 0.5.0 tripwire is inert here.** Its `PreToolUse`/`PostToolUse` pair on Agent calls assumes
-  the tool returns when the agent *finishes*; in this harness agents run in the background and the call
-  returns on *launch*. Measured: snapshot written at `14:17:35`, compared and deleted at `14:17:37`, with
-  the agent still running minutes later. So the **detection** half reports "all clear" unconditionally,
-  which is worse than absent — silence reads as verification. The **prevention** half (`dmons-guard.sh`,
-  `PreToolUse` on each agent's own calls) is unaffected and is doing the real work. Written up for
-  `dmon-dev` at `notes/dmons-0.5.0-tripwire-async-gap.md`.
-- **No auditor can check the `.claude/agents/` half of an amendment sweep** — the guard confines them, and
-  correctly. But that is precisely the half with the worst record in this change: agent definitions have
-  drifted from a decision **three** times (D11, D13, D14), and each time it was invisible to the audit that
-  should logically have owned it. **The architect's own repo-wide grep before committing is the only
-  control that covers it.** A known limit of the workflow, not a gap to be fixed by asking an auditor to
-  look harder.
-
-**[architect]** **Section 2 is CLOSED** — supervisor `Approve` on the second pass, no findings, after one
-remediation round. Base was `0a7d8b0`.
-
-Landed: `eb01909` (2A, `2.1–2.4`), `4447333` (the Product Owner's `durable-format` amendment, mid-section),
-`6625796` (2B, `2.5–2.7`), `f00e573` (remediation, prose and `.gitignore` only, ticked nothing). All seven
-boxes ticked, gates `GATES_EXIT:0`, **63** tests — counted, not quoted.
-
-Section 1 is CLOSED — supervisor `Approve` after one remediation round. Landed: `eccfabe` (1.1–1.3),
-`3a32d66` (1.4–1.5), `befbdae` (DEVLOG restoration), `ecb6afc` (remediation), 25 tests.
-
-**Section 3 is next** — body input from stdin (`3.1–3.4`). It needs no new mechanism: `src/log.zig` takes
-the body as bytes already. What it adds is the terminal check, the empty-body refusal, and the verbatim
-round-trip test. **D5 is what it is briefed against, and D5 was amended this section** — read it as it now
-stands, not as remembered.
-
-**N1 was settled by section 4 as decision A1** — `appendRecord` performs the role check itself, under the
-lock, rather than `openLocked` exposing the parsed log to `main.zig`; the alternative would have exported
-lock lifetime to every future call site. It later grew the addressee and item-existence checks for free,
-which is the evidence the shape was right. The section-4 remediation consolidated both public write paths
-onto one `appendLocked`, so the check cannot come to exist on one path and not the other.
-
-**Standing rule, learned the expensive way this section — sweep repo-wide when a decision amends an
-invariant.** One `durable-format` amendment left **seven** restatements of the retired absolute across
-**five** files: `design.md` D5, the spec's own sibling scenario, `proposal.md`, `worker.md` twice,
-`reviewer.md` twice. Three separate audits each missed some, and none of them could have caught them all —
-block review sees a diff, section review sees a commit range, and `.claude/agents/` sits outside both.
-Before posting an amendment, grep the **whole repo** for every restatement of the invariant, with a term
-list broader than the phrasing you remember writing, and **case-insensitively** — a capitalised
-restatement hid two instances behind a clean-looking `grep -n`. Every time an agent definition has drifted
-from a decision this session, it was invisible to the audit that should logically have owned it.
-
-**And do not overturn an audit's finding on the strength of one grep.** A count from an agent that read
-the files is evidence; disagreeing with it needs better evidence than a single search that came back
-empty. This session produced three false all-clears from too-narrow greps, one of which briefly
-"corrected" a supervisor finding that had been right all along.
-
-**Carried, none blocking:**
-
-1. **D13's body text never mentions `closers`** (`design.md:179–203`). The decision is in the schema table,
-   the specs, tasks, code and a DEVLOG post — but not in `## Decisions`, where the two *rejected*
-   alternatives are the valuable part. Hardcoding `architect` is exactly what a future maintainer proposes
-   again. One paragraph, or a D14.
-2. ~~The agent definitions still state the retired rule as binding.~~ **CLOSED in `0a7d8b0`**, ahead of
-   4.5. It was one line in one file, not three — `reviewer.md:96` and `supervisor.md:113` never contained
-   it. Product Owner confirmed `architect` is the sole closer across their projects and that the agents
-   know it as "the orchestrator"; the fix was to stop `worker.md:65` prescribing a hardcoded role check.
-   Upstream `dmons` scaffold is theirs, separately. See the section 2 post.
-3. ~~`tasks.md:52`'s `--role` overload.~~ **CLOSED in section 4 (A5).** The dispatcher gained genuine
-   command-scoped flag arity via a two-phase parse, so `header`'s `--role` is repeatable while every other
-   command's is exactly-once. `--change` and `--log` both kept: different things, both needed, and
-   `header --help` says which is which.
-4. ~~`Parsed.isAmbiguous()`'s four ordered `if`s.~~ **CLOSED in section 4 (A6).** Replaced by a single
-   `?ParseFault` set once, first-fault-wins encoded in one place. It has since absorbed two further fault
-   kinds — `--ref` malformation and the remediation's `unexpected_argument` — without an ordering
-   decision at either call site, which is the evidence the structure was the fix rather than more care.
-5. **For 8.5** — `zig build test -Dversion=X` fails, because the override makes `build_options.version` and
-   `manifest.version` disagree and the test reads it as skew. 8.5 is where the override is meant to be used.
-6. **Diagnostic nit** — `--role "" --role x` reports "requires a non-empty value" rather than "given more
-   than once". Same tier, same exit 1, first fault named. Recorded so nobody rediscovers it as a finding.
-7. Supervisor notes **N1–N9** are in its first section post, including that `main.zig:146` cites a
-   `tasks.md` path that moves under `archive/` when this change ships.
-8. **The permissions test's power depends on the ambient umask**, which is not pinned — under a `002` umask
-   it passes whether or not the code is correct. The *fix* is umask-independent (`fchmod`); only the test
-   is environment-dependent. `std.c.umask` exists in 0.16. Section 2's supervisor recommends pinning it at
-   **8.5**, when the gates first run somewhere other than this machine. Agreed.
-9. **The safe window between temp-file creation and `fchmod`** deserves a one-line comment in
-   `src/log.zig`: content is written only after `setPermissions` succeeds, so the window can expose an
-   empty file at the umask default but never log content. Currently that reasoning exists only in a review
-   transcript.
-10. **`durable-format`'s "a read ignores a temporary file" scenario has no task.** It cannot be discharged
-    until read commands exist (section 5) and is recorded nowhere but thread prose. Give it a home when
-    section 5 is briefed.
-11. **The temp-name pattern is contract now**, not an implementation detail — `8.4` and `9.4` depend on it,
-    and `.gitignore` matches it — but it lives only in `src/log.zig:206–212`. **Sharpened by the
-    supervisor (P2):** `proposal.md:67`'s "the pattern is `.gitignore`d" is true of *this* repo but reads
-    as a property of the tool. Consumers inherit the orphan risk with none of the mitigation, so `9.4` and
-    `8.1` must **tell consumers to ignore the pattern**, not merely record that it exists. `9.4` is a
-    one-shot handoff prompt — if it is not written into it, it does not happen.
-14. **P1 — "removed before the command exits" is loose on the success path** (`design.md:110`,
-    `specs/durable-format/spec.md:43`). On success the temp file is *renamed*, not removed.
-    Observationally identical, and the scenario at `:68` is exact — but `8.4` requires the format be
-    reimplementable from the document alone, and a reimplementer who reads "removed" as `unlink` after a
-    successful rename **deletes the log**. One clause, when 8.4 is written.
-12. **Append-only has moved from mechanism to convention.** `atomicReplace` accepts arbitrary content; only
-    `replaceWith`'s `concatOwned` keeps the new file a superset of the old. The spec requirement is met, but
-    no test asserts prior bytes survive a *successful* append — the existing test covers the failure path
-    only.
-13. **`openLocked`'s read-and-parse is about to be duplicated by the read path**, which must *not* create
-    the log on a missing path. Watch for it when section 5 is carved.
+1. **In branches nothing executes**, and in behaviour only the built binary shows. `9.1` is the only
+   mechanism aimed at either.
+2. **Behind coverage that cannot fail** — a fixture too small for the property to break, a bad-value table
+   whose one negative is the one the parser rejects for the wrong reason. **Section 7's whole lesson.**
+3. **In the gap between what a task says and what its requirement means.** `7.1`–`7.4` were all built,
+   correctly, and the requirement still was not met. Ticked boxes are not a closed section, which is why
+   the supervisor exists and why it runs on every section including single-block ones.
+4. **In the second implementation of one idea.** Every extraction this project has made (`fail`,
+   `matchesListFilters`, `selectCandidates`, `checkHistoryFilters`) followed a finding that two call sites
+   had drifted or were about to.
 
 **Standing facts for a cold start:**
 
 - Workflow is `dmons` 0.4.0: gates run via `make`, reports quote `LABEL_EXIT:<n>`. Gates run **in-sandbox**
   — `~/.cache/zig` is on the write allowlist. A `manifest_create PermissionDenied` or `unable to load
   'std.zig'` means that entry went missing, not a broken toolchain.
+- **The test count identity is settled: named `test "…"` declarations plus the one anonymous `test {}` at
+  `src/main.zig:20`.** At section 7's close that is 293 + 1 = **294**. There are no other test forms in
+  `src/` — no indented blocks, no `test <identifier>` — so this arithmetic holds for later blocks. Three
+  different numbers were reported for one tree before this was pinned.
 - **Version is single-source**: `build.zig.zon:3` is the only semver literal in tracked source.
 - **Zig 0.16 changed `main`'s signature** — `pub fn main(init: std.process.Init) !void`;
   `std.process.argsAlloc` and `std.io.getStdOut` are gone. Write against 0.16's API, never a remembered one.
 - **Parse-ambiguity errors beat `--help`/`--version`.** Any new error condition must be placed on the
-  correct side of that line.
+  correct side of that line. `search`'s no-query refusal deliberately sits *after* it, so `search --help`
+  works.
 - **Roles are declared per project in the `header`** (D13), which itself carries no role; the header also
   declares `closers`. `orchestrator` is retired — the main session is `analyst` and `architect`.
 - **When rewriting this section, match `^## NEXT$` at start of line.** The bootstrap note contains the

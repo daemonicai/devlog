@@ -309,9 +309,9 @@ an array of integers" is exactly the kind of clause a second implementation gets
 
 ### D15 — Reads render for a human by default and emit JSON on `--json`
 
-Every read command (`resume`, `show`, `list`, `refs`, `status`) prints rendered, agent-readable text by
-default, and the same content as JSON on `stdout` when given `--json`. The default is what a person or an
-agent reads in a terminal or pastes into a thread; `--json` is what a consumer parses.
+Every read command (`resume`, `show`, `list`, `refs`, `status`, `search`) prints rendered, agent-readable
+text by default, and the same content as JSON on `stdout` when given `--json`. The default is what a
+person or an agent reads in a terminal or pastes into a thread; `--json` is what a consumer parses.
 
 **Decided by the Product Owner during section 6**, because nothing in this document, the specs or the
 proposal had settled it, and all five read commands emit something. Recorded here rather than in a review
@@ -323,6 +323,14 @@ carries that the text form cannot show is a signal the text form is under-render
 two to diverge — a consumer that parses `--json` and a human reading the default must never be told
 different things about the same log.
 
+**That equivalence is about what was found, not about what was asked.** A `--json` payload may echo the
+request's own parameters — `search`'s `"limit"` is the only case (D16) — without the text form being
+obliged to restate them. The distinction is that `total` and the records are *derived from the log* and so
+must agree across both forms, whereas `limit` is *the caller's own input handed back*. It is echoed because
+the process that parses the payload is often not the process that built the command line: a plugin
+receiving a result needs to know the bound applied to it, while the human who typed `--limit 5` does not
+need reminding. Nothing derived from the log may hide behind this clause.
+
 `--json` is a flag on the read commands only. The write commands' output is a confirmation, not a query
 result, and is out of scope for this decision.
 
@@ -333,6 +341,37 @@ in another repository whose breakage would show up as a workflow that silently s
 **Rejected — JSON only**, which is unambiguous for machines and unreadable in the terminal where the
 Product Owner checks the tool by hand. It also makes an agent reformat before pasting a status into a
 thread, which is the tool's most common use.
+
+### D16 — `search` is bounded by default, and says so in both forms
+
+`search` returns at most **10** records unless `--limit <n>` says otherwise; `--limit 0` lifts the bound
+entirely. The text form renders `records (10 of 156):` when the bound cut the result and `records (10):`
+when it did not. The `--json` form is an envelope — `{"total":156,"limit":10,"records":[…]}` — and is the
+one read payload that is not a bare array. `"limit"` is `null` when unbounded, never `0`.
+
+**Decided during section 7's supervisor review, on measurement rather than judgement.** Unbounded, a
+natural-language question against this change's own 200-record log returned 96% of it — the tool's purpose
+clause is that an agent can find what was decided "without ingesting the log", so the requirement was not
+met. The measured result after the bound is 6.0%, and the answer's rank in the *uncapped* ranking was 3 or
+better on all six probe questions, so the bound costs no recall at this corpus size.
+
+**This is not a retreat from D3.** Ranking quality was verified good before the cap was chosen, and
+AND-semantics — the obvious alternative — was tested and rejected because it collapses the same questions
+to one or two hits. BM25 works; it was the *tail* that was unbounded.
+
+**The bound is applied in the one derivation**, after the ranking sort and before either renderer, so the
+two forms cannot disagree about what was dropped. `list` and `refs` are deliberately **not** bounded: they
+answer a closed question ("everything matching these filters") where a partial answer is a wrong answer,
+whereas `search` answers an open one where the tail is noise by construction. A consumer wanting an
+unbounded ranking asks for it with `--limit 0`.
+
+**Ranking quality is now load-bearing in a way it was not.** Before the bound, a relevant record ranked
+11th was merely late in a long list; now it is invisible. D3's revisit trigger tightens accordingly: the
+evidence to watch for is *the answer falling outside the top 10*, not *search failing to return it at all*.
+
+**`--limit` accepts ASCII digits only** — no sign, no `_` separators, no leading zeros beyond `0` itself.
+It does not inherit `std.fmt.parseInt`'s liberality, because it did once, and `--limit -0` was accepted and
+returned the whole log.
 
 ## Record schema
 
@@ -392,6 +431,9 @@ understands is refused with a clear message rather than guessed at.
   Append-only softens it: diffs are almost always pure additions.
 - **Lexical search will miss paraphrase.** Accepted under D3, with structured references covering the
   highest-value case. Revisit on evidence from a real change.
+- **The default bound makes ranking quality load-bearing.** Under D16 a relevant record ranked 11th is not
+  merely late, it is unseen. Measured at 200 records the answer ranked 3 or better on every probe, so the
+  margin is comfortable today — but the margin, not the bound, is what a larger corpus erodes first.
 - **More calls per block than the Markdown file required.** Three findings become three invocations
   (D6), and reviews now emit a typed verdict (D7). The trade is deliberate: ceremony at write time buys
   state that cannot drift.
