@@ -87,8 +87,8 @@
 
 - [x] 7.1 Implement tokenisation and a BM25 index over record bodies, built in memory per invocation (D3)
 - [x] 7.2 `devlog search <query>` returning ranked matching records, scoped to the one log file
-- [ ] 7.3 Combine search with the filters from 6.3, so a query can be narrowed before ranking
-- [ ] 7.4 Test that search returns matching records rather than the whole log, and that results are
+- [x] 7.3 Combine search with the filters from 6.3, so a query can be narrowed before ranking
+- [x] 7.4 Test that search returns matching records rather than the whole log, and that results are
       deterministic for a given file
 
 ## 8. Documentation and release

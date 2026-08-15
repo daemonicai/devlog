@@ -9791,6 +9791,306 @@ to item records under R2, and the `--kind` conflict refusal.
 contradict what the code already does — R6 especially, since it asks you to split something that is
 currently one piece — **stop and post `❓ @architect`** rather than choosing for me.
 
+**[worker]** **Block 7B (`7.3`–`7.4`) implemented.** Gates: `BUILD_EXIT:0 TEST_EXIT:0 FORMAT_EXIT:0
+VALIDATE_EXIT:0 GATES_EXIT:0` — `GATES_EXIT:0` in one `-k` pass. **287 tests**, all green (+10 this
+block). One file changed: `src/main.zig`.
+
+**R6 — the extraction, and where the seam fell.** `runList`'s seed-and-intersect is now
+`selectCandidates(allocator, records, indexes, p, kind_filter, out)`, called by both commands, still
+predicated on `matchesListFilters` — no second predicate. Three more pieces came out with it, because
+leaving any of them behind would have meant a copy:
+
+- **`resolveFilterSpec`** — `--kind`/`--state`'s value validation *and* the `--kind`-vs-`--state`
+  conflict, one guard with one message. It returns `union(enum) { ok, refused: u8 }` rather than a bare
+  error, so `fail` keeps owning the exit code as well as the wording.
+- **`matchesItemFilters(it, p, state_filter)`** — the item half. This is where `list` and `search`
+  genuinely differ and the difference is *what each collects*, not what either counts as a match: `list`
+  collects `state_mod.Item`s (its result becomes items), `search` collects
+  `record.Record{ .item = it.opened }` (R2 — candidates narrow, output shape does not move).
+- **`activeRecordFilterCount`** — the sort's guard, kept beside the selection it describes.
+
+The `seq` sort stayed on `list`'s side, as ruled.
+
+**R5 — filter first, and it is pinned by a test that inverts.** `Index.build` is handed
+`candidates.items`, never `opened.log.records`. `seedIdfFixture` is six documents of identical length so
+length normalisation is a constant and IDF alone decides: "alpha" is common over the whole log and rare
+within section 8, "beta" the reverse. Query `alpha beta` ranks the beta records first unfiltered and the
+alpha record first under `--section 8` — **opposite orders over the same three documents**. Mutated to
+index-then-filter (rank the whole log, then drop non-candidates) in a scratch copy: exactly one test
+went red, that one. `TEST_EXIT:1`, then discarded.
+
+**Two more mutations, same method.** `search` ignoring `--state`/`--blocking` → only the R2 test red.
+Removing the shared conflict guard → *two* red, section 6's original `list` test and the new one that
+asserts the two stderrs are byte-equal — which is what proves it is one guard rather than two that agree
+today.
+
+**❓ @architect — three things I decided as forced, not chosen. Flagging in case any is wrong.**
+
+1. **`search` did not "already have `--role`".** The brief said so; `wants_role_value` did not include
+   `wants_search`, and `search` is `strict`, so `search --role x` was `unknown flag '--role'`. I added
+   it — without it `7.3`'s filter set is incomplete. No ruling seems to be in tension with this.
+2. **`seedSearchFixture`'s `brief` carried no `block`, so `derive` faulted it and six of 7A's tests went
+   red the moment `search` started deriving** (`BriefMissingKey`). That is the rule working: it is a log
+   `runBrief` could never have written. I added `.block = "7A"` to the fixture and wrote a **separate**
+   test that reaches the fault deliberately, so the coverage is explicit rather than incidental. I also
+   made `search` derive **unconditionally**, not only when `--state` needs it — the alternative is a
+   command that faults on a broken log with one flag and silently ranks over it without.
+3. **Retargeted `"search joins the strict set…"`** — its subject was `search --section 6`, which `7.3`
+   has now built. Moved to `--ref` (`refs` recognises it, `search` deliberately does not); the property
+   under test is unchanged.
+
+**Carried 21 — you asked; here is the answer.** **The `seq` sort cannot change `list`'s output, and it
+is provable rather than inspected.** `record.parseLog` refuses any log whose `seq` is not strictly
+increasing and contiguous from 1 (`validateSeqOrder`), so **for every log that opens at all, log order
+*is* `seq` order**. `buildIndexes` builds each bucket as an order-preserving subsequence of one forward
+pass; `selectCandidates` only ever drops elements from that subsequence. There is no reachable input on
+which the sort reorders anything. And the premise it was carried on is gone for good: `search` re-sorts
+by score, so no ranked result ever passes through it. I left it in place with the reasoning written into
+the comment — removal is yours.
+
+**Also in this block**: `search_usage` documents all seven filters, states that `--state`/`--blocking`
+do **not** change what `search` returns, and states the 7A nit — a query cannot begin with `-`, there is
+no `--` terminator, and quoting does not rescue it, because the shell strips the quotes.
+
+**Verified against the built binary, not only in tests**: the two conflict messages are byte-identical
+across `list` and `search`; `--role nobody` refuses by declared-role history; `--ref` is still an unknown
+flag; the no-query refusal still precedes all filter work; 20 consecutive filtered runs hash identically;
+and the directory afterwards holds only `DEVLOG.jsonl` — no temp file, no scratch file.
+
+**Worth the reviewer's hardest look**: the defer order in `runSearch` (`opened` → `derived` →
+`candidates` → `index` → `ranked`, so the index's borrowed body-byte keys die before the log does — the
+lifetime 7A's review called load-bearing, now with two more allocations between them); whether
+`matchesItemFilters` is the right seam or whether `search`'s item path should have gone through
+`selectCandidates` too; and my arithmetic in `seedIdfFixture`, which is hand-computed BM25 and the only
+place in this block where a wrong number would still produce a green test.
+
+I did not commit and did not tick boxes. → @reviewer
+
+**[reviewer]** **Block 7B (`7.3`–`7.4`) — `Approve`.** No blockers. Three nits, all cosmetic or
+forward-looking, none worth a round trip. Gates re-run and read from the exit line, not the output:
+`BUILD_EXIT:0 TEST_EXIT:0 FORMAT_EXIT:0 VALIDATE_EXIT:0 GATES_EXIT:0`. **287 tests** — counted, 286 named
+`test "…"` across `src/` plus one anonymous block, exactly the worker's figure. Two files changed;
+`Makefile`, `tasks.md`, `build.zig`, `build.zig.zon` untouched and `.dependencies = .{}` unchanged
+(ADR-0001). `7.3`/`7.4` still unticked. `search` remains read-only end to end: after seeding a real log
+and running fourteen searches across every flag combination, the directory held `DEVLOG.jsonl` and
+nothing else — no temp file, no scratch file, no index file (ADR-0002, D11 clean by construction).
+
+**R6 — `list` is bit-for-bit unchanged, and I proved it rather than read it.** Built HEAD's binary and
+the working tree's and ran a **750-probe parse-and-dispatch matrix**: fifteen command words (the
+fourteen real ones plus `frobnicate`) × sixteen flags × three positions (`--log` present, `--log`
+absent, flag *before* the command word), plus a stray positional and `--help` for each. **The diff is
+exactly twenty-two lines and every one of them is `search`** — the seven newly-recognised flags in
+their three positions, plus `search`'s one-line summary. Every other command, including the unknown-word
+path, is byte-identical. That is the R1 class you asked me to re-check, and nothing moved.
+
+Reading the extraction against its pre-image, the equivalence is structural too: `resolveFilterSpec`
+keeps the original's exact order (kind value → state value → conflict) and its three exact messages,
+still ahead of `Diagnostics.init` and the read-only open, so an unusable combination is still refused
+before the filesystem is touched (A3). `matchesItemFilters` keeps the original inline order (state,
+blocking, `matchesListFilters` with `kind_filter` null). `selectCandidates` is the seed chain verbatim,
+with `opened.log.records` and `derived.indexes` passed in rather than closed over. `activeRecordFilterCount`
+is the same five `@intFromBool` terms and is still evaluated only on the record path, after the
+`item_only` early return. Nothing was reordered, and no message was restated at a call site.
+
+**The conflict guard really is one place, and the test that says so bites.** `grep` finds the wording
+once in code (`src/main.zig:2154`) and once in `search_usage`'s prose. Against the built binary the two
+stderrs are byte-identical (`diff` → no output). Then the mutation: deleting the guard from
+`resolveFilterSpec` in a scratch copy turned **two** tests red — section 6's original `list` refusal and
+7B's byte-equality test — which is exactly the pair that distinguishes one guard from two that agree
+today. `TEST_EXIT:1`, discarded.
+
+**`FilterSpecResult` keeps `fail` owning the code.** `union(enum) { ok: FilterSpec, refused: u8 }`, and
+the `refused` payload is the *return value of `fail`* (`src/main.zig:2143-2161`), not a literal. Both
+call sites are `switch (…) { .ok => |f| f, .refused => |code| return code }`. There is no second path to
+an exit code and no call site that knows what `1` means.
+
+**R5 — filter first, index over the survivors. Verified by the mutation, not by reading the call.**
+`Index.build` is handed `candidates.items` (`src/main.zig:2494`) and `opened.log.records` appears
+nowhere below the selection. I mutated a scratch copy to the wrong thing you'd expect a shortcut to
+produce — build over `opened.log.records`, rank the whole log, then drop non-candidates from the ranked
+slice, which yields *identical record sets* and differs only in IDF — and **exactly one test went red**:
+the R5 test, at `narrowed_alpha < narrowed_beta`. So the assertion is load-bearing on the IDF corpus
+specifically, not merely on the result count.
+
+**The hand-computed BM25 in `seedIdfFixture` — checked independently against the formula in
+`Index.rank`'s doc comment, and it is right.** All six documents are four tokens, so `avgdl = 4` and the
+length term collapses to `k1·(1 − b + b·1) = 1.2` for every document; with `tf = 1` throughout, the
+whole score reduces to `IDF × (1 × 2.2)/(1 + 1.2) = IDF × 1.0`. **Whole log**, `N = 6` (the header has no
+body, so it is not a document — which also confirms the `records (6):` the test asserts): `df(alpha) = 4`
+→ `ln(1 + 2.5/4.5) = 0.4418`; `df(beta) = 2` → `ln(1 + 4.5/2.5) = 1.0296`. Beta wins, so `sigilfive`
+precedes `sigilfour`. ✔ **Section 8**, `N = 3`: `df(alpha) = 1` → `ln(1 + 2.5/1.5) = 0.9808`;
+`df(beta) = 2` → `ln(1 + 1.5/2.5) = 0.4700`. Alpha wins, so `sigilfour` precedes `sigilfive`. ✔ And
+`sigilfive`/`sigilsix` are numerically identical, so the third assertion is a genuine `seq` tie, not a
+score comparison in disguise. The inversion is a factor of ~2.2 in both directions — nowhere near
+floating-point noise, so the test is not sitting on a knife edge.
+
+**R2 — narrows candidates, never switches shape.** Confirmed against the binary under `--state open`,
+`--state resolved`, `--blocking`, `--state` + `--section`, `--state` + `--kind item`, and `--json`: every
+one emits `records (n):` / a bare array, never `items (`, and the JSON object carries `kind":"item"` with
+**no `state` key** — the derived state that selected the record does not leak into the record. Mutating
+`runSearch` to ignore `item_only` turned exactly one test red, the R2 test. `TEST_EXIT:1`.
+
+**R3 holds.** `writeRecordListText`/`writeRecordListJson` are untouched by this diff and are the only
+renderers `search` reaches; no score field, no seventh JSON shape, `--json` exactly one line under
+filters as well as without (`wc -l` = 1). Ties by `seq` still pinned — 7A's test plus the new
+`sigilfive`/`sigilsix` assertion inside a *narrowed* corpus, which is a case 7A could not reach.
+
+**Determinism (`7.4`) — holds, and I checked the harder version of it.** The new test repeats each of
+four invocations eight times *within one process*, which cannot see nondeterminism that varies between
+processes. So I ran the real thing: **25 separate process launches per invocation, five invocations, 125
+runs — one distinct output hash each.** Structurally it is sound for the same reason 7A was: nothing in
+the pipeline iterates a hash map. `selectCandidates`'s no-filter seed is the positional slice, its
+filtered seeds are order-preserving bucket subsequences, `rank` walks `terms.items` then `list.items`,
+and `hits` is built by walking `self.docs` — so even the summation order of the floats is fixed. The
+in-process limitation is a note for `8.4`, not a gap in the block.
+
+**`7.4`'s "not the whole log" test bites too.** Mutated `rank`'s `scores[i] > 0` to `>= 0` — the exact
+degeneration the test was written against — and 14 tests went red including that one. `TEST_EXIT:1`.
+
+**Allocator hygiene — the longer chain still tears down inside-out.** `runSearch` declares
+`diag` → `opened` → `derived` → `candidates` → `index` → `ranked`, so unwinding runs `ranked` →
+`index` → `candidates` → `derived` → `opened` → `diag`. The borrow graph points the same way: the
+postings map's `FoldedTerm` keys and `index.docs`'s records borrow body bytes owned by `opened.log`'s
+arena (via `candidates`, which holds copies of `Record` values whose slices point into it), and `ranked`
+borrows from `index.docs`. Every borrower dies before what it borrows from. `Index.docs`/`doc_len` are
+`toOwnedSlice`d, so the index does not even alias `candidates.items` — the ordering is correct with a
+margin. The `item_only` path's `Record{ .item = it.opened }` copies a payload whose slices also point
+into `opened.log`, so it obeys the same order. All 287 tests run under `std.testing.allocator`; no leak,
+and the two OOM paths (`candidates.append`, `selectCandidates`) both route through `fail` rather than a
+`catch unreachable`. No new `catch {}` anywhere in the diff.
+
+**The retarget of "search joins the strict set…" still pins what it was written to pin.** The property
+is *`search` is in `strict`, so a flag outside its grammar is a fault rather than silently accepted* —
+and `--ref` is the right replacement subject precisely because `refs` recognises it and `search` does
+not, so it can only reach the unknown-flag branch through the `strict` membership. Verified at the
+binary across all three argument positions, and the matrix above shows `search --ref D:1` refusing while
+`refs --ref D:1` does not. Two other spellings also still refuse (`-lock`, `-`), so `search_usage`'s new
+leading-dash paragraph is accurate rather than approximately true — I checked, because a help text that
+overstates a limit is its own defect.
+
+**The three decisions you left unruled — my read on each.**
+
+1. **Deriving unconditionally is right, and the argument for it is stronger than the worker's own.**
+   `selectCandidates` needs `derived.indexes`, so `search` already had to derive for *any* filter; the
+   only invocation that could have skipped it is a completely unfiltered one. Making that single case
+   the exception would mean `search lock` succeeding on a log that `search lock --section 6` refuses —
+   the same command, the same log, two verdicts on its integrity, with the honest one reachable only by
+   adding a flag. It is also now consistent with `list`, `refs`, `show`, `status` and `resume`, which is
+   the property that matters: derive-level faults are a statement about the *log*, not about the
+   question being asked of it. The cost is real but pre-existing and uniform — no read command can be
+   used to diagnose a log that fails derive. Worth a sentence in `8.4` about the read surface as a
+   whole; not a finding against this block.
+2. **The fixture correction did not weaken those six tests, and I checked it two independent ways.**
+   Structurally, only `common.body` is indexed (R4) and `block` is metadata, so the corpus size,
+   document lengths, term frequencies and every ranking assertion are untouched — and `"7A"` appears
+   nowhere in the file except the fixture line itself, so no assertion was quietly retargeted onto it.
+   Empirically, I extracted HEAD into a scratch tree (7A's derive-less `search`, original fixture),
+   applied **only** the `.block = "7A"` line, and ran the suite: `TEST_EXIT:0`, all 277 green. The edit
+   changes nothing observable under the code those tests were written against — which is exactly the
+   distinction between fixing a fixture and blunting a test. And they still bite *after* the edit: six of
+   the fourteen tests my `scores[i] >= 0` mutation turned red are those very tests. The separate
+   `BriefMissingKey` test is the right shape too — it builds its own two-record log rather than
+   borrowing the fixture, so the fault it pins cannot drift back into shared setup.
+3. **`matchesItemFilters` is the right seam; do not route `search`'s item path through
+   `selectCandidates`.** They iterate different collections with different keys: `selectCandidates` walks
+   *records* off `Indexes`' buckets, the item path walks `derived.items` in `#n` order and reads the
+   derived `state` that `--state` tests, which no record carries. Merging them would mean handing
+   `selectCandidates` the whole `Derived` and branching internally on `item_only` — one function with two
+   loops over two collections, which is more coupling than the duplication it removes. The seam is
+   already at the right depth: **both paths bottom out in `matchesListFilters`**, which is the thing R6
+   said must have one implementation. What remains at the two call sites is an eight-line loop shell that
+   genuinely differs in what it collects (`state_mod.Item` vs `Record{ .item = … }`), which is the
+   difference R6 itself named.
+
+**Carried 21 — the worker's proof is sound, and I checked its premise rather than accepting it.**
+`record.validateSeqOrder` (`src/record.zig:852`) walks the records with `expected` starting at 1 and
+returns `SeqOutOfOrder` or `NonContiguousSeq` on any deviation, and `parseLog` calls it unconditionally
+(`src/record.zig:910`). So for every log that opens at all, log order **is** `seq` order; `buildIndexes`
+preserves that order; `selectCandidates` only ever drops elements. The sort at `src/main.zig:2334` cannot
+reorder anything on any reachable input. The other half of the claim is also right and is the part that
+kills the old premise for good: `search` re-sorts by score and never routes a ranked result through
+`runList` at all. **The sort is provably dead code that the type system will never flag** — its removal
+is yours, and the reasoning is now written into the comment either way.
+
+**Nits — three, none blocking.**
+
+1. `src/main.zig:7842-7851` — the new paragraph explaining the `block` was inserted *between* items 4
+   and 5 of `seedSearchFixture`'s numbered record list, so the list now reads `1, 2, 3, 4`, a paragraph,
+   then `5, 6, 7`. The content is right and the placement is not; it belongs after item 7. Cosmetic, but
+   the list is the thing a future reader uses to check a ranking assertion by hand, so splitting it costs
+   more than it looks like it does.
+2. `src/main.zig:409` — `The filters are 'list''s` renders in `search --help` as a doubled apostrophe.
+   Reads as a typo rather than a possessive. `the filters are 'list'​'s` does not help either; the fix is
+   to reword (`The filters are the ones 'list' takes, and they narrow…`).
+3. `src/main.zig:2280-2290` and `:2463-2473` — the `--role`/`--to` declared-history checks are the one
+   part of the shared filter question R6's extraction left duplicated at both call sites. This is *not*
+   the failure mode R6 named — the messages live in `log.zig` and `reportLogError`, so there is still one
+   wording — and the duplication is twelve lines of dispatch rather than of logic. But it is now the only
+   filter concern that is not single-sourced, and a third reader command would copy it a third time. A
+   `checkHistoryFilters(records, p, &diag)` beside `resolveFilterSpec` would close it in one commit,
+   whenever a third caller appears.
+
+**Architectural notes — for `8.4` and the section review, not for this block.**
+
+- **The determinism test is in-process.** It re-invokes `run()` eight times inside one test binary, so
+  it can only catch nondeterminism that varies *within* a process. It is still the right test to have
+  running every time, and the property does hold across processes (125 launches, one hash per
+  invocation) — but `8.4` should say that the guarantee rests on the structural no-hash-map-iteration
+  property plus the `seq` tiebreak, not on the repetition count.
+- **`search`'s item path silently ignores `filters.kind`.** Safe today and correctly documented at
+  `matchesItemFilters` (`resolveFilterSpec` has already guaranteed kind is null-or-`item`), but the
+  invariant lives in a doc comment two functions away from the loop that depends on it. If `--kind`'s
+  conflict rule is ever relaxed, this is where a filter goes quietly missing.
+- **Empty candidate sets and body-less kinds are handled without a special case.** `search x --kind
+  header` gives `records (0):` and exit 0, and `avg_doc_len` is only ever 0 when the postings map is
+  empty, so it is never a divisor — verified against the binary, not just read.
+
+I did not edit code, commit, or tick boxes. → @architect
+
+**[architect]** **Block 7B is CLOSED, and with it every box in section 7.** Reviewer `Approve`, no
+blockers. Gates green on three independent runs — the worker's, mine, and the reviewer's: `BUILD_EXIT:0`
+`TEST_EXIT:0` `FORMAT_EXIT:0` `VALIDATE_EXIT:0` `GATES_EXIT:0`. **287 tests** — counted, not quoted (286
+named plus one anonymous `test {}`). `7.3` and `7.4` ticked; **43 of 52**. The section still needs its
+supervisor pass before `8.` opens.
+
+**The review is the reason this block is trustworthy, and it is worth naming what it actually did.** R6
+lifted the guts out of `list` — a command already approved, shipped, and relied on. The reviewer did not
+read the extraction and judge it faithful. It built HEAD's binary and the working tree's and ran a
+**750-probe matrix** (15 command words × 16 flags × 3 argument positions, plus a stray positional and
+`--help` each): the diff between the two is **22 lines, every one of them `search`**. That is the R1 class
+from 7A re-checked at a scale reading cannot reach. It also verified R5 with the *precise* mutation rather
+than the crude one — rebuilding the index over the whole log while keeping the same record set, so only
+IDF differed — and exactly one assertion went red. A cruder mutation would have turned several red and
+proved less.
+
+**Carried 21 — ruled: remove it.** Both the worker and the reviewer arrived at the same proof
+independently, and it is a proof rather than an inspection: `record.validateSeqOrder` (`record.zig:852`)
+enforces contiguous ascending `seq` from 1, and `parseLog` calls it unconditionally (`:910`), so **for
+every log that opens at all, log order *is* `seq` order**. Buckets are order-preserving subsequences;
+`selectCandidates` only ever drops elements. The sort at `main.zig:2334` therefore cannot reorder anything
+on any reachable input — and the premise that kept it alive is now permanently gone, since `search`
+re-sorts by score and no ranked result ever reaches it.
+
+It was kept as insurance against a case that turned out to be impossible. **The replacement is one
+sentence of comment, not code**: combined-filter results arrive in `seq` order *because* `validateSeqOrder`
+makes log order and `seq` order the same thing — so if that validation is ever relaxed, the sort must come
+back. That converts unreachable code into a recorded invariant, which is the better artefact. Section 6
+carried this for two sections; it closes here.
+
+**Queued for a small follow-on block, after the supervisor speaks** (none blocking, none worth a round
+trip on its own):
+
+1. **Carried 21's removal**, as ruled above.
+2. **The `--role`/`--to` history checks are duplicated** between `runList` and `runSearch`
+   (`main.zig:2280–2290`, `:2463–2473`) — the one filter concern R6's extraction left behind. Not R6's
+   named failure mode, since the *wording* still lives once in `log.zig`, but the reviewer's point stands:
+   a third reader command would copy it a third time. Section 7 is the last section that adds a command,
+   so there will be no third — which makes this cheap to fix and cheap to leave. I lean fix.
+3. **Two cosmetics** — the new `block` paragraph split `seedSearchFixture`'s numbered record list in half
+   (`main.zig:7842–7851`), and `The filters are 'list''s` renders as a doubled apostrophe in
+   `search --help` (`main.zig:409`). The first matters more than it looks: that list is what a future
+   reader uses to check a ranking assertion by hand.
+
 ## NEXT
 
 **[architect]** **Sections 1–6 are CLOSED and fully ticked** — 39 of 52 boxes, no outstanding

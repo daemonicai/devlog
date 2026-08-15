@@ -362,7 +362,9 @@ const refs_usage =
 
 const search_usage =
     \\USAGE
-    \\    devlog --log <path> search <query> [--json]
+    \\    devlog --log <path> search <query> [--section <s>] [--block <b>]
+    \\        [--role <r>] [--to <role>] [--kind <k>] [--state <s>]
+    \\        [--blocking] [--json]
     \\
     \\Searches the bodies of this log's records for the query's words and
     \\returns the matching records, most relevant first (D3: lexical BM25,
@@ -372,12 +374,45 @@ const search_usage =
     \\ARGUMENTS
     \\    <query>  The words to search for. Exactly one argument: quote a
     \\             multi-word query. A second bare token is refused rather
-    \\             than silently dropped.
+    \\             than silently dropped. A query cannot begin with '-':
+    \\             it would be read as a flag, and there is no '--'
+    \\             terminator to escape it. Quoting does not help, since
+    \\             the shell strips the quotes before devlog sees them. In
+    \\             practice this costs nothing — leading punctuation is not
+    \\             part of any word the index holds, so searching for the
+    \\             word without its dash finds the same records.
     \\
     \\FLAGS
-    \\    --json   Emit the same result as JSON instead of rendered text
-    \\             (D15). One derivation, two renderings — never two
-    \\             derivations.
+    \\    --section <s>  Only records concerning this tasks.md section.
+    \\    --block <b>    Only records whose block label matches. Given
+    \\                   alone, matches by label and may span sections;
+    \\                   given with --section, the two are the
+    \\                   intersection — the one identified block.
+    \\    --role <r>     Only records authored by this role. Must be one of
+    \\                   the roles declared by some 'devlog header' in this
+    \\                   log, including a retired one.
+    \\    --to <role>    Only records addressed to this role. Same rule.
+    \\    --kind <k>     Only records of this kind: header, section, brief,
+    \\                   post, item, close, verdict, next. Refused
+    \\                   alongside --state or --blocking unless it names
+    \\                   'item'.
+    \\    --state <s>    Only the records that opened items now in this
+    \\                   derived state: open, resolved, deferred,
+    \\                   superseded.
+    \\    --blocking     Only the records that opened items flagged
+    \\                   blocking. There is no --no-blocking: absent means
+    \\                   no filtering on it.
+    \\    --json         Emit the same result as JSON instead of rendered
+    \\                   text (D15). One derivation, two renderings — never
+    \\                   two derivations.
+    \\
+    \\The filters are 'list''s, and they narrow the query *before* it is
+    \\ranked: relevance is computed over the records that survive them, so
+    \\a word that is rare in the section you are searching ranks as rare
+    \\even if it is common across the whole change. Every given filter must
+    \\match — filters combine with AND. Unlike 'list', --state and
+    \\--blocking do not change what is returned: a search always returns
+    \\records, under every combination of flags.
     \\
     \\The result is the same shape 'list' and 'refs' emit, and the ranking
     \\is the order it arrives in: there is no score field. A record matches
@@ -413,7 +448,7 @@ const commands = [_]CommandSpec{
     .{ .name = "list", .summary = "List records, filtered by section, block, role, kind, state, or addressee.", .section = "6", .usage = list_usage },
     .{ .name = "refs", .summary = "Show every record carrying a given external reference.", .section = "6", .usage = refs_usage },
     .{ .name = "status", .summary = "Show the rendered current state: NEXT plus open items.", .section = "6", .usage = status_usage },
-    .{ .name = "search", .summary = "Search record bodies, ranked by relevance.", .section = "7", .usage = search_usage, .takes_positional = true },
+    .{ .name = "search", .summary = "Search record bodies, ranked by relevance, narrowed by list's filters.", .section = "7", .usage = search_usage, .takes_positional = true },
 };
 
 /// The one place that owns the `devlog: ` prefix, the trailing newline,
@@ -596,7 +631,8 @@ const Parsed = struct {
     /// argv only decides arity, the same split A5 already draws for every
     /// other flag.
     item_type: ?[]const u8 = null,
-    /// `item`-only, a bare boolean flag (4.4): absent means false,
+    /// `item`'s own declaration (4.4) and the item filter `list` (6.3) and
+    /// `search` (7.3) share. A bare boolean flag: absent means false,
     /// present means true. No arity ambiguity to check — repeating it is
     /// harmless, unlike a value-carrying flag.
     blocking: bool = false,
@@ -605,8 +641,11 @@ const Parsed = struct {
     /// required). The raw digits; parsed to a positive integer in
     /// `runClose`/`runShow` respectively.
     item_num: ?[]const u8 = null,
-    /// `close`-only, exactly-once, required (4.5). Validated against
-    /// `record.CloseState`'s permitted set in `runClose`.
+    /// Exactly-once for all three of its commands, and two different
+    /// permitted sets: `close`'s own required state (4.5), validated
+    /// against `record.CloseState` in `runClose`, and the *derived* item
+    /// state `list` (6.3) and `search` (7.3) filter by, validated against
+    /// `state_mod.ItemState` in `resolveFilterSpec`.
     state: ?[]const u8 = null,
     /// `verdict`-only, exactly-once, required (4.6). Validated against
     /// `record.VerdictOutcome`'s permitted set in `runVerdict`.
@@ -623,9 +662,10 @@ const Parsed = struct {
     /// rendered-text form, present means emit the same content as JSON
     /// instead.
     json: bool = false,
-    /// `list`-only (6.3), exactly-once. Validated against `record.Kind`'s
-    /// permitted set in `runList`, not here — same split A5 draws for every
-    /// other flag's arity-vs-value-validity distinction.
+    /// `list` (6.3) and `search` (7.3), exactly-once. Validated against
+    /// `record.Kind`'s permitted set in `resolveFilterSpec`, not here —
+    /// same split A5 draws for every other flag's
+    /// arity-vs-value-validity distinction.
     kind: ?[]const u8 = null,
     /// The bare positional argument of a `takes_positional` command —
     /// `search`'s query (7.2), the only one this surface has. Exactly-once
@@ -793,10 +833,13 @@ fn parseArgs(allocator: Allocator, args: []const [:0]const u8) Allocator.Error!P
     // (4.5: "nothing else"); `verdict` takes `--section`/`--block` but
     // not `--to` (4.6 names no addressee). `list` (6.3) joins all three —
     // its own filter, not a write-time attribution, but the same shared
-    // flags answer both questions.
-    const wants_section_flag = wants_post or wants_section_cmd or wants_brief or wants_item or wants_verdict or wants_list;
-    const wants_block_flag = wants_post or wants_brief or wants_item or wants_verdict or wants_list;
-    const wants_to_flag = wants_post or wants_brief or wants_item or wants_list;
+    // flags answer both questions. `search` (7.3) joins them for exactly
+    // that reason: narrowing a query before ranking it is the same
+    // question `list` asks of the same log, so it is the same flags and,
+    // below, the same predicate (ruling R6).
+    const wants_section_flag = wants_post or wants_section_cmd or wants_brief or wants_item or wants_verdict or wants_list or wants_search;
+    const wants_block_flag = wants_post or wants_brief or wants_item or wants_verdict or wants_list or wants_search;
+    const wants_to_flag = wants_post or wants_brief or wants_item or wants_list or wants_search;
     // Commands that recognise `--role` as their own exactly-once value —
     // every write command (the caller's identity), `resume` (the role to
     // resume as, required), and `list` (a filter). `header` is handled
@@ -811,7 +854,8 @@ fn parseArgs(allocator: Allocator, args: []const [:0]const u8) Allocator.Error!P
     // ambiguous line — e.g. a bare `--role` with no command, or `--role`
     // before `--log`), since there is no command's flag set to defer to.
     const wants_role_value = wants_post or wants_section_cmd or wants_brief or wants_next or
-        wants_item or wants_close or wants_verdict or wants_resume or wants_list or command_hint == null;
+        wants_item or wants_close or wants_verdict or wants_resume or wants_list or wants_search or
+        command_hint == null;
     // `refs` (6.4) reuses this same `--ref` parsing and its malformation
     // fault (A6) rather than a second parser — the brief's own
     // instruction — even though its `--ref` means "look this up", not
@@ -848,11 +892,11 @@ fn parseArgs(allocator: Allocator, args: []const [:0]const u8) Allocator.Error!P
             if (takeFlagValue(&p, args, &i, "--base")) |v| setOnce(&p, &p.base, "--base", v);
         } else if (wants_item and std.mem.eql(u8, arg, "--type")) {
             if (takeFlagValue(&p, args, &i, "--type")) |v| setOnce(&p, &p.item_type, "--type", v);
-        } else if ((wants_item or wants_list) and std.mem.eql(u8, arg, "--blocking")) {
+        } else if ((wants_item or wants_list or wants_search) and std.mem.eql(u8, arg, "--blocking")) {
             p.blocking = true;
         } else if ((wants_close or wants_show) and std.mem.eql(u8, arg, "--item")) {
             if (takeFlagValue(&p, args, &i, "--item")) |v| setOnce(&p, &p.item_num, "--item", v);
-        } else if ((wants_close or wants_list) and std.mem.eql(u8, arg, "--state")) {
+        } else if ((wants_close or wants_list or wants_search) and std.mem.eql(u8, arg, "--state")) {
             if (takeFlagValue(&p, args, &i, "--state")) |v| setOnce(&p, &p.state, "--state", v);
         } else if (wants_verdict and std.mem.eql(u8, arg, "--outcome")) {
             if (takeFlagValue(&p, args, &i, "--outcome")) |v| setOnce(&p, &p.outcome, "--outcome", v);
@@ -860,7 +904,7 @@ fn parseArgs(allocator: Allocator, args: []const [:0]const u8) Allocator.Error!P
             if (takeFlagValue(&p, args, &i, "--commit")) |v| setOnce(&p, &p.commit, "--commit", v);
         } else if (wants_show and std.mem.eql(u8, arg, "--seq")) {
             if (takeFlagValue(&p, args, &i, "--seq")) |v| setOnce(&p, &p.seq_num, "--seq", v);
-        } else if (wants_list and std.mem.eql(u8, arg, "--kind")) {
+        } else if ((wants_list or wants_search) and std.mem.eql(u8, arg, "--kind")) {
             if (takeFlagValue(&p, args, &i, "--kind")) |v| setOnce(&p, &p.kind, "--kind", v);
         } else if ((wants_show or wants_resume or wants_status or wants_list or wants_refs or wants_search) and std.mem.eql(u8, arg, "--json")) {
             p.json = true;
@@ -2044,6 +2088,142 @@ fn matchesListFilters(rec: record.Record, p: *const Parsed, kind_filter: ?record
     return true;
 }
 
+/// The item half of the same question, applied to one derived item:
+/// `--state`/`--blocking` — the two properties only a *derived* item has —
+/// plus the four record-level filters, answered by `matchesListFilters` on
+/// the record that opened it rather than field by field a second time
+/// (blocker 3, section 6 supervisor).
+///
+/// Shared by `list` (6.3), where these two flags narrow the *result* from
+/// records to items, and by `search` (7.3, ruling R2), where they narrow
+/// the *candidates* to the records those items opened and leave the output
+/// shape alone. One predicate, two uses — the difference between the
+/// commands is what each collects, not what either counts as a match.
+///
+/// `kind_filter` is `null` here: `resolveFilterSpec` has already refused
+/// any `--kind` other than `item` alongside these flags, so there is
+/// nothing left for it to check.
+fn matchesItemFilters(it: state_mod.Item, p: *const Parsed, state_filter: ?state_mod.ItemState) bool {
+    if (state_filter) |sf| {
+        if (it.state != sf) return false;
+    }
+    if (p.blocking and !it.opened.blocking) return false;
+    return matchesListFilters(record.Record{ .item = it.opened }, p, null);
+}
+
+/// `--kind` and `--state`'s values, and their mutual conflict, resolved
+/// once for the two commands that take them.
+const FilterSpec = struct {
+    kind: ?record.Kind = null,
+    state: ?state_mod.ItemState = null,
+    /// `--state` or `--blocking` given. Both name properties only a derived
+    /// item has, so their presence restricts the answer to items: to a list
+    /// *of* items for `list` (the block's ruling), to the item records
+    /// themselves for `search` (R2 — the filters narrow the candidate set,
+    /// they never switch the output shape).
+    item_only: bool = false,
+};
+
+/// Either the resolved spec or the exit code of the refusal already
+/// printed — so `fail` stays the one owner of the message *and* of the
+/// code, rather than a call site restating either.
+const FilterSpecResult = union(enum) { ok: FilterSpec, refused: u8 };
+
+/// Validates `--kind`/`--state`'s values against their permitted sets and
+/// refuses the one combination that cannot mean anything — `--kind`
+/// naming something other than `item` alongside `--state`/`--blocking`,
+/// which narrow to items.
+///
+/// One place, one message (ruling R6): `list` (6.3) and `search` (7.3)
+/// both call this before the read-only load ever touches the filesystem
+/// (A3), so an unusable combination is refused rather than silently
+/// ignored — A6's first-fault-wins shape applied to a business-logic
+/// refusal rather than a parse one. Copying the message into the second
+/// command is the failure mode this function exists to prevent.
+fn resolveFilterSpec(p: *const Parsed, stderr: *Io.Writer) FilterSpecResult {
+    const kind_filter: ?record.Kind = if (p.kind) |k|
+        std.meta.stringToEnum(record.Kind, k) orelse
+            return .{ .refused = fail(stderr, "--kind '{s}' must be one of: {s}", .{ k, record_kind_names }) }
+    else
+        null;
+
+    const state_filter: ?state_mod.ItemState = if (p.state) |s|
+        std.meta.stringToEnum(state_mod.ItemState, s) orelse
+            return .{ .refused = fail(stderr, "--state '{s}' must be one of: {s}", .{ s, item_state_names }) }
+    else
+        null;
+
+    const item_only = state_filter != null or p.blocking;
+    if (item_only and kind_filter != null and kind_filter.? != .item) {
+        return .{ .refused = fail(
+            stderr,
+            "--kind '{s}' cannot be combined with --state or --blocking, which narrow the result to items",
+            .{p.kind.?},
+        ) };
+    }
+
+    return .{ .ok = .{ .kind = kind_filter, .state = state_filter, .item_only = item_only } };
+}
+
+/// How many record-level filters are active. `list` alone needs the count
+/// — for its `seq` sort — but it lives beside the seed selection it
+/// describes so the two cannot drift apart.
+fn activeRecordFilterCount(p: *const Parsed, kind_filter: ?record.Kind) usize {
+    return @as(usize, @intFromBool(p.section != null)) +
+        @as(usize, @intFromBool(p.block != null)) +
+        @as(usize, @intFromBool(p.role != null)) +
+        @as(usize, @intFromBool(p.to != null)) +
+        @as(usize, @intFromBool(kind_filter != null));
+}
+
+/// The one answer to "which records match these filters", appended to
+/// `out` in log order. `list` (6.3) and `search` (7.3) ask exactly that
+/// question of exactly the same log, so it has one implementation and one
+/// predicate (ruling R6) rather than a second one written to look the
+/// same.
+///
+/// **Carried 16, in full.** A single active filter is a key lookup into one
+/// of `Indexes`' buckets, already in log order by construction (`5.5`: each
+/// bucket is built by one forward pass over `records`, appending in the
+/// order encountered). Two or more active filters are an intersection: this
+/// seeds from whichever one active filter's bucket is found first (any one
+/// will do — correctness does not depend on which) and checks every *other*
+/// active filter directly against each candidate via `matchesListFilters`.
+/// With no filter active at all, the seed is the positional `records` slice
+/// itself — never a `StringHashMap` enumeration, whose order would vary
+/// between runs, which is what makes `7.4`'s determinism requirement hold
+/// for a filtered search as well as an unfiltered one.
+///
+/// The `seq` sort deliberately stays *outside* this function (ruling R6):
+/// it is `list`'s, and it is wasted work for `search`, which re-sorts every
+/// result by score.
+fn selectCandidates(
+    allocator: Allocator,
+    records: []const record.Record,
+    indexes: state_mod.Indexes,
+    p: *const Parsed,
+    kind_filter: ?record.Kind,
+    out: *std.ArrayList(record.Record),
+) Allocator.Error!void {
+    const seed: []const record.Record = if (kind_filter) |k|
+        indexes.byKind(k)
+    else if (p.section) |s|
+        indexes.bySection(s)
+    else if (p.block) |b|
+        indexes.byBlockLabel(b)
+    else if (p.role) |r|
+        indexes.byRole(r)
+    else if (p.to) |t|
+        indexes.byAddressee(t)
+    else
+        records;
+
+    for (seed) |rec| {
+        if (!matchesListFilters(rec, p, kind_filter)) continue;
+        try out.append(allocator, rec);
+    }
+}
+
 fn recordSeqLessThan(_: void, a: record.Record, b: record.Record) bool {
     return a.seq() < b.seq();
 }
@@ -2052,30 +2232,22 @@ fn recordSeqLessThan(_: void, a: record.Record, b: record.Record) bool {
 /// command: every filter reads off `state_mod`'s already-built indexes or
 /// the raw parsed `records` slice, never a second derivation.
 ///
-/// **Carried 16, in full — the block this rule was written for.** A single
-/// active filter is a key lookup into one of `Indexes`' buckets, already in
-/// log order by construction (`5.5`: each bucket is built by one forward
-/// pass over `records`, appending in the order encountered). Two or more
-/// active filters are an intersection: this seeds from whichever one active
-/// filter's bucket is found first (any one will do — correctness does not
-/// depend on which), checks every *other* active filter directly against
-/// each candidate via `matchesListFilters`, and — since an intersection has
-/// no order guarantee independent of how it happened to be computed —
-/// explicitly sorts the result by `seq` before rendering, rather than
-/// trusting the seed bucket's order to survive the narrowing. With no
-/// filter active at all, the seed is `opened.log.records` itself: the
-/// positional slice `record.parseLog` built, never a `StringHashMap`
-/// enumeration, whose order would vary between runs.
+/// **Carried 16** lives in `selectCandidates`, which this shares with
+/// `search` (ruling R6) — the seed-and-intersect selection and its order
+/// guarantees are documented there. What stays here is the sort that
+/// selection deliberately leaves behind, and the item-narrowed half below.
 ///
 /// **`--state`/`--blocking` narrow the result to items** (the block's
 /// ruling): they are properties only a derived item has, so their presence
 /// switches the command from listing records to listing items — filtered
 /// directly off `derived.items`, itself already positional (`#n` order,
 /// carried 16 again), so no sort is needed on that path regardless of how
-/// many item-level predicates are active. `--kind` naming anything but
-/// `item` alongside either is refused before the read-only load ever
-/// touches the filesystem (A3), not silently ignored (A6's first-fault-wins
-/// shape, applied to a business-logic refusal rather than a parse one).
+/// many item-level predicates are active. Note this is where `list` and
+/// `search` genuinely differ: the same two flags narrow `search`'s
+/// candidates without changing what it returns (R2). `--kind` naming
+/// anything but `item` alongside either is refused before the read-only
+/// load ever touches the filesystem (A3), by `resolveFilterSpec`, which
+/// both commands share.
 fn runList(
     allocator: Allocator,
     io: Io,
@@ -2085,26 +2257,10 @@ fn runList(
     stdout: *Io.Writer,
     stderr: *Io.Writer,
 ) u8 {
-    const kind_filter: ?record.Kind = if (p.kind) |k|
-        std.meta.stringToEnum(record.Kind, k) orelse
-            return fail(stderr, "--kind '{s}' must be one of: {s}", .{ k, record_kind_names })
-    else
-        null;
-
-    const state_filter: ?state_mod.ItemState = if (p.state) |s|
-        std.meta.stringToEnum(state_mod.ItemState, s) orelse
-            return fail(stderr, "--state '{s}' must be one of: {s}", .{ s, item_state_names })
-    else
-        null;
-
-    const item_only = state_filter != null or p.blocking;
-    if (item_only and kind_filter != null and kind_filter.? != .item) {
-        return fail(
-            stderr,
-            "--kind '{s}' cannot be combined with --state or --blocking, which narrow the result to items",
-            .{p.kind.?},
-        );
-    }
+    const filters = switch (resolveFilterSpec(p, stderr)) {
+        .ok => |f| f,
+        .refused => |code| return code,
+    };
 
     var diag: record.Diagnostics = .init(allocator);
     defer diag.deinit();
@@ -2138,22 +2294,11 @@ fn runList(
     };
     defer derived.deinit();
 
-    if (item_only) {
+    if (filters.item_only) {
         var matching: std.ArrayList(state_mod.Item) = .empty;
         defer matching.deinit(allocator);
         for (derived.items) |it| {
-            if (state_filter) |sf| {
-                if (it.state != sf) continue;
-            }
-            if (p.blocking and !it.opened.blocking) continue;
-            // `--section`/`--block`/`--role`/`--to` are the same question
-            // `matchesListFilters` already answers for the record path
-            // (blocker 3, section 6 supervisor): reuse it here rather than
-            // re-answering it field by field a second time. `kind_filter`
-            // is `null` — `item_only`'s own guard above has already
-            // refused any `--kind` other than `item`, so there is nothing
-            // left for it to check.
-            if (!matchesListFilters(record.Record{ .item = it.opened }, p, null)) continue;
+            if (!matchesItemFilters(it, p, filters.state)) continue;
             matching.append(allocator, it) catch return fail(stderr, "out of memory", .{});
         }
         if (p.json) {
@@ -2164,49 +2309,29 @@ fn runList(
         return 0;
     }
 
-    const filter_count: usize =
-        @as(usize, @intFromBool(p.section != null)) +
-        @as(usize, @intFromBool(p.block != null)) +
-        @as(usize, @intFromBool(p.role != null)) +
-        @as(usize, @intFromBool(p.to != null)) +
-        @as(usize, @intFromBool(kind_filter != null));
-
-    const seed: []const record.Record = if (kind_filter) |k|
-        derived.indexes.byKind(k)
-    else if (p.section) |s|
-        derived.indexes.bySection(s)
-    else if (p.block) |b|
-        derived.indexes.byBlockLabel(b)
-    else if (p.role) |r|
-        derived.indexes.byRole(r)
-    else if (p.to) |t|
-        derived.indexes.byAddressee(t)
-    else
-        opened.log.records;
-
     var matching: std.ArrayList(record.Record) = .empty;
     defer matching.deinit(allocator);
-    for (seed) |rec| {
-        if (!matchesListFilters(rec, p, kind_filter)) continue;
-        matching.append(allocator, rec) catch return fail(stderr, "out of memory", .{});
-    }
+    selectCandidates(allocator, opened.log.records, derived.indexes, p, filters.kind, &matching) catch
+        return fail(stderr, "out of memory", .{});
 
     // A single filter's bucket, or the raw positional slice with none
     // active, is already in log order by construction — sorting only does
     // real work, and is only needed at all, once two or more filters
     // intersect (carried 16).
     //
-    // Currently a no-op: buildIndexes (state.zig) builds every bucket as an
-    // order-preserving subsequence of a single forward pass over the log, so
-    // a combined-filter result already arrives in `seq` order before this
-    // sort runs — there is no reachable input on which it changes anything.
-    // It becomes load-bearing the moment a filtered result stops arriving in
-    // `seq` order, which 7.3 (combining search with these filters) is the
-    // most likely task to introduce: a search+filter pipeline ranks by
-    // relevance, not by log order. Carried 21 (section 6 close, architect
-    // ruling): re-check this sort when 7.3 lands, rather than re-deriving
-    // why it's here from scratch.
-    if (filter_count >= 2) {
+    // Carried 21, answered by block 7B rather than carried further: this
+    // sort cannot change `list`'s output, and now provably so rather than
+    // by inspection of `buildIndexes` alone. `record.parseLog` refuses any
+    // log whose `seq` is not strictly increasing and contiguous from 1
+    // (`validateSeqOrder`), so for every log that opens at all, log order
+    // *is* `seq` order; `buildIndexes` builds each bucket as an
+    // order-preserving subsequence of one forward pass; and
+    // `selectCandidates` only ever drops elements from that subsequence.
+    // Nor does 7.3 change this, contrary to what this comment predicted:
+    // `search` re-sorts by score and so never routes a ranked result
+    // through here at all. Kept as documented insurance — its removal is
+    // the architect's call, not this block's.
+    if (activeRecordFilterCount(p, filters.kind) >= 2) {
         std.mem.sort(record.Record, matching.items, {}, recordSeqLessThan);
     }
 
@@ -2282,8 +2407,30 @@ fn runRefs(
 ///
 /// Opened with `openReadOnly`, which never creates the log: a search
 /// against a change that has none is a plain refusal, not a fresh empty
-/// file (carried 13, D5). No `state_mod.derive` — nothing here reads
-/// derived state; `7.3` adds it when `--state` first needs it.
+/// file (carried 13, D5).
+///
+/// **`7.3` — the query is narrowed before it is ranked.** The filters are
+/// `6.3`'s entire set and are answered by `selectCandidates` /
+/// `matchesItemFilters`, the same two `list` uses (ruling R6). The index is
+/// then built over *what survives*, never over the whole log with the
+/// filters applied to the results afterwards (ruling R5), so a term's IDF
+/// is relative to what the reader actually asked about — a term rare in the
+/// section being searched scores as rare even if it is common across the
+/// change. The usual objection, that scores are then incomparable between
+/// filter sets, is free here: R3 emits no score, so no consumer can compare
+/// two.
+///
+/// **`--state`/`--blocking` narrow the candidates, they do not switch the
+/// output shape** (ruling R2). Where `list` answers them with a list of
+/// items, `search` answers them with the item *records* those items
+/// opened — so `search` returns records under every combination of flags,
+/// and its result is the same shape under all of them.
+///
+/// `search` derives as of `7.3`, and does so unconditionally rather than
+/// only when `--state` needs it: the alternative is a command that faults
+/// on a write-boundary violation with one flag and silently succeeds over
+/// the same broken log without it. Every other read command derives; this
+/// one now does too.
 fn runSearch(
     allocator: Allocator,
     io: Io,
@@ -2295,6 +2442,11 @@ fn runSearch(
 ) u8 {
     const query = p.query orelse return fail(stderr, "'search' requires a query — see --help", .{});
 
+    const filters = switch (resolveFilterSpec(p, stderr)) {
+        .ok => |f| f,
+        .refused => |code| return code,
+    };
+
     var diag: record.Diagnostics = .init(allocator);
     defer diag.deinit();
 
@@ -2303,7 +2455,45 @@ fn runSearch(
     };
     defer opened.close(allocator);
 
-    var index = search.Index.build(allocator, opened.log.records) catch
+    // `--role`/`--to` are filters over *history* here, exactly as they are
+    // for `list`: an undeclared value is refused (the same typo hazard),
+    // but "declared" means declared in any header this log carries, since a
+    // role the project has since retired still authored records that must
+    // stay queryable through them. Settled in section 6; reused, not
+    // re-derived.
+    if (p.role) |r| {
+        log.checkDeclaredRoleHistory(opened.log.records, r, &diag) catch |err| {
+            return reportLogError(stderr, err, &diag);
+        };
+    }
+    if (p.to) |t| {
+        log.checkDeclaredToHistory(opened.log.records, t, &diag) catch |err| {
+            return reportLogError(stderr, err, &diag);
+        };
+    }
+
+    var derived = state_mod.derive(allocator, opened.log.records, &diag) catch |err| {
+        return reportLogError(stderr, err, &diag);
+    };
+    defer derived.deinit();
+
+    var candidates: std.ArrayList(record.Record) = .empty;
+    defer candidates.deinit(allocator);
+    if (filters.item_only) {
+        for (derived.items) |it| {
+            if (!matchesItemFilters(it, p, filters.state)) continue;
+            candidates.append(allocator, record.Record{ .item = it.opened }) catch
+                return fail(stderr, "out of memory", .{});
+        }
+    } else {
+        selectCandidates(allocator, opened.log.records, derived.indexes, p, filters.kind, &candidates) catch
+            return fail(stderr, "out of memory", .{});
+    }
+
+    // R5: over the candidates, not over the log. With no filter given
+    // `candidates` *is* every record, so an unfiltered search is unchanged
+    // from 7A.
+    var index = search.Index.build(allocator, candidates.items) catch
         return fail(stderr, "out of memory", .{});
     defer index.deinit();
 
@@ -2766,27 +2956,36 @@ test "flags after an unknown command word are left alone, not rejected as unknow
     );
 }
 
-test "search joins the strict set: a filter flag 7.3 has not built yet is refused, not ignored (R1)" {
+test "search joins the strict set: a flag it does not recognise is refused, not ignored (R1)" {
     // The other half of the retarget above, and the reason for it: while
-    // `search` was a placeholder this exact line reached the
-    // not-implemented message, silently accepting `--section`. It is now a
-    // parse fault like any other unknown flag.
+    // `search` was a placeholder this line reached the not-implemented
+    // message, silently accepting whatever flag followed. It is now a parse
+    // fault like any other unknown flag.
+    //
+    // The subject moved in block 7B: `--section` was the example while 7.3
+    // had not built it, and 7.3 has now built it. `--ref` takes its place —
+    // `refs` (6.4) recognises it and `search` deliberately does not, since
+    // a reference lookup is an exact key lookup, not a ranked query. The
+    // property under test is unchanged: `search` refuses a flag outside its
+    // own grammar rather than accepting and ignoring it.
     try expectRun(
         std.testing.allocator,
-        &.{ "--log", "DEVLOG.jsonl", "search", "--section", "6" },
+        &.{ "--log", "DEVLOG.jsonl", "search", "--ref", "D:1" },
         1,
         null,
-        "unknown flag '--section'",
+        "unknown flag '--ref'",
     );
 }
 
 test "--log and --role are recognised in any position relative to the command" {
     // Retargeted in block 7A: `search` (the old subject) is strict now and
-    // recognises neither `--role` nor a second positional, so the pair
-    // moves to commands that do recognise them. Both assertions still
-    // prove the same thing — the flag was picked up *after* the command
-    // word rather than refused or ignored, since a missing `--log` and an
-    // unrecognised `--role` each produce a different message.
+    // recognises no second positional, so the pair moves to commands that
+    // do. Both assertions still prove the same thing — the flag was picked
+    // up *after* the command word rather than refused or ignored, since a
+    // missing `--log` and an unrecognised `--role` each produce a different
+    // message. (`search` recognises `--role` again as of 7.3, where it is a
+    // filter; the first case here still exercises `--log` after the command
+    // word, which is what it is for.)
     try expectRun(
         std.testing.allocator,
         &.{ "search", "--log", "DEVLOG.jsonl", "concurrency" },
@@ -7641,6 +7840,14 @@ test "list --state open --to <role> agrees with resume --role <role> on the same
 ///   2. post    seq 2  — "lock" once, 12 tokens
 ///   3. post    seq 3  — "lock" twice, 11 tokens
 ///   4. brief   seq 4  — about ranking, no "lock"
+///
+/// The `brief` carries a `block` as of block 7B, not because any 7.1/7.2
+/// assertion needs one but because `search` derives as of `7.3` and
+/// `state.derive` faults on a `brief` missing `section`/`block`
+/// (`BriefMissingKey`) — a log `runBrief` could never have written, since
+/// it requires both. The fixture was legal only while `search` was the one
+/// read command that skipped `derive`; a dedicated test below now pins that
+/// fault reaching `search` deliberately rather than through this fixture.
 ///   5. post    seq 5  — carries the non-ASCII word "naïve"
 ///   6. item    seq 6  — an item's body is prose too, and is indexed
 ///   7. next    seq 7  — so is a next's
@@ -7682,6 +7889,7 @@ fn seedSearchFixture(allocator: Allocator, dir: Io.Dir, io: Io, diag: *record.Di
             .ts = "t3",
             .role = "architect",
             .section = "7",
+            .block = "7A",
             .to = "worker",
             .body = "Ranking is the order, never a score field.",
         },
@@ -7871,4 +8079,432 @@ test "search --help prints its own usage, naming the one-argument rule and the a
     try expectRun(std.testing.allocator, &.{ "search", "--help" }, 0, "devlog search", null);
     try expectRun(std.testing.allocator, &.{ "search", "--help" }, 0, "Exactly one argument", null);
     try expectRun(std.testing.allocator, &.{ "search", "--help" }, 0, "there is no score field", null);
+}
+
+// --- Section 7: search narrowed by 6.3's filters (7.3, 7.4) --------------
+
+/// One word ("lock") deliberately spread across sections, roles,
+/// addressees, kinds and item states, so that every filter has something to
+/// remove and the removal is visible in the count. One record's body
+/// mentions none of it, and one item is closed — so `--state open` and
+/// `--state resolved` each have exactly one answer.
+///
+/// Records, in append order (kind, seq, section/block, role → to, body):
+///   1. header  seq 1  — no body: never a document (R4)
+///   2. post    seq 2  s6         architect → worker  "lock"
+///   3. post    seq 3  s7         worker              "lock"
+///   4. brief   seq 4  s7 / 7B    architect → worker  "lock"
+///   5. item #1 seq 5  s6 / 6C    worker → architect  "lock", blocking, open
+///   6. item #2 seq 6  s7 / 7B    reviewer → architect "lock", resolved below
+///   7. close   seq 7             architect           closes #2, no "lock"
+///   8. next    seq 8             architect           no "lock"
+///   9. post    seq 9  s6         reviewer            no "lock"
+fn seedSearchFilterFixture(allocator: Allocator, dir: Io.Dir, io: Io, diag: *record.Diagnostics) !void {
+    _ = try log.appendHeader(
+        allocator,
+        io,
+        dir,
+        "DEVLOG.jsonl",
+        "t0",
+        "devlog 0.1.0",
+        .{ .change = "x", .roles = &.{ "architect", "worker", "reviewer" }, .closers = &.{"architect"} },
+        diag,
+    );
+
+    _ = try log.appendRecord(allocator, io, dir, "DEVLOG.jsonl", record.Record{ .post = .{
+        .common = .{
+            .seq = 0,
+            .ts = "t1",
+            .role = "architect",
+            .section = "6",
+            .to = "worker",
+            .body = "The lock is taken before seq is assigned.",
+        },
+    } }, diag);
+
+    _ = try log.appendRecord(allocator, io, dir, "DEVLOG.jsonl", record.Record{ .post = .{
+        .common = .{
+            .seq = 0,
+            .ts = "t2",
+            .role = "worker",
+            .section = "7",
+            .body = "Ranking happens after the lock is released.",
+        },
+    } }, diag);
+
+    _ = try log.appendRecord(allocator, io, dir, "DEVLOG.jsonl", record.Record{ .brief = .{
+        .common = .{
+            .seq = 0,
+            .ts = "t3",
+            .role = "architect",
+            .section = "7",
+            .block = "7B",
+            .to = "worker",
+            .body = "Narrow the lock discussion before ranking it.",
+        },
+    } }, diag);
+
+    _ = try log.appendItem(allocator, io, dir, "DEVLOG.jsonl", record.Record{ .item = .{
+        .common = .{
+            .seq = 0,
+            .ts = "t4",
+            .role = "worker",
+            .section = "6",
+            .block = "6C",
+            .to = "architect",
+            .body = "Does the lock cover the rename?",
+        },
+        .item = 0,
+        .type = .question,
+        .blocking = true,
+    } }, diag);
+
+    _ = try log.appendItem(allocator, io, dir, "DEVLOG.jsonl", record.Record{ .item = .{
+        .common = .{
+            .seq = 0,
+            .ts = "t5",
+            .role = "reviewer",
+            .section = "7",
+            .block = "7B",
+            .to = "architect",
+            .body = "The lock comment is stale.",
+        },
+        .item = 0,
+        .type = .finding,
+        .blocking = false,
+    } }, diag);
+
+    _ = try log.appendRecord(allocator, io, dir, "DEVLOG.jsonl", record.Record{ .close = .{
+        .common = .{ .seq = 0, .ts = "t6", .role = "architect", .body = "Fixed and rewritten." },
+        .item = 2,
+        .state = .resolved,
+    } }, diag);
+
+    _ = try log.appendRecord(allocator, io, dir, "DEVLOG.jsonl", record.Record{ .next = .{
+        .common = .{ .seq = 0, .ts = "t7", .role = "architect", .body = "Resume at 7.3." },
+    } }, diag);
+
+    _ = try log.appendRecord(allocator, io, dir, "DEVLOG.jsonl", record.Record{ .post = .{
+        .common = .{
+            .seq = 0,
+            .ts = "t8",
+            .role = "reviewer",
+            .section = "6",
+            .body = "Nothing to do with the topic at hand.",
+        },
+    } }, diag);
+}
+
+test "search returns the matching records, not the whole log (log-retrieval, 7.4)" {
+    // The spec scenario in one assertion: "it receives the relevant records
+    // rather than the entire log". The fixture makes the difference visible
+    // — nine records in the log, five that say "lock" — so a ranking that
+    // degenerated into "return everything, ordered" would fail here rather
+    // than pass silently.
+    var searched = try runSeeded(std.testing.allocator, seedSearchFilterFixture, &.{ "--log", "DEVLOG.jsonl", "search", "lock" });
+    defer searched.deinit(std.testing.allocator);
+    try std.testing.expectEqual(@as(u8, 0), searched.code);
+    try std.testing.expect(std.mem.indexOf(u8, searched.stdout, "records (5):") != null);
+    try std.testing.expect(std.mem.indexOf(u8, searched.stdout, "Nothing to do with the topic") == null);
+
+    var listed = try runSeeded(std.testing.allocator, seedSearchFilterFixture, &.{ "--log", "DEVLOG.jsonl", "list" });
+    defer listed.deinit(std.testing.allocator);
+    try std.testing.expectEqual(@as(u8, 0), listed.code);
+    try std.testing.expect(std.mem.indexOf(u8, listed.stdout, "records (9):") != null);
+    try std.testing.expect(std.mem.indexOf(u8, listed.stdout, "Nothing to do with the topic") != null);
+}
+
+test "search is deterministic for a given file: repeated runs over one log are byte-identical (7.4)" {
+    // Not the same log *content* re-seeded into a fresh directory — the
+    // same file, opened again and again, which is what the requirement
+    // says. Covers the unfiltered, filtered and JSON paths, since each
+    // reaches a different sort input.
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var diag: record.Diagnostics = .init(std.testing.allocator);
+    defer diag.deinit();
+    try seedSearchFilterFixture(std.testing.allocator, tmp.dir, std.testing.io, &diag);
+
+    var stdin_file = try openStdinStandin(tmp.dir, std.testing.io, "");
+    defer stdin_file.close(std.testing.io);
+
+    const invocations = [_][]const [:0]const u8{
+        &.{ "--log", "DEVLOG.jsonl", "search", "lock" },
+        &.{ "--log", "DEVLOG.jsonl", "search", "lock", "--section", "7" },
+        &.{ "--log", "DEVLOG.jsonl", "search", "lock", "--state", "open" },
+        &.{ "--log", "DEVLOG.jsonl", "search", "lock", "--json" },
+    };
+
+    for (invocations) |args| {
+        var first: ?[]u8 = null;
+        defer if (first) |f| std.testing.allocator.free(f);
+        for (0..8) |_| {
+            var out: Io.Writer.Allocating = .init(std.testing.allocator);
+            defer out.deinit();
+            var err_out: Io.Writer.Allocating = .init(std.testing.allocator);
+            defer err_out.deinit();
+            const code = run(
+                std.testing.allocator,
+                std.testing.io,
+                tmp.dir,
+                stdin_file,
+                test_ts,
+                args,
+                &out.writer,
+                &err_out.writer,
+            );
+            try std.testing.expectEqual(@as(u8, 0), code);
+            if (first) |f| {
+                try std.testing.expectEqualStrings(f, out.written());
+            } else {
+                first = try std.testing.allocator.dupe(u8, out.written());
+            }
+        }
+    }
+}
+
+test "each of 6.3's filters narrows a search on its own (7.3)" {
+    const cases = [_]struct { args: []const [:0]const u8, expect: []const u8 }{
+        // Unfiltered: every record whose body says "lock".
+        .{ .args = &.{ "--log", "DEVLOG.jsonl", "search", "lock" }, .expect = "records (5):" },
+        // --section: only section 7's three.
+        .{ .args = &.{ "--log", "DEVLOG.jsonl", "search", "lock", "--section", "7" }, .expect = "records (3):" },
+        // --block: the label's two, and it is not the same set as --section.
+        .{ .args = &.{ "--log", "DEVLOG.jsonl", "search", "lock", "--block", "7B" }, .expect = "records (2):" },
+        // --role: by author.
+        .{ .args = &.{ "--log", "DEVLOG.jsonl", "search", "lock", "--role", "architect" }, .expect = "records (2):" },
+        // --to: by addressee.
+        .{ .args = &.{ "--log", "DEVLOG.jsonl", "search", "lock", "--to", "architect" }, .expect = "records (2):" },
+        // --kind: the two item records.
+        .{ .args = &.{ "--log", "DEVLOG.jsonl", "search", "lock", "--kind", "item" }, .expect = "records (2):" },
+        // A filter that matches nothing is an empty success, not a refusal.
+        .{ .args = &.{ "--log", "DEVLOG.jsonl", "search", "lock", "--section", "3" }, .expect = "records (0):" },
+    };
+    for (cases) |c| {
+        var result = try runSeeded(std.testing.allocator, seedSearchFilterFixture, c.args);
+        defer result.deinit(std.testing.allocator);
+        try std.testing.expectEqual(@as(u8, 0), result.code);
+        try std.testing.expect(std.mem.indexOf(u8, result.stdout, c.expect) != null);
+    }
+}
+
+test "two filters intersect with the query, and the intersection is not either one alone (7.3)" {
+    // Section 7 holds three "lock" records; the worker authored two records
+    // overall. Their intersection is exactly one — a result neither filter
+    // produces by itself, which is what makes this an AND rather than a
+    // pair of independent narrowings.
+    var result = try runSeeded(std.testing.allocator, seedSearchFilterFixture, &.{ "--log", "DEVLOG.jsonl", "search", "lock", "--section", "7", "--role", "worker" });
+    defer result.deinit(std.testing.allocator);
+    try std.testing.expectEqual(@as(u8, 0), result.code);
+    try std.testing.expect(std.mem.indexOf(u8, result.stdout, "records (1):") != null);
+    try std.testing.expect(std.mem.indexOf(u8, result.stdout, "Ranking happens after the lock") != null);
+}
+
+test "search --state/--blocking narrow the candidates to item records and never switch the output shape (R2)" {
+    // `list` answers these two flags with a list of items; `search` answers
+    // them with the records those items opened, so its result is the same
+    // shape under every combination of flags.
+    const cases = [_]struct { args: []const [:0]const u8, body: []const u8 }{
+        .{ .args = &.{ "--log", "DEVLOG.jsonl", "search", "lock", "--state", "open" }, .body = "Does the lock cover the rename?" },
+        .{ .args = &.{ "--log", "DEVLOG.jsonl", "search", "lock", "--state", "resolved" }, .body = "The lock comment is stale." },
+        .{ .args = &.{ "--log", "DEVLOG.jsonl", "search", "lock", "--blocking" }, .body = "Does the lock cover the rename?" },
+        .{ .args = &.{ "--log", "DEVLOG.jsonl", "search", "lock", "--state", "open", "--section", "6" }, .body = "Does the lock cover the rename?" },
+        // --kind item alongside --state is redundant, not a conflict.
+        .{ .args = &.{ "--log", "DEVLOG.jsonl", "search", "lock", "--state", "open", "--kind", "item" }, .body = "Does the lock cover the rename?" },
+    };
+    for (cases) |c| {
+        var result = try runSeeded(std.testing.allocator, seedSearchFilterFixture, c.args);
+        defer result.deinit(std.testing.allocator);
+        try std.testing.expectEqual(@as(u8, 0), result.code);
+        try std.testing.expect(std.mem.indexOf(u8, result.stdout, "records (1):") != null);
+        try std.testing.expect(std.mem.indexOf(u8, result.stdout, "items (") == null);
+        try std.testing.expect(std.mem.indexOf(u8, result.stdout, c.body) != null);
+    }
+
+    // And the same narrowing in JSON is still the bare record array, not a
+    // seventh shape (R3, D15).
+    var as_json = try runSeeded(std.testing.allocator, seedSearchFilterFixture, &.{ "--log", "DEVLOG.jsonl", "search", "lock", "--state", "open", "--json" });
+    defer as_json.deinit(std.testing.allocator);
+    try std.testing.expectEqual(@as(u8, 0), as_json.code);
+    try expectExactlyOneJsonLine(as_json.stdout);
+    var parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, as_json.stdout, .{});
+    defer parsed.deinit();
+    try std.testing.expectEqual(@as(usize, 1), parsed.value.array.items.len);
+    try std.testing.expectEqualStrings("item", parsed.value.array.items[0].object.get("kind").?.string);
+    try std.testing.expect(parsed.value.array.items[0].object.get("state") == null);
+}
+
+test "the --kind/--state conflict is one guard with one message, not a copy per command (R6)" {
+    // The refusal `list` has carried since 6.3, reached through `search`.
+    // Asserting the two stderrs are *equal* is the point: a second copy of
+    // the message would satisfy a substring check and fail this one.
+    var listed = try runSeeded(std.testing.allocator, seedSearchFilterFixture, &.{ "--log", "DEVLOG.jsonl", "list", "--kind", "post", "--state", "open" });
+    defer listed.deinit(std.testing.allocator);
+    var searched = try runSeeded(std.testing.allocator, seedSearchFilterFixture, &.{ "--log", "DEVLOG.jsonl", "search", "lock", "--kind", "post", "--state", "open" });
+    defer searched.deinit(std.testing.allocator);
+
+    try std.testing.expectEqual(@as(u8, 1), listed.code);
+    try std.testing.expectEqual(@as(u8, 1), searched.code);
+    try std.testing.expectEqualStrings(listed.stderr, searched.stderr);
+    try std.testing.expect(std.mem.indexOf(u8, searched.stderr, "cannot be combined with --state or --blocking") != null);
+    try std.testing.expectEqualStrings("", searched.stdout);
+
+    // The value-validation refusals are the same one place too.
+    var bad_kind = try runSeeded(std.testing.allocator, seedSearchFilterFixture, &.{ "--log", "DEVLOG.jsonl", "search", "lock", "--kind", "nonsense" });
+    defer bad_kind.deinit(std.testing.allocator);
+    try std.testing.expectEqual(@as(u8, 1), bad_kind.code);
+    try std.testing.expect(std.mem.indexOf(u8, bad_kind.stderr, "must be one of: header, section") != null);
+
+    var bad_state = try runSeeded(std.testing.allocator, seedSearchFilterFixture, &.{ "--log", "DEVLOG.jsonl", "search", "lock", "--state", "nonsense" });
+    defer bad_state.deinit(std.testing.allocator);
+    try std.testing.expectEqual(@as(u8, 1), bad_state.code);
+    try std.testing.expect(std.mem.indexOf(u8, bad_state.stderr, "must be one of: open, resolved") != null);
+}
+
+test "search --role/--to are history filters, refusing a value no header ever declared (section 6 ruling)" {
+    var undeclared = try runSeeded(std.testing.allocator, seedSearchFilterFixture, &.{ "--log", "DEVLOG.jsonl", "search", "lock", "--role", "supervisor" });
+    defer undeclared.deinit(std.testing.allocator);
+    try std.testing.expectEqual(@as(u8, 1), undeclared.code);
+    try std.testing.expect(std.mem.indexOf(u8, undeclared.stderr, "supervisor") != null);
+    try std.testing.expectEqualStrings("", undeclared.stdout);
+
+    var undeclared_to = try runSeeded(std.testing.allocator, seedSearchFilterFixture, &.{ "--log", "DEVLOG.jsonl", "search", "lock", "--to", "supervisor" });
+    defer undeclared_to.deinit(std.testing.allocator);
+    try std.testing.expectEqual(@as(u8, 1), undeclared_to.code);
+    try std.testing.expectEqualStrings("", undeclared_to.stdout);
+
+    // A declared role that authored nothing matching is an empty success.
+    var declared = try runSeeded(std.testing.allocator, seedSearchFilterFixture, &.{ "--log", "DEVLOG.jsonl", "search", "lock", "--role", "reviewer" });
+    defer declared.deinit(std.testing.allocator);
+    try std.testing.expectEqual(@as(u8, 0), declared.code);
+    try std.testing.expect(std.mem.indexOf(u8, declared.stdout, "records (1):") != null);
+}
+
+test "search derives as of 7.3, so a write-boundary violation faults instead of ranking over it" {
+    // The rule every other read command has always been held to, now
+    // reaching `search`: a `brief` carrying neither `section` nor `block`
+    // is a log `runBrief` could not have written, and `state.derive`
+    // refuses it (`BriefMissingKey`). Before 7.3, `search` skipped `derive`
+    // and would have happily ranked this log.
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var diag: record.Diagnostics = .init(std.testing.allocator);
+    defer diag.deinit();
+    _ = try log.appendHeader(
+        std.testing.allocator,
+        std.testing.io,
+        tmp.dir,
+        "DEVLOG.jsonl",
+        "t0",
+        "devlog 0.1.0",
+        .{ .change = "x", .roles = &.{ "architect", "worker" }, .closers = &.{"architect"} },
+        &diag,
+    );
+    _ = try log.appendRecord(std.testing.allocator, std.testing.io, tmp.dir, "DEVLOG.jsonl", record.Record{ .brief = .{
+        .common = .{ .seq = 0, .ts = "t1", .role = "architect", .to = "worker", .body = "malformed: no section, no block" },
+    } }, &diag);
+
+    var stdin_file = try openStdinStandin(tmp.dir, std.testing.io, "");
+    defer stdin_file.close(std.testing.io);
+    var out: Io.Writer.Allocating = .init(std.testing.allocator);
+    defer out.deinit();
+    var err_out: Io.Writer.Allocating = .init(std.testing.allocator);
+    defer err_out.deinit();
+
+    // No filter on the line at all: `search` derives unconditionally, so
+    // the fault does not depend on which flags were given.
+    const code = run(
+        std.testing.allocator,
+        std.testing.io,
+        tmp.dir,
+        stdin_file,
+        test_ts,
+        &.{ "--log", "DEVLOG.jsonl", "search", "malformed" },
+        &out.writer,
+        &err_out.writer,
+    );
+    try std.testing.expectEqual(@as(u8, 1), code);
+    try std.testing.expect(std.mem.indexOf(u8, err_out.written(), "brief") != null);
+    try std.testing.expect(std.mem.indexOf(u8, err_out.written(), "section") != null);
+    try std.testing.expectEqualStrings("", out.written());
+}
+
+/// Six documents of identical length, so BM25's length normalisation is the
+/// same constant for every one of them and the ranking is decided by IDF
+/// alone — which is what makes R5 testable by hand.
+///
+/// "alpha" appears in four of the six and in only one of section 8's three;
+/// "beta" in two of the six and in two of section 8's three. So the query
+/// "alpha beta" ranks the beta records above the alpha one over the whole
+/// log, and the alpha record above them within section 8 — opposite orders
+/// over the same three documents, decided entirely by which corpus the IDF
+/// was computed against.
+fn seedIdfFixture(allocator: Allocator, dir: Io.Dir, io: Io, diag: *record.Diagnostics) !void {
+    _ = try log.appendHeader(
+        allocator,
+        io,
+        dir,
+        "DEVLOG.jsonl",
+        "t0",
+        "devlog 0.1.0",
+        .{ .change = "x", .roles = &.{"architect"}, .closers = &.{"architect"} },
+        diag,
+    );
+    const bodies = [_]struct { section: []const u8, body: []const u8 }{
+        .{ .section = "5", .body = "alpha pad pad sigilone" },
+        .{ .section = "5", .body = "alpha pad pad sigiltwo" },
+        .{ .section = "5", .body = "alpha pad pad sigilthree" },
+        .{ .section = "8", .body = "alpha pad pad sigilfour" },
+        .{ .section = "8", .body = "beta pad pad sigilfive" },
+        .{ .section = "8", .body = "beta pad pad sigilsix" },
+    };
+    for (bodies) |b| {
+        _ = try log.appendRecord(allocator, io, dir, "DEVLOG.jsonl", record.Record{ .post = .{
+            .common = .{
+                .seq = 0,
+                .ts = "t1",
+                .role = "architect",
+                .section = b.section,
+                .body = b.body,
+            },
+        } }, diag);
+    }
+}
+
+test "the index is built over the filtered candidates, so IDF is relative to what was asked about (R5)" {
+    // The one assertion that tells filter-then-index apart from
+    // index-then-filter. Over the whole log "alpha" is the common term and
+    // "beta" the rare one, so the beta records rank first. Restricted to
+    // section 8 the relationship inverts — "alpha" is now the rare term —
+    // and the order of the *same three documents* inverts with it. If the
+    // filters were applied to the results of a whole-log ranking instead,
+    // the second ordering would match the first.
+    var whole = try runSeeded(std.testing.allocator, seedIdfFixture, &.{ "--log", "DEVLOG.jsonl", "search", "alpha beta" });
+    defer whole.deinit(std.testing.allocator);
+    try std.testing.expectEqual(@as(u8, 0), whole.code);
+    try std.testing.expect(std.mem.indexOf(u8, whole.stdout, "records (6):") != null);
+    const whole_beta = std.mem.indexOf(u8, whole.stdout, "sigilfive") orelse return error.TestUnexpectedResult;
+    const whole_alpha = std.mem.indexOf(u8, whole.stdout, "sigilfour") orelse return error.TestUnexpectedResult;
+    try std.testing.expect(whole_beta < whole_alpha);
+
+    var narrowed = try runSeeded(std.testing.allocator, seedIdfFixture, &.{ "--log", "DEVLOG.jsonl", "search", "alpha beta", "--section", "8" });
+    defer narrowed.deinit(std.testing.allocator);
+    try std.testing.expectEqual(@as(u8, 0), narrowed.code);
+    try std.testing.expect(std.mem.indexOf(u8, narrowed.stdout, "records (3):") != null);
+    const narrowed_alpha = std.mem.indexOf(u8, narrowed.stdout, "sigilfour") orelse return error.TestUnexpectedResult;
+    const narrowed_beta = std.mem.indexOf(u8, narrowed.stdout, "sigilfive") orelse return error.TestUnexpectedResult;
+    try std.testing.expect(narrowed_alpha < narrowed_beta);
+
+    // Ties within the narrowed set still break by seq ascending (R3):
+    // sigilfive and sigilsix score identically.
+    const narrowed_sixth = std.mem.indexOf(u8, narrowed.stdout, "sigilsix") orelse return error.TestUnexpectedResult;
+    try std.testing.expect(narrowed_beta < narrowed_sixth);
+}
+
+test "search --help documents the filters and the leading-dash limit of its positional" {
+    try expectRun(std.testing.allocator, &.{ "search", "--help" }, 0, "--section <s>", null);
+    try expectRun(std.testing.allocator, &.{ "search", "--help" }, 0, "--blocking", null);
+    try expectRun(std.testing.allocator, &.{ "search", "--help" }, 0, "cannot begin with '-'", null);
+    try expectRun(std.testing.allocator, &.{ "search", "--help" }, 0, "there is no '--'", null);
+    try expectRun(std.testing.allocator, &.{ "search", "--help" }, 0, "a search always returns", null);
 }
