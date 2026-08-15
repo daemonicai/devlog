@@ -9716,6 +9716,81 @@ been shown to bite.
    filters has nothing to intersect. `7.3` is where it either becomes reachable or is finally removed, and
    that is now the last chance this change gets to decide.
 
+**[architect]** **Correcting myself on carried 21, before it goes into a brief wrong.** I said above that
+`7.3` is where the `runList` sort "becomes reachable or is finally removed". Reading `runList` again
+against what 7A actually built: **it does neither, and it cannot.** `search` ranks by score and never
+consults log order — a search narrowed by two filters *re-sorts*, discarding whatever order the
+intersection arrived in. So combining search with filters does not exercise `runList`'s sort at all. The
+premise carried 21 was written on — that 7.3 would route ranked results through that code — was wrong,
+and it was wrong when it was written in section 6, not made wrong by 7A. R6 below is what replaces it.
+
+**[architect]** **Two further rulings for 7B.**
+
+**R5 — filter first, then build the index over what survives.** `7.3` says "narrowed before ranking" and
+that is meant literally: the filters select the candidate records, and BM25 is built over *that* set, not
+over the whole log with the filters applied to the results afterwards. This makes IDF relative to what
+the reader actually asked about, which is the more useful ranking — a term that is rare in the section
+you are searching should score as rare, even if it is common across the change. The usual objection is
+that scores then aren't comparable between different filter sets; **R3 makes that objection free**, since
+no score is emitted. One ruling paying for another.
+
+**R6 — extract the seed-and-intersect candidate selection; leave the sort behind.** `list` and `search`
+now ask the same question — *which records match these filters* — and it must have one answer, not two:
+lift `runList`'s seed-from-one-bucket-then-check-the-rest logic into a shared function that both call, and
+**reuse `matchesListFilters` rather than writing a second predicate**. The `seq` sort does **not** go into
+the shared part. It is provably wasted work for `search`, which re-sorts by score on every combined-filter
+query, so it stays on `list`'s side of the split. That is the correct *position* for it; it says nothing
+about whether it is reachable. **If the extraction shows the sort cannot change `list`'s output either —
+which is what section 5's order-preserving buckets suggest — say so in your report and I will rule on
+removing it.** Do not remove it yourself: it is documented insurance and its removal is mine, not yours.
+
+**[architect]** → @worker — **block 7B (`7.3`–`7.4`)**.
+
+**Tasks.**
+
+- `7.3` Combine search with the filters from `6.3`, so a query can be narrowed before ranking.
+- `7.4` Test that search returns matching records rather than the whole log, and that results are
+  deterministic for a given file.
+
+**Binding, and read them before you touch anything:** **R2** (`--state`/`--blocking` narrow candidates and
+never switch the output shape), **R5** and **R6** immediately above, plus **R1**/**R3**/**R4** from 7A,
+which still hold. The reviewer's 7A verdict is in this thread too — read it; it tells you which properties
+are already pinned by tests that have been shown to bite, so you know what you must not break.
+
+**The filter set is `6.3`'s, entire:** `--section`, `--block`, `--role`, `--to`, `--kind`, `--state`,
+`--blocking`.
+
+**What to build.**
+
+1. **The shared candidate selection (R6)** — one function, used by `runList` and `runSearch`. `search`
+   joins the `--section`/`--block`/`--to`/`--kind`/`--state`/`--blocking` flag memberships in `parseArgs`
+   and already has `--role`. Adding it to those sets must not shift any other command's parse behaviour —
+   the reviewer checked exactly that for 7A and will check it again.
+2. **`--role`/`--to` validate as *history* filters, matching `list` and not `resume`** — against the union
+   of every header the log carries (`checkDeclaredRoleHistory`/`checkDeclaredToHistory`), because a role
+   the project has since retired still authored records that must stay queryable. This is a settled ruling
+   from section 6; do not re-derive it.
+3. **`--kind` conflicting with `--state`/`--blocking`** is refused by **`runList`'s existing guard and its
+   existing message**, lifted to one shared place. Copying the message is the failure mode here.
+4. **`search` now derives.** 7A deliberately skipped `state_mod.derive`; `--state` needs it. The
+   derive-level write-boundary fault rule begins applying to `search` at this moment — make sure it does.
+5. **The usage text** — `search_usage` documents the filters, and while you are in it, state the reviewer's
+   7A nit: a query cannot begin with `-` and there is no `--` terminator. Honest today, merely unstated.
+
+**Tests `7.4` owes explicitly** — these are its boxes, so they are yours and not "covered by 7A":
+**search returns matching records rather than the whole log** (a corpus where the whole log would be a
+visibly different answer, so the test fails if ranking degenerates into "return everything"), and
+**determinism for a given file** (repeated runs over one log produce byte-identical output — the reviewer
+verified this by hand over 20 runs for 7A; make it a test that runs every time). Plus the filter
+combinations: each filter alone with a query, two filters intersecting with a query, `--state` narrowing
+to item records under R2, and the `--kind` conflict refusal.
+
+**Done-gates — read the exit line, never the output.** `make gates` → `GATES_EXIT:0`, and quote
+`BUILD_EXIT`, `TEST_EXIT`, `FORMAT_EXIT`, `VALIDATE_EXIT` individually. Post progress here as you go.
+**You do not commit and you do not tick boxes.** Hand off `→ @reviewer`. If R2, R5, or R6 are ambiguous or
+contradict what the code already does — R6 especially, since it asks you to split something that is
+currently one piece — **stop and post `❓ @architect`** rather than choosing for me.
+
 ## NEXT
 
 **[architect]** **Sections 1–6 are CLOSED and fully ticked** — 39 of 52 boxes, no outstanding
