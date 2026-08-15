@@ -247,6 +247,47 @@ const show_usage =
     \\Takes no body: never reads stdin.
 ;
 
+const resume_usage =
+    \\USAGE
+    \\    devlog --log <path> resume --role <r> [--json]
+    \\
+    \\Gives a role what it needs to pick up work cold (D8, log-retrieval):
+    \\the current NEXT narrative, the open items addressed to that role, and
+    \\the latest brief for the role's block. Bounded by what is currently
+    \\open, not by the log's history.
+    \\
+    \\The role's block is the block of the most recently posted 'brief'
+    \\addressed to the role; the brief returned is the latest one for that
+    \\block, which may since have been addressed to someone else (a
+    \\remediation brief). If no brief has ever been addressed to the role,
+    \\the brief is plainly absent.
+    \\
+    \\FLAGS
+    \\    --role <r>  The role to resume as. Required.
+    \\    --json      Emit the same result as JSON instead of rendered
+    \\                text (D15). One derivation, two renderings — never
+    \\                two derivations.
+    \\
+    \\Takes no body: never reads stdin.
+;
+
+const status_usage =
+    \\USAGE
+    \\    devlog --log <path> status [--json]
+    \\
+    \\Renders the current state (next-state): the current NEXT narrative
+    \\together with every currently open item. Closing an item, with no new
+    \\NEXT recorded, removes it from the next 'status'. Items flagged
+    \\blocking are distinguishable from non-blocking ones in both forms.
+    \\
+    \\FLAGS
+    \\    --json  Emit the same result as JSON instead of rendered text
+    \\            (D15). One derivation, two renderings — never two
+    \\            derivations.
+    \\
+    \\Takes no body: never reads stdin.
+;
+
 /// Names only, from sections 4, 6 and 7 of the change's `tasks.md`. This
 /// block dispatches to them and gives each a `--help`; their behaviour is
 /// those sections' to build. `header`, `post`, `section`, `brief`, and
@@ -260,11 +301,11 @@ const commands = [_]CommandSpec{
     .{ .name = "close", .summary = "Close a work item with a reason (declared closers only).", .section = "4", .usage = close_usage },
     .{ .name = "verdict", .summary = "Record a typed review verdict for a block.", .section = "4", .usage = verdict_usage },
     .{ .name = "next", .summary = "Append the current NEXT narrative.", .section = "4", .usage = next_usage },
-    .{ .name = "resume", .summary = "Show the current NEXT, open items for a role, and its latest brief.", .section = "6" },
+    .{ .name = "resume", .summary = "Show the current NEXT, open items for a role, and its latest brief.", .section = "6", .usage = resume_usage },
     .{ .name = "show", .summary = "Show one item or one record by its identifier.", .section = "6", .usage = show_usage },
     .{ .name = "list", .summary = "List records, filtered by section, block, role, kind, state, or addressee.", .section = "6" },
     .{ .name = "refs", .summary = "Show every record carrying a given external reference.", .section = "6" },
-    .{ .name = "status", .summary = "Show the rendered current state: NEXT plus open items.", .section = "6" },
+    .{ .name = "status", .summary = "Show the rendered current state: NEXT plus open items.", .section = "6", .usage = status_usage },
     .{ .name = "search", .summary = "Search record bodies, ranked by relevance.", .section = "7", .takes_positional = true },
 };
 
@@ -464,10 +505,11 @@ const Parsed = struct {
     /// `show`-only, exactly-once (6.2), mutually exclusive with
     /// `--item`. The raw digits; parsed to a positive `u64` in `runShow`.
     seq_num: ?[]const u8 = null,
-    /// Read-command-only (D15, block 6A wires `show`; 6B/6C wire the
-    /// rest). A bare boolean flag, same shape as `item`'s `--blocking`:
-    /// absent means the default rendered-text form, present means emit
-    /// the same content as JSON instead.
+    /// Read-command-only (D15, block 6A wires `show`; block 6B wires
+    /// `resume`/`status`; 6C wires the rest). A bare boolean flag, same
+    /// shape as `item`'s `--blocking`: absent means the default
+    /// rendered-text form, present means emit the same content as JSON
+    /// instead.
     json: bool = false,
 
     fn deinit(self: *Parsed, allocator: Allocator) void {
@@ -572,8 +614,10 @@ fn parseArgs(allocator: Allocator, args: []const [:0]const u8) Allocator.Error!P
     const wants_close = command_hint != null and std.mem.eql(u8, command_hint.?, "close");
     const wants_verdict = command_hint != null and std.mem.eql(u8, command_hint.?, "verdict");
     const wants_show = command_hint != null and std.mem.eql(u8, command_hint.?, "show");
+    const wants_resume = command_hint != null and std.mem.eql(u8, command_hint.?, "resume");
+    const wants_status = command_hint != null and std.mem.eql(u8, command_hint.?, "status");
     const strict = wants_header or wants_post or wants_section_cmd or wants_brief or wants_next or
-        wants_item or wants_close or wants_verdict or wants_show;
+        wants_item or wants_close or wants_verdict or wants_show or wants_resume or wants_status;
     // Whether the hinted command recognises a bare positional argument at
     // all (B1: `CommandSpec.takes_positional`). Looked up structurally,
     // not by name, so a future command that takes one only has to set the
@@ -634,7 +678,7 @@ fn parseArgs(allocator: Allocator, args: []const [:0]const u8) Allocator.Error!P
             if (takeFlagValue(&p, args, &i, "--commit")) |v| setOnce(&p, &p.commit, "--commit", v);
         } else if (wants_show and std.mem.eql(u8, arg, "--seq")) {
             if (takeFlagValue(&p, args, &i, "--seq")) |v| setOnce(&p, &p.seq_num, "--seq", v);
-        } else if (wants_show and std.mem.eql(u8, arg, "--json")) {
+        } else if ((wants_show or wants_resume or wants_status) and std.mem.eql(u8, arg, "--json")) {
             p.json = true;
         } else if (wants_section_flag and std.mem.eql(u8, arg, "--section")) {
             if (takeFlagValue(&p, args, &i, "--section")) |v| setOnce(&p, &p.section, "--section", v);
@@ -1358,6 +1402,255 @@ fn writeItemJson(w: *Io.Writer, item: state_mod.Item, diag: ?*record.Diagnostics
     try w.writeAll("]}\n");
 }
 
+/// The `brief` slot of a "current state" view (D8, block 6B). `resume`
+/// (6.1) and `status` (6.5) share everything about "NEXT narrative plus a
+/// set of items" except this: `status` has no brief concept at all,
+/// `resume` always has one, either found or plainly absent (the block
+/// brief's ruling, point 4 — not an error, not an empty field).
+const BriefSlot = union(enum) {
+    /// `status`: never rendered, in either form — there is no brief
+    /// concept to omit a value for.
+    not_applicable,
+    /// `resume`: no `brief` has ever been addressed to this role.
+    none,
+    /// `resume`: the latest brief for the role's block (which may itself
+    /// be addressed to someone else — a remediation brief).
+    found: record.Record,
+};
+
+/// The role's block (D8, `resume` ruling point 1): the `(section, block)`
+/// of the most recently posted `brief` addressed to `role`, scanning
+/// `briefs` (`state_mod.Indexes.byKind(.brief)` — an `EnumArray` bucket, in
+/// log order, never a hash-map enumeration) in order and keeping the last
+/// match. `null` if no brief has ever been addressed to the role — ruling
+/// point 4, "there is no block".
+fn findBriefToRole(briefs: []const record.Record, role: []const u8) ?record.BriefRecord {
+    var found: ?record.BriefRecord = null;
+    for (briefs) |rec| {
+        const b = rec.brief;
+        const to = b.common.to orelse continue;
+        if (std.mem.eql(u8, to, role)) found = b;
+    }
+    return found;
+}
+
+/// The latest brief for `(section, block)` (ruling point 2), scanning the
+/// same `briefs` bucket a second time and keeping the last exact match on
+/// **both** fields (ruling point 3 — the section-5 close ruling: never key
+/// on the bare block label alone, since it is not unique across sections).
+/// `--section`/`--block`/`--to` are all required on `devlog brief`
+/// (`runBrief`), so every brief this build's CLI wrote has both fields
+/// set — but `briefs` is whatever `state.derive` accepted, and `derive`
+/// now faults (`error.BriefMissingKey`) before `Indexes` is built if any
+/// `brief` record is missing either field. That makes the guard below
+/// unreachable in practice, which is exactly why it stays a guard —
+/// `orelse continue`, mirroring `findBriefToRole` two functions up —
+/// rather than a `.?` that would silently start panicking again the day
+/// the upstream invariant changes.
+fn findLatestBriefForBlock(briefs: []const record.Record, section: []const u8, block: []const u8) ?record.Record {
+    var found: ?record.Record = null;
+    for (briefs) |rec| {
+        const b = rec.brief;
+        const b_section = b.common.section orelse continue;
+        const b_block = b.common.block orelse continue;
+        if (std.mem.eql(u8, b_section, section) and std.mem.eql(u8, b_block, block)) {
+            found = rec;
+        }
+    }
+    return found;
+}
+
+/// The text form of a "current state" view — the shared half of D8's
+/// `resume` and `next-state`'s `status`, parameterised over `items` (the
+/// caller has already selected and ordered them: every open item for
+/// `status`, the open items addressed to one role for `resume`) and
+/// `brief`. One renderer, not two hand-written ones that could disagree
+/// about the same item (D15's rule, one level up). Reuses `renderRecordText`
+/// for the NEXT record and the brief, and `writeItemText` for each item —
+/// the exact renderers `show` already exercises, so a current-state item
+/// reads exactly as it would fetched by its own `show --item`, including
+/// its `blocking: {}` field (`next-state`: blocking items distinguishable).
+fn renderCurrentStateText(
+    w: *Io.Writer,
+    next: ?record.NextRecord,
+    items: []const state_mod.Item,
+    brief: BriefSlot,
+) void {
+    w.writeAll("next:\n") catch {};
+    if (next) |n| {
+        renderRecordText(w, record.Record{ .next = n });
+    } else {
+        w.writeAll("(none recorded)\n") catch {};
+    }
+
+    w.print("\nopen items ({d}):\n", .{items.len}) catch {};
+    if (items.len == 0) w.writeAll("(none)\n") catch {};
+    for (items, 0..) |it, idx| {
+        w.print("\n--- item {d} of {d} ---\n", .{ idx + 1, items.len }) catch {};
+        writeItemText(w, it);
+    }
+
+    switch (brief) {
+        .not_applicable => {},
+        .none => w.writeAll("\nbrief: none — no brief has been addressed to this role yet\n") catch {},
+        .found => |rec| {
+            w.writeAll("\nbrief:\n") catch {};
+            renderRecordText(w, rec);
+        },
+    }
+}
+
+/// The JSON form of a "current state" view — mirrors
+/// `renderCurrentStateText` field for field (D15): `next` (the record, or
+/// `null`), `items` (each rendered by `writeItemJson`, the same emitter
+/// `show --item --json` uses), and `brief`, present as a key only when
+/// `brief != .not_applicable` — `status` therefore never carries a `brief`
+/// key at all, rather than a `null` a reader could mistake for "checked,
+/// found nothing".
+fn writeCurrentStateJson(
+    w: *Io.Writer,
+    next: ?record.NextRecord,
+    items: []const state_mod.Item,
+    brief: BriefSlot,
+    diag: ?*record.Diagnostics,
+) record.WriteError!void {
+    try w.writeAll("{\"next\":");
+    if (next) |n| {
+        try record.write(w, record.Record{ .next = n }, diag);
+    } else {
+        try w.writeAll("null");
+    }
+    try w.writeAll(",\"items\":[");
+    for (items, 0..) |it, idx| {
+        if (idx != 0) try w.writeAll(",");
+        try writeItemJson(w, it, diag);
+    }
+    try w.writeAll("]");
+    switch (brief) {
+        .not_applicable => {},
+        .none => try w.writeAll(",\"brief\":null"),
+        .found => |rec| {
+            try w.writeAll(",\"brief\":");
+            try record.write(w, rec, diag);
+        },
+    }
+    try w.writeAll("}\n");
+}
+
+/// `devlog resume` (6.1, D8, `log-retrieval`). Everything rendered here is
+/// already derived by `state_mod` — this command selects and renders, it
+/// derives nothing new. Loads via `log.openReadOnly` (never
+/// `log.appendRecord`'s locked, create-if-missing path — a read does
+/// neither).
+///
+/// **Item selection stays off `Indexes.by_addressee` entirely** (carried
+/// 16): filters `derived.indexes.byState(.open)` — already positional,
+/// in `#n` order, per `state.zig`'s own derivation — by `opened.common.to
+/// == role`, rather than looking the role up in the hash-map index and
+/// risking an unstable enumeration. The result is bounded by how many
+/// items are open and addressed to `role`, never by the log's history
+/// (`log-retrieval`'s boundedness requirement).
+///
+/// **Brief lookup stays off the hash-map indexes too**: both
+/// `findBriefToRole` and `findLatestBriefForBlock` scan
+/// `Indexes.byKind(.brief)`, an `EnumArray` bucket addressed directly by
+/// tag — not a hash map, and not subject to carried 16 at all.
+fn runResume(
+    allocator: Allocator,
+    io: Io,
+    dir: Io.Dir,
+    log_path: []const u8,
+    p: *const Parsed,
+    stdout: *Io.Writer,
+    stderr: *Io.Writer,
+) u8 {
+    const role = p.role orelse return fail(stderr, "'resume' requires --role <role>", .{});
+
+    var diag: record.Diagnostics = .init(allocator);
+    defer diag.deinit();
+
+    var opened = log.openReadOnly(allocator, io, dir, log_path, &diag) catch |err| {
+        return reportLogError(stderr, err, &diag);
+    };
+    defer opened.close(allocator);
+
+    var derived = state_mod.derive(allocator, opened.log.records, &diag) catch |err| {
+        return reportLogError(stderr, err, &diag);
+    };
+    defer derived.deinit();
+
+    var matching: std.ArrayList(state_mod.Item) = .empty;
+    defer matching.deinit(allocator);
+    for (derived.indexes.byState(.open)) |it| {
+        const to = it.opened.common.to orelse continue;
+        if (!std.mem.eql(u8, to, role)) continue;
+        matching.append(allocator, it) catch return fail(stderr, "out of memory", .{});
+    }
+
+    // The three `.?`s this block's review flagged (`rb.common.section.?`,
+    // `rb.common.block.?`, and the outer unwrap of `findLatestBriefForBlock`'s
+    // result) are gone: `state.derive` now faults on a `brief` missing
+    // either field before `Indexes` is ever built, so `rb` is guaranteed
+    // complete here — but the `orelse .none` below treats that as a
+    // guarantee to defend, not one to trust blindly.
+    const briefs = derived.indexes.byKind(.brief);
+    const brief_slot: BriefSlot = if (findBriefToRole(briefs, role)) |rb| blk: {
+        const section = rb.common.section orelse break :blk .none;
+        const block_id = rb.common.block orelse break :blk .none;
+        break :blk if (findLatestBriefForBlock(briefs, section, block_id)) |found|
+            BriefSlot{ .found = found }
+        else
+            .none;
+    } else .none;
+
+    if (p.json) {
+        writeCurrentStateJson(stdout, derived.currentNext(), matching.items, brief_slot, &diag) catch |err|
+            return reportLogError(stderr, err, &diag);
+    } else {
+        renderCurrentStateText(stdout, derived.currentNext(), matching.items, brief_slot);
+    }
+    return 0;
+}
+
+/// `devlog status` (6.5, `next-state`). The other half of the shared
+/// "current state" view `runResume` renders: every open item, unfiltered
+/// by addressee, and no brief concept at all (`BriefSlot.not_applicable`).
+/// `derived.indexes.byState(.open)` is already positional (`#n` order,
+/// carried 16) — passed straight through, no copy needed. Loads via
+/// `log.openReadOnly`, exactly as `runResume` and `runShow` do.
+fn runStatus(
+    allocator: Allocator,
+    io: Io,
+    dir: Io.Dir,
+    log_path: []const u8,
+    p: *const Parsed,
+    stdout: *Io.Writer,
+    stderr: *Io.Writer,
+) u8 {
+    var diag: record.Diagnostics = .init(allocator);
+    defer diag.deinit();
+
+    var opened = log.openReadOnly(allocator, io, dir, log_path, &diag) catch |err| {
+        return reportLogError(stderr, err, &diag);
+    };
+    defer opened.close(allocator);
+
+    var derived = state_mod.derive(allocator, opened.log.records, &diag) catch |err| {
+        return reportLogError(stderr, err, &diag);
+    };
+    defer derived.deinit();
+
+    const items = derived.indexes.byState(.open);
+
+    if (p.json) {
+        writeCurrentStateJson(stdout, derived.currentNext(), items, .not_applicable, &diag) catch |err|
+            return reportLogError(stderr, err, &diag);
+    } else {
+        renderCurrentStateText(stdout, derived.currentNext(), items, .not_applicable);
+    }
+    return 0;
+}
+
 /// `devlog show` (6.2, `log-retrieval`, D15). Retrieves one item — with
 /// its current derived state and full close history — by `--item <n>`, or
 /// one record verbatim by `--seq <n>`. The two are mutually exclusive and
@@ -1527,10 +1820,16 @@ fn run(
     if (std.mem.eql(u8, spec.name, "show")) {
         return runShow(allocator, io, dir, log_path, &p, stdout, stderr);
     }
+    if (std.mem.eql(u8, spec.name, "resume")) {
+        return runResume(allocator, io, dir, log_path, &p, stdout, stderr);
+    }
+    if (std.mem.eql(u8, spec.name, "status")) {
+        return runStatus(allocator, io, dir, log_path, &p, stdout, stderr);
+    }
 
-    // No other subcommand is wired yet (`resume`/`list`/`refs`/`status` —
-    // section 6 blocks 6B/6C; `search` — section 7). Fail honestly rather
-    // than silently succeed, and touch nothing on the way out (D5).
+    // No other subcommand is wired yet (`list`/`refs` — section 6 block
+    // 6C; `search` — section 7). Fail honestly rather than silently
+    // succeed, and touch nothing on the way out (D5).
     return fail(stderr, "'{s}' is not implemented yet", .{spec.name});
 }
 
@@ -1669,15 +1968,17 @@ test "a recognised command without --log is an error, not an attempt" {
 }
 
 test "a recognised but unimplemented command with --log fails honestly as not implemented" {
-    // status is still a placeholder past block 4A — header and post are
-    // the two commands this block makes real; every other command must
-    // still fail this way rather than silently succeed.
+    // list is still a placeholder past block 6B — status/resume became
+    // real in this block, retargeted here for the same reason 4A's
+    // original status target was retargeted at 6A and again at 6B; every
+    // command this change has not yet built must still fail this way
+    // rather than silently succeed.
     try expectRun(
         std.testing.allocator,
-        &.{ "--log", "DEVLOG.jsonl", "status" },
+        &.{ "--log", "DEVLOG.jsonl", "list" },
         1,
         null,
-        "'status' is not implemented yet",
+        "'list' is not implemented yet",
     );
 }
 
@@ -1845,26 +2146,28 @@ test "an unrecognised global flag before the command is rejected" {
 }
 
 test "flags after the subcommand are left for its own section, not rejected here" {
-    // show is real as of block 6A, so this test (from block 4A, pre-4C,
-    // already retargeted once at 4C) is retargeted again to a command
-    // block 6A does not build — resume, still a placeholder past this
-    // block (6B).
+    // show is real as of block 6A, resume/status as of block 6B, so this
+    // test (from block 4A, retargeted at 4C, 6A, and now again here) moves
+    // to a command block 6B does not build — list, still a placeholder
+    // past this block (6C). `--section` is not one of `--role`'s global
+    // flags, so this pins that it is left for `list`'s own section rather
+    // than rejected here.
     try expectRun(
         std.testing.allocator,
-        &.{ "--log", "DEVLOG.jsonl", "resume", "--role", "architect" },
+        &.{ "--log", "DEVLOG.jsonl", "list", "--section", "6" },
         1,
         null,
-        "'resume' is not implemented yet",
+        "'list' is not implemented yet",
     );
 }
 
 test "--log and --role are recognised in any position relative to the command" {
     try expectRun(
         std.testing.allocator,
-        &.{ "status", "--log", "DEVLOG.jsonl", "--role", "architect" },
+        &.{ "list", "--log", "DEVLOG.jsonl", "--role", "architect" },
         1,
         null,
-        "'status' is not implemented yet",
+        "'list' is not implemented yet",
     );
 }
 
@@ -4864,4 +5167,661 @@ test "show --item on an item with no close yet renders \"closes: none yet\" in t
         const closes = root.get("closes").?.array;
         try std.testing.expectEqual(@as(usize, 0), closes.items.len);
     }
+}
+
+// --- Block 6B: `resume` (6.1) and `status` (6.5) --------------------------
+
+test "resume requires --role, before the read-only load ever touches the filesystem" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var stdin_file = try openStdinStandin(tmp.dir, std.testing.io, "");
+    defer stdin_file.close(std.testing.io);
+    var out: Io.Writer.Allocating = .init(std.testing.allocator);
+    defer out.deinit();
+    var err_out: Io.Writer.Allocating = .init(std.testing.allocator);
+    defer err_out.deinit();
+
+    const code = run(
+        std.testing.allocator,
+        std.testing.io,
+        tmp.dir,
+        stdin_file,
+        test_ts,
+        &.{ "--log", "DEVLOG.jsonl", "resume" },
+        &out.writer,
+        &err_out.writer,
+    );
+    try std.testing.expectEqual(@as(u8, 1), code);
+    try std.testing.expect(std.mem.indexOf(u8, err_out.written(), "requires --role") != null);
+    try std.testing.expectError(error.FileNotFound, tmp.dir.openFile(std.testing.io, "DEVLOG.jsonl", .{}));
+}
+
+test "resume against a missing log reports plainly, exits non-zero, and creates nothing (durable-format)" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var stdin_file = try openStdinStandin(tmp.dir, std.testing.io, "");
+    defer stdin_file.close(std.testing.io);
+    var out: Io.Writer.Allocating = .init(std.testing.allocator);
+    defer out.deinit();
+    var err_out: Io.Writer.Allocating = .init(std.testing.allocator);
+    defer err_out.deinit();
+
+    const code = run(
+        std.testing.allocator,
+        std.testing.io,
+        tmp.dir,
+        stdin_file,
+        test_ts,
+        &.{ "--log", "DEVLOG.jsonl", "resume", "--role", "worker" },
+        &out.writer,
+        &err_out.writer,
+    );
+    try std.testing.expectEqual(@as(u8, 1), code);
+    try std.testing.expect(std.mem.indexOf(u8, err_out.written(), "devlog header") != null);
+    try std.testing.expectEqualStrings("", out.written());
+
+    var count: usize = 0;
+    var it = tmp.dir.iterate();
+    while (try it.next(std.testing.io)) |entry| {
+        try std.testing.expectEqualStrings("stdin-standin", entry.name);
+        count += 1;
+    }
+    try std.testing.expectEqual(@as(usize, 1), count);
+}
+
+test "status against a missing log reports plainly, exits non-zero, and creates nothing (durable-format)" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var stdin_file = try openStdinStandin(tmp.dir, std.testing.io, "");
+    defer stdin_file.close(std.testing.io);
+    var out: Io.Writer.Allocating = .init(std.testing.allocator);
+    defer out.deinit();
+    var err_out: Io.Writer.Allocating = .init(std.testing.allocator);
+    defer err_out.deinit();
+
+    const code = run(
+        std.testing.allocator,
+        std.testing.io,
+        tmp.dir,
+        stdin_file,
+        test_ts,
+        &.{ "--log", "DEVLOG.jsonl", "status" },
+        &out.writer,
+        &err_out.writer,
+    );
+    try std.testing.expectEqual(@as(u8, 1), code);
+    try std.testing.expect(std.mem.indexOf(u8, err_out.written(), "devlog header") != null);
+    try std.testing.expectEqualStrings("", out.written());
+
+    var count: usize = 0;
+    var it = tmp.dir.iterate();
+    while (try it.next(std.testing.io)) |entry| {
+        try std.testing.expectEqualStrings("stdin-standin", entry.name);
+        count += 1;
+    }
+    try std.testing.expectEqual(@as(usize, 1), count);
+}
+
+/// Seeds header, NEXT, a mix of open and closed items across two roles
+/// (worker/reviewer), and four briefs that exercise every step of the
+/// `resume` ruling (block 6B brief):
+///
+/// - item #1 — worker, blocking.
+/// - item #2 — reviewer, not blocking. Never addressed to worker
+///   (`log-retrieval`'s exclusion scenario).
+/// - item #3 — worker, not blocking.
+/// - item #4 — worker, but closed (must not appear as an open item —
+///   proves resume/status render *derived* open state, not merely "an
+///   item record exists").
+/// - Brief A (`6`, `6A`, to worker) — an earlier brief to worker, on a
+///   different block.
+/// - Brief B (`6`, `6B`, to worker) — the *most recent* brief addressed
+///   to worker, so `findBriefToRole` resolves worker's block to `(6,
+///   6B)` (ruling point 1).
+/// - the remediation brief (`6`, `6B`, to reviewer) — later than Brief B,
+///   same block, addressed to someone else: the latest brief *for the
+///   block*, not for the role (ruling point 2).
+/// - the decoy brief (`9`, `6B`, to reviewer) — posted last, and shares
+///   Brief B's bare block label but not its section. If the lookup ever
+///   keyed on the bare label alone, this would incorrectly win over the
+///   remediation brief (ruling point 3).
+fn seedResumeFixture(allocator: Allocator, dir: Io.Dir, io: Io, diag: *record.Diagnostics) !void {
+    _ = try log.appendHeader(
+        allocator,
+        io,
+        dir,
+        "DEVLOG.jsonl",
+        "t0",
+        "devlog 0.1.0",
+        .{ .change = "x", .roles = &.{ "architect", "worker", "reviewer" }, .closers = &.{"architect"} },
+        diag,
+    );
+    _ = try log.appendRecord(allocator, io, dir, "DEVLOG.jsonl", record.Record{ .next = .{
+        .common = .{ .seq = 0, .ts = "t1", .role = "architect", .body = "Land block 6B, then close section 6." },
+    } }, diag);
+
+    _ = try log.appendItem(allocator, io, dir, "DEVLOG.jsonl", record.Record{ .item = .{
+        .common = .{ .seq = 0, .ts = "t2", .role = "architect", .to = "worker", .body = "Do X" },
+        .item = 0,
+        .type = .task,
+        .blocking = true,
+    } }, diag);
+    _ = try log.appendItem(allocator, io, dir, "DEVLOG.jsonl", record.Record{ .item = .{
+        .common = .{ .seq = 0, .ts = "t3", .role = "architect", .to = "reviewer", .body = "Review Y" },
+        .item = 0,
+        .type = .task,
+        .blocking = false,
+    } }, diag);
+    _ = try log.appendItem(allocator, io, dir, "DEVLOG.jsonl", record.Record{ .item = .{
+        .common = .{ .seq = 0, .ts = "t4", .role = "worker", .to = "worker", .body = "Minor nit" },
+        .item = 0,
+        .type = .finding,
+        .blocking = false,
+    } }, diag);
+    _ = try log.appendItem(allocator, io, dir, "DEVLOG.jsonl", record.Record{ .item = .{
+        .common = .{ .seq = 0, .ts = "t5", .role = "architect", .to = "worker", .body = "Old task" },
+        .item = 0,
+        .type = .task,
+        .blocking = false,
+    } }, diag);
+    _ = try log.appendRecord(allocator, io, dir, "DEVLOG.jsonl", record.Record{ .close = .{
+        .common = .{ .seq = 0, .ts = "t6", .role = "architect", .body = "done already" },
+        .item = 4,
+        .state = .resolved,
+    } }, diag);
+
+    _ = try log.appendRecord(allocator, io, dir, "DEVLOG.jsonl", record.Record{ .brief = .{
+        .common = .{ .seq = 0, .ts = "t7", .role = "architect", .section = "6", .block = "6A", .to = "worker", .body = "Focus on foundational item first." },
+    } }, diag);
+    _ = try log.appendRecord(allocator, io, dir, "DEVLOG.jsonl", record.Record{ .brief = .{
+        .common = .{ .seq = 0, .ts = "t8", .role = "architect", .section = "6", .block = "6B", .to = "worker", .body = "Implement the rendering block now." },
+    } }, diag);
+    _ = try log.appendRecord(allocator, io, dir, "DEVLOG.jsonl", record.Record{ .brief = .{
+        .common = .{ .seq = 0, .ts = "t9", .role = "architect", .section = "6", .block = "6B", .to = "reviewer", .body = "Fix the nits before landing." },
+    } }, diag);
+    _ = try log.appendRecord(allocator, io, dir, "DEVLOG.jsonl", record.Record{ .brief = .{
+        .common = .{ .seq = 0, .ts = "t10", .role = "architect", .section = "9", .block = "6B", .to = "reviewer", .body = "Unrelated section nine content." },
+    } }, diag);
+}
+
+test "resume returns open items addressed to the role in item-number order, excluding other roles' and closed items (log-retrieval)" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var diag: record.Diagnostics = .init(std.testing.allocator);
+    defer diag.deinit();
+    try seedResumeFixture(std.testing.allocator, tmp.dir, std.testing.io, &diag);
+
+    var stdin_file = try openStdinStandin(tmp.dir, std.testing.io, "");
+    defer stdin_file.close(std.testing.io);
+
+    var out: Io.Writer.Allocating = .init(std.testing.allocator);
+    defer out.deinit();
+    var err_out: Io.Writer.Allocating = .init(std.testing.allocator);
+    defer err_out.deinit();
+    const code = run(
+        std.testing.allocator,
+        std.testing.io,
+        tmp.dir,
+        stdin_file,
+        test_ts,
+        &.{ "--log", "DEVLOG.jsonl", "resume", "--role", "worker" },
+        &out.writer,
+        &err_out.writer,
+    );
+    try std.testing.expectEqual(@as(u8, 0), code);
+    const text = out.written();
+
+    // #1 and #3, worker's open items — present, blocking distinguishable.
+    try std.testing.expect(std.mem.indexOf(u8, text, "Do X") != null);
+    try std.testing.expect(std.mem.indexOf(u8, text, "Minor nit") != null);
+    try std.testing.expect(std.mem.indexOf(u8, text, "blocking: true") != null);
+    try std.testing.expect(std.mem.indexOf(u8, text, "blocking: false") != null);
+    // #1 (worker's) sorts before #3 (item-number order, carried 16).
+    try std.testing.expect(std.mem.indexOf(u8, text, "Do X").? < std.mem.indexOf(u8, text, "Minor nit").?);
+
+    // #2, addressed to reviewer — excluded (the exclusion scenario).
+    try std.testing.expect(std.mem.indexOf(u8, text, "Review Y") == null);
+    // #4, closed — excluded (derived state, not raw record presence).
+    try std.testing.expect(std.mem.indexOf(u8, text, "Old task") == null);
+
+    // The NEXT narrative.
+    try std.testing.expect(std.mem.indexOf(u8, text, "Land block 6B") != null);
+
+    // The remediation brief — latest for worker's block (6, 6B), even
+    // though it is addressed to reviewer, not worker (ruling point 2).
+    try std.testing.expect(std.mem.indexOf(u8, text, "Fix the nits before landing.") != null);
+    // Superseded: Brief B itself, Brief A, and the same-label-wrong-section
+    // decoy must not appear.
+    try std.testing.expect(std.mem.indexOf(u8, text, "Implement the rendering block now.") == null);
+    try std.testing.expect(std.mem.indexOf(u8, text, "Focus on foundational item first.") == null);
+    try std.testing.expect(std.mem.indexOf(u8, text, "Unrelated section nine content.") == null);
+}
+
+test "resume --json carries the same items, next, and brief as the text form (D15)" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var diag: record.Diagnostics = .init(std.testing.allocator);
+    defer diag.deinit();
+    try seedResumeFixture(std.testing.allocator, tmp.dir, std.testing.io, &diag);
+
+    var stdin_file = try openStdinStandin(tmp.dir, std.testing.io, "");
+    defer stdin_file.close(std.testing.io);
+    var out: Io.Writer.Allocating = .init(std.testing.allocator);
+    defer out.deinit();
+    var err_out: Io.Writer.Allocating = .init(std.testing.allocator);
+    defer err_out.deinit();
+
+    const code = run(
+        std.testing.allocator,
+        std.testing.io,
+        tmp.dir,
+        stdin_file,
+        test_ts,
+        &.{ "--log", "DEVLOG.jsonl", "resume", "--role", "worker", "--json" },
+        &out.writer,
+        &err_out.writer,
+    );
+    try std.testing.expectEqual(@as(u8, 0), code);
+
+    var parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, out.written(), .{});
+    defer parsed.deinit();
+    const root = parsed.value.object;
+
+    try std.testing.expectEqualStrings("Land block 6B, then close section 6.", root.get("next").?.object.get("body").?.string);
+
+    const items = root.get("items").?.array;
+    try std.testing.expectEqual(@as(usize, 2), items.items.len);
+    try std.testing.expectEqual(@as(i64, 1), items.items[0].object.get("number").?.integer);
+    try std.testing.expectEqual(@as(i64, 3), items.items[1].object.get("number").?.integer);
+    const opened1 = items.items[0].object.get("item").?.object;
+    try std.testing.expect(opened1.get("blocking").?.bool);
+    const opened3 = items.items[1].object.get("item").?.object;
+    try std.testing.expect(!opened3.get("blocking").?.bool);
+
+    const brief = root.get("brief").?.object;
+    try std.testing.expectEqualStrings("brief", brief.get("kind").?.string);
+    try std.testing.expectEqualStrings("Fix the nits before landing.", brief.get("body").?.string);
+    try std.testing.expectEqualStrings("reviewer", brief.get("to").?.string);
+    try std.testing.expectEqualStrings("6", brief.get("section").?.string);
+    try std.testing.expectEqualStrings("6B", brief.get("block").?.string);
+}
+
+test "resume for a role never briefed has no block: the brief is plainly absent, not an error (ruling point 4)" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var diag: record.Diagnostics = .init(std.testing.allocator);
+    defer diag.deinit();
+    try seedResumeFixture(std.testing.allocator, tmp.dir, std.testing.io, &diag);
+
+    var stdin_file = try openStdinStandin(tmp.dir, std.testing.io, "");
+    defer stdin_file.close(std.testing.io);
+
+    {
+        var out: Io.Writer.Allocating = .init(std.testing.allocator);
+        defer out.deinit();
+        var err_out: Io.Writer.Allocating = .init(std.testing.allocator);
+        defer err_out.deinit();
+        const code = run(
+            std.testing.allocator,
+            std.testing.io,
+            tmp.dir,
+            stdin_file,
+            test_ts,
+            &.{ "--log", "DEVLOG.jsonl", "resume", "--role", "architect" },
+            &out.writer,
+            &err_out.writer,
+        );
+        try std.testing.expectEqual(@as(u8, 0), code);
+        const text = out.written();
+        try std.testing.expect(std.mem.indexOf(u8, text, "brief: none") != null);
+        try std.testing.expect(std.mem.indexOf(u8, text, "open items (0)") != null);
+    }
+    {
+        var out: Io.Writer.Allocating = .init(std.testing.allocator);
+        defer out.deinit();
+        var err_out: Io.Writer.Allocating = .init(std.testing.allocator);
+        defer err_out.deinit();
+        const code = run(
+            std.testing.allocator,
+            std.testing.io,
+            tmp.dir,
+            stdin_file,
+            test_ts,
+            &.{ "--log", "DEVLOG.jsonl", "resume", "--role", "architect", "--json" },
+            &out.writer,
+            &err_out.writer,
+        );
+        try std.testing.expectEqual(@as(u8, 0), code);
+        var parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, out.written(), .{});
+        defer parsed.deinit();
+        const root = parsed.value.object;
+        try std.testing.expectEqual(std.json.Value{ .null = {} }, root.get("brief").?);
+        try std.testing.expectEqual(@as(usize, 0), root.get("items").?.array.items.len);
+    }
+}
+
+test "status shows every open item regardless of addressee, with blocking distinguishable, and has no brief concept (next-state)" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var diag: record.Diagnostics = .init(std.testing.allocator);
+    defer diag.deinit();
+    try seedResumeFixture(std.testing.allocator, tmp.dir, std.testing.io, &diag);
+
+    var stdin_file = try openStdinStandin(tmp.dir, std.testing.io, "");
+    defer stdin_file.close(std.testing.io);
+
+    {
+        var out: Io.Writer.Allocating = .init(std.testing.allocator);
+        defer out.deinit();
+        var err_out: Io.Writer.Allocating = .init(std.testing.allocator);
+        defer err_out.deinit();
+        const code = run(
+            std.testing.allocator,
+            std.testing.io,
+            tmp.dir,
+            stdin_file,
+            test_ts,
+            &.{ "--log", "DEVLOG.jsonl", "status" },
+            &out.writer,
+            &err_out.writer,
+        );
+        try std.testing.expectEqual(@as(u8, 0), code);
+        const text = out.written();
+        try std.testing.expect(std.mem.indexOf(u8, text, "Do X") != null);
+        try std.testing.expect(std.mem.indexOf(u8, text, "Review Y") != null);
+        try std.testing.expect(std.mem.indexOf(u8, text, "Minor nit") != null);
+        try std.testing.expect(std.mem.indexOf(u8, text, "Old task") == null);
+        try std.testing.expect(std.mem.indexOf(u8, text, "blocking: true") != null);
+        try std.testing.expect(std.mem.indexOf(u8, text, "blocking: false") != null);
+        // status has no brief concept at all — never rendered.
+        try std.testing.expect(std.mem.indexOf(u8, text, "brief") == null);
+    }
+    {
+        var out: Io.Writer.Allocating = .init(std.testing.allocator);
+        defer out.deinit();
+        var err_out: Io.Writer.Allocating = .init(std.testing.allocator);
+        defer err_out.deinit();
+        const code = run(
+            std.testing.allocator,
+            std.testing.io,
+            tmp.dir,
+            stdin_file,
+            test_ts,
+            &.{ "--log", "DEVLOG.jsonl", "status", "--json" },
+            &out.writer,
+            &err_out.writer,
+        );
+        try std.testing.expectEqual(@as(u8, 0), code);
+        var parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, out.written(), .{});
+        defer parsed.deinit();
+        const root = parsed.value.object;
+        const items = root.get("items").?.array;
+        try std.testing.expectEqual(@as(usize, 3), items.items.len);
+        try std.testing.expectEqual(@as(i64, 1), items.items[0].object.get("number").?.integer);
+        try std.testing.expectEqual(@as(i64, 2), items.items[1].object.get("number").?.integer);
+        try std.testing.expectEqual(@as(i64, 3), items.items[2].object.get("number").?.integer);
+        // Reviewer nit (block 6B): the `blocking` key, distinguishable in
+        // JSON as `next-state` requires, not just in the text form.
+        try std.testing.expect(items.items[0].object.get("item").?.object.get("blocking").?.bool);
+        try std.testing.expect(!items.items[1].object.get("item").?.object.get("blocking").?.bool);
+        try std.testing.expect(!items.items[2].object.get("item").?.object.get("blocking").?.bool);
+        // status's JSON carries no "brief" key at all — not even null.
+        try std.testing.expectEqual(@as(?std.json.Value, null), root.get("brief"));
+    }
+}
+
+test "closing an open item removes it from the next status, with no new NEXT recorded (next-state)" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var diag: record.Diagnostics = .init(std.testing.allocator);
+    defer diag.deinit();
+    _ = try log.appendHeader(
+        std.testing.allocator,
+        std.testing.io,
+        tmp.dir,
+        "DEVLOG.jsonl",
+        "t0",
+        "devlog 0.1.0",
+        .{ .change = "x", .roles = &.{ "architect", "worker" }, .closers = &.{"architect"} },
+        &diag,
+    );
+    _ = try log.appendRecord(std.testing.allocator, std.testing.io, tmp.dir, "DEVLOG.jsonl", record.Record{ .next = .{
+        .common = .{ .seq = 0, .ts = "t1", .role = "architect", .body = "Steady narrative, unchanged by the close below." },
+    } }, &diag);
+    _ = try log.appendItem(std.testing.allocator, std.testing.io, tmp.dir, "DEVLOG.jsonl", record.Record{ .item = .{
+        .common = .{ .seq = 0, .ts = "t2", .role = "architect", .to = "worker", .body = "Transient open item" },
+        .item = 0,
+        .type = .task,
+        .blocking = false,
+    } }, &diag);
+
+    var stdin_file = try openStdinStandin(tmp.dir, std.testing.io, "");
+    defer stdin_file.close(std.testing.io);
+
+    {
+        var out: Io.Writer.Allocating = .init(std.testing.allocator);
+        defer out.deinit();
+        var err_out: Io.Writer.Allocating = .init(std.testing.allocator);
+        defer err_out.deinit();
+        const code = run(
+            std.testing.allocator,
+            std.testing.io,
+            tmp.dir,
+            stdin_file,
+            test_ts,
+            &.{ "--log", "DEVLOG.jsonl", "status" },
+            &out.writer,
+            &err_out.writer,
+        );
+        try std.testing.expectEqual(@as(u8, 0), code);
+        try std.testing.expect(std.mem.indexOf(u8, out.written(), "Transient open item") != null);
+        try std.testing.expect(std.mem.indexOf(u8, out.written(), "Steady narrative") != null);
+    }
+
+    _ = try log.appendRecord(std.testing.allocator, std.testing.io, tmp.dir, "DEVLOG.jsonl", record.Record{ .close = .{
+        .common = .{ .seq = 0, .ts = "t3", .role = "architect", .body = "no longer needed" },
+        .item = 1,
+        .state = .superseded,
+    } }, &diag);
+
+    {
+        var out: Io.Writer.Allocating = .init(std.testing.allocator);
+        defer out.deinit();
+        var err_out: Io.Writer.Allocating = .init(std.testing.allocator);
+        defer err_out.deinit();
+        const code = run(
+            std.testing.allocator,
+            std.testing.io,
+            tmp.dir,
+            stdin_file,
+            test_ts,
+            &.{ "--log", "DEVLOG.jsonl", "status" },
+            &out.writer,
+            &err_out.writer,
+        );
+        try std.testing.expectEqual(@as(u8, 0), code);
+        // The item is gone — no new NEXT was recorded, so the same
+        // narrative is still current.
+        try std.testing.expect(std.mem.indexOf(u8, out.written(), "Transient open item") == null);
+        try std.testing.expect(std.mem.indexOf(u8, out.written(), "Steady narrative") != null);
+        try std.testing.expect(std.mem.indexOf(u8, out.written(), "open items (0)") != null);
+    }
+}
+
+test "resume's and status's read stays small when the log has accumulated many records but few items are open (log-retrieval boundedness)" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var diag: record.Diagnostics = .init(std.testing.allocator);
+    defer diag.deinit();
+    _ = try log.appendHeader(
+        std.testing.allocator,
+        std.testing.io,
+        tmp.dir,
+        "DEVLOG.jsonl",
+        "t0",
+        "devlog 0.1.0",
+        .{ .change = "x", .roles = &.{ "architect", "worker" }, .closers = &.{"architect"} },
+        &diag,
+    );
+    _ = try log.appendRecord(std.testing.allocator, std.testing.io, tmp.dir, "DEVLOG.jsonl", record.Record{ .next = .{
+        .common = .{ .seq = 0, .ts = "t1", .role = "architect", .body = "Short narrative." },
+    } }, &diag);
+
+    // A large volume of history: 60 unaddressed posts, none of which are
+    // items and none of which are open — the read's size must track the
+    // one open item below, not this history.
+    var buf: [64]u8 = undefined;
+    var n: usize = 0;
+    while (n < 60) : (n += 1) {
+        const body_text = try std.fmt.bufPrint(&buf, "post body number {d}, padding out the history", .{n});
+        _ = try log.appendRecord(std.testing.allocator, std.testing.io, tmp.dir, "DEVLOG.jsonl", record.Record{ .post = .{
+            .common = .{ .seq = 0, .ts = "t2", .role = "architect", .body = body_text },
+        } }, &diag);
+    }
+    _ = try log.appendItem(std.testing.allocator, std.testing.io, tmp.dir, "DEVLOG.jsonl", record.Record{ .item = .{
+        .common = .{ .seq = 0, .ts = "t3", .role = "architect", .to = "worker", .body = "The one open item" },
+        .item = 0,
+        .type = .task,
+        .blocking = false,
+    } }, &diag);
+
+    var stdin_file = try openStdinStandin(tmp.dir, std.testing.io, "");
+    defer stdin_file.close(std.testing.io);
+
+    inline for (.{ "status", "resume" }) |cmd| {
+        var out: Io.Writer.Allocating = .init(std.testing.allocator);
+        defer out.deinit();
+        var err_out: Io.Writer.Allocating = .init(std.testing.allocator);
+        defer err_out.deinit();
+        const args: []const [:0]const u8 = if (std.mem.eql(u8, cmd, "resume"))
+            &.{ "--log", "DEVLOG.jsonl", "resume", "--role", "worker" }
+        else
+            &.{ "--log", "DEVLOG.jsonl", "status" };
+        const code = run(std.testing.allocator, std.testing.io, tmp.dir, stdin_file, test_ts, args, &out.writer, &err_out.writer);
+        try std.testing.expectEqual(@as(u8, 0), code);
+        const text = out.written();
+        try std.testing.expect(std.mem.indexOf(u8, text, "The one open item") != null);
+        try std.testing.expect(std.mem.indexOf(u8, text, "open items (1)") != null);
+        // None of the 60 padding posts leaked into the read.
+        try std.testing.expect(std.mem.indexOf(u8, text, "padding out the history") == null);
+        // The read stays small: nowhere near what dumping 60+ records
+        // would cost, regardless of exactly how this renderer formats one
+        // item.
+        try std.testing.expect(text.len < 2000);
+    }
+}
+
+test "resume against a brief missing 'section'/'block' reports a diagnostic instead of panicking (block 6B review fix)" {
+    // The reviewer's repro, reproduced as a test: a hand-written log (not
+    // one this CLI's own `runBrief` could ever produce, since that
+    // requires `--section` and `--block`) carries a `brief` with `to` but
+    // neither field. Before this fix, `findLatestBriefForBlock` and
+    // `runResume` force-unwrapped both fields and the process aborted
+    // (SIGABRT, exit 134). It must now report a plain diagnostic and a
+    // non-zero exit — and this test must fail (by crashing the whole
+    // suite) if `state.derive`'s `BriefMissingKey` fault is ever removed.
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var diag: record.Diagnostics = .init(std.testing.allocator);
+    defer diag.deinit();
+    _ = try log.appendHeader(
+        std.testing.allocator,
+        std.testing.io,
+        tmp.dir,
+        "DEVLOG.jsonl",
+        "t0",
+        "devlog 0.1.0",
+        .{ .change = "x", .roles = &.{ "architect", "worker" }, .closers = &.{"architect"} },
+        &diag,
+    );
+    _ = try log.appendRecord(std.testing.allocator, std.testing.io, tmp.dir, "DEVLOG.jsonl", record.Record{ .brief = .{
+        .common = .{ .seq = 0, .ts = "t1", .role = "architect", .to = "worker", .body = "malformed: no section, no block" },
+    } }, &diag);
+
+    var stdin_file = try openStdinStandin(tmp.dir, std.testing.io, "");
+    defer stdin_file.close(std.testing.io);
+    var out: Io.Writer.Allocating = .init(std.testing.allocator);
+    defer out.deinit();
+    var err_out: Io.Writer.Allocating = .init(std.testing.allocator);
+    defer err_out.deinit();
+
+    const code = run(
+        std.testing.allocator,
+        std.testing.io,
+        tmp.dir,
+        stdin_file,
+        test_ts,
+        &.{ "--log", "DEVLOG.jsonl", "resume", "--role", "worker" },
+        &out.writer,
+        &err_out.writer,
+    );
+    try std.testing.expectEqual(@as(u8, 1), code);
+    try std.testing.expect(std.mem.indexOf(u8, err_out.written(), "brief") != null);
+    try std.testing.expect(std.mem.indexOf(u8, err_out.written(), "section") != null);
+}
+
+test "status's and resume's 'no NEXT ever recorded' text branch renders '(none recorded)' (carried gap, block 6B review fix)" {
+    // Flagged by the worker rather than found by review: nothing in this
+    // section's other fixtures ever calls `status`/`resume` before a
+    // `next` has been posted, so `renderCurrentStateText`'s "no NEXT ever
+    // recorded" branch was correct by inspection only. This fixture posts
+    // no `next` record at all.
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var diag: record.Diagnostics = .init(std.testing.allocator);
+    defer diag.deinit();
+    _ = try log.appendHeader(
+        std.testing.allocator,
+        std.testing.io,
+        tmp.dir,
+        "DEVLOG.jsonl",
+        "t0",
+        "devlog 0.1.0",
+        .{ .change = "x", .roles = &.{ "architect", "worker" }, .closers = &.{"architect"} },
+        &diag,
+    );
+
+    var stdin_file = try openStdinStandin(tmp.dir, std.testing.io, "");
+    defer stdin_file.close(std.testing.io);
+
+    inline for (.{ "status", "resume" }) |cmd| {
+        var out: Io.Writer.Allocating = .init(std.testing.allocator);
+        defer out.deinit();
+        var err_out: Io.Writer.Allocating = .init(std.testing.allocator);
+        defer err_out.deinit();
+        const args: []const [:0]const u8 = if (std.mem.eql(u8, cmd, "resume"))
+            &.{ "--log", "DEVLOG.jsonl", "resume", "--role", "worker" }
+        else
+            &.{ "--log", "DEVLOG.jsonl", "status" };
+        const code = run(std.testing.allocator, std.testing.io, tmp.dir, stdin_file, test_ts, args, &out.writer, &err_out.writer);
+        try std.testing.expectEqual(@as(u8, 0), code);
+        try std.testing.expect(std.mem.indexOf(u8, out.written(), "(none recorded)") != null);
+    }
+
+    // Architect ruling (block 6B, review re-audit): the ruling that closed
+    // this gap was scoped to "the text branch" too narrowly — the gap is
+    // D15 parity, which is both renderings by definition. Assert the JSON
+    // form of "no NEXT ever recorded" for both commands too.
+    inline for (.{ "status", "resume" }) |cmd| {
+        var out: Io.Writer.Allocating = .init(std.testing.allocator);
+        defer out.deinit();
+        var err_out: Io.Writer.Allocating = .init(std.testing.allocator);
+        defer err_out.deinit();
+        const args: []const [:0]const u8 = if (std.mem.eql(u8, cmd, "resume"))
+            &.{ "--log", "DEVLOG.jsonl", "resume", "--role", "worker", "--json" }
+        else
+            &.{ "--log", "DEVLOG.jsonl", "status", "--json" };
+        const code = run(std.testing.allocator, std.testing.io, tmp.dir, stdin_file, test_ts, args, &out.writer, &err_out.writer);
+        try std.testing.expectEqual(@as(u8, 0), code);
+        var parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, out.written(), .{});
+        defer parsed.deinit();
+        try std.testing.expectEqual(@as(?std.json.Value, .null), parsed.value.object.get("next"));
+    }
+}
+
+test "resume --help and status --help each print their own usage" {
+    try expectRun(std.testing.allocator, &.{ "resume", "--help" }, 0, "devlog resume", null);
+    try expectRun(std.testing.allocator, &.{ "resume", "--help" }, 0, "--role", null);
+    try expectRun(std.testing.allocator, &.{ "status", "--help" }, 0, "devlog status", null);
+    try expectRun(std.testing.allocator, &.{ "status", "--help" }, 0, "--json", null);
 }

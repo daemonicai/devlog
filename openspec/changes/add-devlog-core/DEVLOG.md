@@ -7769,6 +7769,456 @@ missing log reports plainly. Zig 0.16 against the real API. No new dependencies,
 **Done-gates.** `make gates` → `GATES_EXIT:0`, quoting every individual `LABEL_EXIT:<n>` line, and the
 counted test total. Then `→ @reviewer`. No commit, no ticks.
 
+**[worker]** **Block 6B (`6.1`, `6.5`) implemented.**
+
+**One shared renderer, not two.** Added `BriefSlot` (a tagged union: `.not_applicable` for `status`,
+`.none`/`.found` for `resume`) plus `renderCurrentStateText`/`writeCurrentStateJson` — the single
+parameterised "NEXT narrative plus a set of items" renderer the brief asked for. Both `runResume` and
+`runStatus` select and order their own `items: []const state_mod.Item` and call the same pair. Per item
+and per brief, they reuse the exact renderers `show` already exercises and this block does not touch:
+`writeItemText`/`writeItemJson` per item, `renderRecordText`/`record.write` for NEXT and the brief. No new
+record emitter, no second item renderer — `status` and `resume` cannot disagree about the same item
+because they render it through the same code.
+
+**`6.1` — `resume --role <r>`.** Implements the ruling exactly: `findBriefToRole` scans
+`Indexes.byKind(.brief)` (an `EnumArray` bucket, not a hash map) for the latest brief addressed to the
+role, giving its `(section, block)`; `findLatestBriefForBlock` scans the same bucket a second time for the
+latest brief matching *both* fields — never the bare block label alone. A remediation brief addressed to
+someone else legitimately wins over the role's own original brief. No brief ever addressed to the role →
+`BriefSlot.none`, rendered as a plain absence, not an error or empty field.
+
+**Item selection avoids `by_addressee` entirely (carried 16).** Both commands filter
+`derived.indexes.byState(.open)` — already positional, `#n` order — rather than touching the hash-map
+addressee index at all: `resume` by `opened.common.to == role`, `status` not at all (every open item). No
+hash-map enumeration anywhere in this block, so the stable-order requirement is satisfied by construction
+rather than by care.
+
+**`6.5` — `status`.** NEXT plus every open item, `BriefSlot.not_applicable` — no `brief` key in JSON at all
+(not even `null`, which could read as "checked, found nothing"), no brief text in either rendering.
+
+**D15.** `--json` widened from `wants_show`-only to `wants_show or wants_resume or wants_status`. Both
+commands load via `log.openReadOnly` — never `openLocked` — same as `show`.
+
+**Retargeted 3 pre-existing tests** that asserted `resume`/`status` were still-unimplemented placeholders
+(now real) to `list`, the next still-unimplemented command, in the same style as the 4C→6A retargeting
+already in the file.
+
+**Tests added (10), covering everything the brief called out by name:**
+
+- Boundedness (`log-retrieval`): 60 padding posts + 1 open item — the read stays small (`text.len < 2000`,
+  none of the padding bodies leak in), for both `resume` and `status`.
+- Exclusion: an item addressed to another role never appears in `resume`'s output.
+- `next-state` "closing an item changes what's presented": close an open item, no new NEXT — it's gone
+  from the next `status`, narrative unchanged.
+- The full ruling (points 1–4): a 4-brief fixture (an earlier brief to the role, the role's latest brief,
+  a remediation brief to someone else on the same block, and a same-label-wrong-section decoy posted last)
+  proves the block resolution, the "latest for the block may be addressed elsewhere" step, and the
+  (section, block)-pair keying, not the bare label.
+- Blocking distinguishable, in both renderings, both commands.
+- D15 parity (JSON structure asserted field-by-field against the text form).
+- Required `--role`, missing-log (creates nothing, durable-format), `--help` for both.
+
+**Gates.** `BUILD_EXIT:0` `TEST_EXIT:0` `FORMAT_EXIT:0` `VALIDATE_EXIT:0` `GATES_EXIT:0` — **211/211** tests
+pass (10 new), counted via `zig build test --summary all`.
+
+**One untested path, flagged rather than fixed:** `renderCurrentStateText`'s "no NEXT ever recorded"
+branch (`(none recorded)`) is unexercised — every fixture in this block posts a NEXT before calling
+`status`/`resume`. Correct by inspection (mirrors `show`'s missing-record handling), but not pinned by a
+test. Flagging for the architect/reviewer to decide whether it's worth a fixture in this block or can ride
+with the section.
+
+Only `src/main.zig` changed — no `tasks.md`, no `Makefile`.
+
+No commit, no ticks. → @reviewer
+
+**[reviewer]** **Block 6B (`6.1`, `6.5`) audited. Verdict: Request changes.**
+
+**Gates, re-run independently.** `BUILD_EXIT:0` `TEST_EXIT:0` `FORMAT_EXIT:0` `VALIDATE_EXIT:0`
+`GATES_EXIT:0`. Test total counted, not quoted: `zig build test --summary all` → `211/211 tests passed`,
+matching the worker's number.
+
+**Blocker — `resume` panics the whole process on a `brief` record with no `section`/`block`, which the
+parser does not forbid (`main.zig:1450`, `main.zig:1586`).**
+
+`findLatestBriefForBlock` (`main.zig:1450`) force-unwraps `b.common.section.?`/`b.common.block.?`, and
+`runResume` (`main.zig:1586`) force-unwraps `rb.common.section.?`/`rb.common.block.?`, on the stated
+invariant that "every brief in `briefs` has both fields set" because `devlog brief` requires
+`--section`/`--block`/`--to` (`runBrief`, confirmed at `main.zig:1007-1010`). That is true only for
+briefs *this build's CLI wrote*. It is not enforced by the read path: `record.parse`'s `.brief` case
+(`record.zig:767`) does no kind-specific field validation at all — `section`/`block`/`to` are parsed as
+`optionalString` for every kind (`record.zig:734-736`), and unlike `item`/`close`/`verdict`
+(`record.zig:770-809`, each validated with `requireInt`/`requireString`/`requireBool` →
+`error.MissingField` on a missing field), `.brief` has no equivalent check. A `brief` record already on
+disk without `section`/`block` — from a hand-edited log, a future/older tool version, or a partially-
+written record — parses successfully with `section = null`, `block = null`.
+
+Proved with a real repro, not just reasoning: built the binary, hand-wrote a two-line `DEVLOG.jsonl`
+(header + one `brief` record with `to` but no `section`/`block`), ran
+`devlog --log DEVLOG.jsonl resume --role worker` against it:
+
+```
+thread panic: attempt to use null value
+src/main.zig:1586:70: in runResume
+        .{ .found = findLatestBriefForBlock(briefs, rb.common.section.?, rb.common.block.?).? }
+```
+
+Exit code 134 (SIGABRT) — not a diagnostic, not a non-zero `fail()`, no message naming the offending
+record. This is exactly the class the audit checklist names: "no `unreachable` where an input could
+land," and a failure path that must report plainly instead of crashing.
+
+This is not a hypothetical edge case pulled from nowhere — it directly contradicts this same diff's own
+established convention two lines up the file. The `to` field on the very same `Attributed.common` struct
+is handled safely throughout this block: `findBriefToRole` (`main.zig:1431`) does
+`b.common.to orelse continue`, and `runResume`'s item filter (`main.zig:1579`) does
+`it.opened.common.to orelse continue`. `renderRecordText`, entirely untouched by this diff, treats
+`section`/`block` the same safe way at `main.zig:1282-1283`: `if (common.section) |s| ...`. The two `.?`
+unwraps in the new ruling-lookup code are the only place in the touched surface that assumes instead of
+guards.
+
+**Fix belongs in this block's own diff, not in `record.zig`.** `findLatestBriefForBlock`'s and
+`runResume`'s `.?` unwraps should become `orelse` guards (mirroring `findBriefToRole`'s own style), with
+a malformed brief treated as "does not match"/reported via `Diagnostics` rather than crashing — same
+posture `show`/`list` already take toward malformed input elsewhere in the change. (Separately, worth
+flagging to the architect: `record.zig`'s `.brief` parse case has no field validation at all, unlike
+every other kind with kind-specific fields — that's section 4/6A territory, not this diff's to fix, but
+it's the root cause and should get a companion fix at some point so this class of bug can't recur at a
+different call site.)
+
+**The ruling itself — implemented correctly, and proved by mutation, not inspection.** All four numbered
+parts of the architect's brief ruling are present and correct:
+- Part 1 (`findBriefToRole`, `main.zig:1427-1435`): latest brief *addressed to the role*, scanning
+  `Indexes.byKind(.brief)` in log order, keeping the last match. Correct.
+- Part 2 (`findLatestBriefForBlock`, `main.zig:1446-1455`): latest brief *for that block*, which may be
+  addressed to someone else. `seedResumeFixture` (`main.zig:5272-5329`) builds exactly the fixture this
+  ruling needs — Brief A (earlier, to worker, different block), Brief B (latest to worker), a remediation
+  brief (later, same block, to reviewer), and a same-label-wrong-section decoy (later still, to
+  reviewer) — and the assertions at `main.zig:5374-5381` confirm the remediation brief wins over Brief B
+  despite being addressed to someone else. Verified this has real power, not just presence: in a scratch
+  copy, changed the `.found` branch to return the step-1 brief (`rb`) directly instead of calling
+  `findLatestBriefForBlock` — killed exactly the two tests built to catch it (`resume returns open
+  items...` and `resume --json carries the same items...`), nothing else.
+- Part 3 (section+block pair, never bare label): the decoy brief (`section=9, block=6B`) is asserted
+  absent from the output (`main.zig:5381`) — proves the pair-keying, not the label alone.
+- Part 4 (no brief ever addressed to role → plainly absent): `main.zig:5433-5485` asserts `"brief: none"`
+  in text and JSON `null` for a role (`architect`) that was never briefed, distinct from an error.
+
+**Boundedness — a real, mutation-proven pin, not something that would hold regardless.**
+`main.zig:5630-5691` seeds 60 unaddressed `post` records plus one open item, asserts the padding text
+never appears and `text.len < 2000`, for both `status` and `resume`. Verified this has power: in a
+scratch copy, made `runStatus`'s text branch also dump every raw record's body before rendering — killed
+the boundedness test specifically on the `"padding out the history"` assertion, exactly as designed,
+alongside two other tests that also depend on closed/unaddressed exclusion.
+
+**Single-renderer claim — confirmed genuine.** `renderCurrentStateText`/`writeCurrentStateJson`
+(`main.zig:1467-1532`) are the only renderers for the "NEXT + items [+ brief]" shape; both `runResume`
+and `runStatus` call them, and per-item rendering goes through `writeItemText`/`writeItemJson`
+(unmodified from 6A), which themselves call `renderRecordText`/`record.write`. `status` and `resume`
+cannot disagree about the same item because there is exactly one code path rendering it, in both text
+and JSON.
+
+**Carried 16 — genuinely avoided.** Confirmed against `state.zig`: `by_kind` and `by_state` are
+`std.EnumArray`s built by a single ordered pass over `records`/`items` (`state.zig:270-284`), so
+`byKind(.brief)` and `byState(.open)` are stable, log-ordered, and not hash-map enumerations.
+`by_addressee` (the hash map) is untouched by this block's new code — `resume`'s role filter runs off
+`byState(.open)` with a manual `to == role` check, not off `byAddressee`.
+
+**D15 parity.** Text and JSON share the same underlying renderers for every field this block adds (next,
+items, brief), so a divergence in one would be a divergence in the other by construction — already
+exercised by the mutation-tested D15 fixtures from 6A (verdict's `commit` field) and now extended to
+`.brief`/`.next` kinds specifically by this block's own fixtures, which weren't exercised through
+`show --seq` before. One coverage gap: `status --json`'s test (`main.zig:5523-5549`) checks item
+count/numbers/brief-absence but doesn't check the `blocking` key in JSON — low risk since it's the same
+`writeItemJson` already proven for `resume --json` and `show --item --json`, but worth a one-line
+addition (nit, not blocking).
+
+**The worker's flagged gap — same class as 6A's, not a lesser one; recommend closing in-block per the
+established precedent.** `renderCurrentStateText`'s "no NEXT ever recorded" branch (`main.zig:1477`,
+`"(none recorded)"`) and `writeCurrentStateJson`'s matching `null` branch (`main.zig:1515`) are
+unexercised by any fixture in this block — every fixture posts a NEXT before calling `status`/`resume`.
+The underlying derivation (`currentNext() == null`) is independently proven in `state.zig:801`; what's
+untested is purely this block's rendering of that case in both forms.
+
+Applying the same reasoning the architect used to require 6A's "closes: none yet" fix in-block rather
+than carried: nothing in 6C (`list`/`refs`) touches `renderCurrentStateText`/`writeCurrentStateJson` —
+this renderer is exclusive to `resume`/`status`. A gap here is not discharged by the section's later
+work; it is discharged only if someone remembers, which is the exact failure mode the architect's 6A
+ruling was written to close off. The fixture is trivial (header, no NEXT ever posted, call
+`status`/`resume`, assert `"(none recorded)"` in text and `"next":null` in JSON) — the same order of
+cost as 6A's fix. I'd treat this the same way: close it in-block, not carry it.
+
+**Findings requiring action before re-audit:**
+1. **Blocker** — `main.zig:1450`, `main.zig:1586`: replace the `.section.?`/`.block.?` force-unwraps
+   with guarded handling (a malformed brief without `section`/`block` must not crash the process; treat
+   it as non-matching or surface a diagnostic, matching `findBriefToRole`'s own `orelse` style two lines
+   above). Add a fixture proving `resume` reports plainly rather than panicking against a hand-written
+   log with such a record.
+2. Add the "no NEXT ever recorded" fixture for both `status` and `resume`, text and JSON (mirrors the 6A
+   precedent for the analogous gap).
+3. Nit: add a `blocking`-key JSON assertion to the `status --json` test for parity completeness (low
+   priority, shared renderer already proven elsewhere).
+
+**Architectural note (not blocking this block):** the root cause of finding 1 is that `record.zig`'s
+`.brief` parse case (`record.zig:767`) does no kind-specific field validation, unlike
+`item`/`close`/`verdict`. Worth a companion fix at some point — outside this diff, flagging for the
+architect to route (section 4/6A territory).
+
+Scope check: only `src/main.zig` and `DEVLOG.md` changed; `tasks.md` and `Makefile` untouched; no
+third-party dependency; `openReadOnly` used throughout, never `openLocked`; nothing persisted beyond the
+log.
+
+→ @worker
+
+**[architect]** **Ruling — the fix is a fault in `derive`, not a guard in `runResume`. And do not touch
+the parser.**
+
+Blocker confirmed, and the reviewer's repro is the right kind of evidence: a panic, exit 134, from a
+hand-written log. I checked the deciding fact myself — `runBrief` requires `--section` and `--block`
+(`src/main.zig:1008-1009`), exactly as `runVerdict` does (`:1147-1148`). **That makes this the same class
+as `VerdictMissingKey`, and it gets the same answer.**
+
+**This is the failure mode the section-5 standing rule was written to prevent, arriving from the other
+direction.** The rule has two halves: *where the write boundary guarantees something, the derivation
+faults rather than silently tolerating it* — **and** *none of those guarantees hold for a hand-written
+log*. A `.?` on a write-boundary invariant honours neither half. It does not fault, and it does not
+tolerate; it aborts. Two `.?`s survived a diff whose own author had written `orelse continue` for the
+sibling field two lines away, which tells you this is a hazard of habit rather than of understanding.
+
+**What to implement:**
+
+1. **`state.derive` gains a fault for a `brief` record missing `section` or `block`** — a sibling to
+   `ItemNumberMismatch` / `CloseTargetMissing` / `VerdictMissingKey`, in the same error set, with the same
+   diagnostic shape (name the record's `seq` and which field is absent). Carried 17 already wired
+   `DeriveError` to `reportLogError`, so it reports with the same message shape and exit code as every
+   other fault, and the panic becomes `devlog: …` on stderr with exit 1.
+2. **Both `.?`s go** (`src/main.zig:1450`, `:1586`). With the derive-level fault in place they are
+   unreachable, which is exactly when a force-unwrap is least justified and most likely to be preserved by
+   a later edit that changes the invariant.
+3. **The reviewer's repro becomes a test** — a log with a `brief` missing `section`/`block`, asserting a
+   graceful diagnostic and a non-zero exit rather than a panic. It must fail if the fault is removed.
+
+**Do not "fix" this in the parser, and this is the part most likely to be got wrong.** The reviewer's
+architectural note is right that `record.parse`'s `.brief` case does no kind-specific validation — but
+tightening it is the wrong move, on the reasoning already written into `Attributed`'s doc comment during
+section 3: **the parser must stay able to read whatever a legal historical write produced.** A parser that
+starts rejecting syntactically valid records because a later policy tightened is precisely the drift D14
+exists to prevent, and this log has no repair path. Policy lives at the write boundary and in the
+derivation; the parser's job is to read the file. The note is answered, not deferred.
+
+**Also in this block, per the same standard I applied in 6A:** close the "no NEXT ever recorded" text
+branch with one fixture. The reviewer confirms it is the same class — nothing later in the section
+exercises that renderer, so carrying it means it closes only if someone remembers. One standard, applied
+the same way twice.
+
+**Correction to carried 18, which this finding partly overturns.** The section-5 supervisor recorded that
+`brief`/`section` records with a null `section` were *correctly* left as a silent skip because "the write
+path does not require `section` on every kind". That reasoning does not hold for the two kinds it named:
+`runBrief` requires `--section` **and** `--block`, and `runSection` requires `--section`
+(`src/main.zig:956`). The kinds that may legitimately lack a `section` are others — `post` and `next`
+among them. Carried 18 stands only for those; for `brief` it was wrong, and this block is where it
+surfaced as a panic. Worth knowing that a supervisor note can be confidently wrong about which kinds an
+invariant covers, and that the check is one grep of the `run*` functions.
+
+Gates again on return, then `→ @reviewer`. No commit, no ticks.
+
+**[worker]** **Block 6B fix — ruling implemented, all four parts.**
+
+**1. `state.derive` gains `error.BriefMissingKey`** (`src/state.zig`): a sibling to `ItemNumberMismatch`/
+`CloseTargetMissing`/`VerdictMissingKey` in `DeriveError`, checked in the same forward-pass loop right
+after the `.verdict` arm, before `Indexes` is built. Same diagnostic shape as `VerdictMissingKey` — names
+the record's `seq` and which field (`section` or `block`) is absent. `reportLogError` already covers all
+of `DeriveError` (carried 17, already wired in section 6's first block), so this reaches the CLI as
+`devlog: brief at seq N is missing 'section'/'block'` on stderr with exit 1 — no new reporting path.
+
+**2. Both `.?`s gone.** `findLatestBriefForBlock` (`src/main.zig`, was `:1450`) now uses
+`orelse continue` on both fields, mirroring `findBriefToRole`'s own style two functions up. `runResume`
+(was `:1586`) restructures the three-unwrap expression (`rb.common.section.?`, `rb.common.block.?`, and
+the outer unwrap of `findLatestBriefForBlock`'s result — the reviewer's report named the first two;
+the third was there too and falls with them) into a block expression that `orelse .none`s out on either
+missing field. With the derive-level fault in place none of this is reachable in practice — that's the
+point: a guard here is now defending a proven invariant instead of assuming one.
+
+**3. The repro is now a test.** `resume against a brief missing 'section'/'block' reports a diagnostic
+instead of panicking (block 6B review fix)` hand-writes header + one `brief` record with `to` but no
+`section`/`block` (bypassing `runBrief`'s own requirement, same technique `seedResumeFixture`'s siblings
+use elsewhere in this file), runs `resume --role worker`, and asserts exit `1` plus `section` and `brief`
+both present on stderr. Since a panic aborts the whole test binary rather than just failing one test, this
+test's pass/fail signal *is* "did the process survive" — it will fail (by crashing the suite) if the
+`BriefMissingKey` fault is ever removed. Companion unit tests in `state.zig` (`a brief missing
+'section'/'block' is a fault...`) pin `derive` itself, mirroring the existing `verdictMissingSection`/
+`verdictMissingBlock` pair exactly, including new `briefMissingSection`/`briefMissingBlock` fixture
+helpers.
+
+**4. The "no NEXT ever recorded" text branch is closed.** One new fixture (`status`'s and `resume`'s 'no
+NEXT ever recorded' text branch renders '(none recorded)' (carried gap, block 6B review fix)`) posts a
+header with no `next` record at all, then calls both `status` and `resume`, asserting `(none recorded)`
+appears in each — the branch `renderCurrentStateText` takes when `next == null`, previously correct only
+by inspection.
+
+**Parser untouched**, per the ruling: `record.parse`'s `.brief` case still does no kind-specific
+validation. Policy stays at the write boundary (`runBrief`) and in `derive`; the parser stays able to read
+whatever a legal historical write produced.
+
+**Tests: 211 → 215** (4 new: 2 in `src/main.zig`, 2 in `src/state.zig`), counted via
+`zig build test --summary all` → `215/215 tests passed`.
+
+**Gates.** `BUILD_EXIT:0` `TEST_EXIT:0` `FORMAT_EXIT:0` `VALIDATE_EXIT:0` `GATES_EXIT:0`.
+
+Only `src/main.zig` and `src/state.zig` changed — no `tasks.md`, no `Makefile`. No commit, no ticks.
+→ @reviewer
+
+**[reviewer]** **Block 6B re-audit, after the fix. Verdict: Approve.**
+
+**Gates, re-run independently.** `BUILD_EXIT:0` `TEST_EXIT:0` `FORMAT_EXIT:0` `VALIDATE_EXIT:0`
+`GATES_EXIT:0`. Test total counted, not quoted: `zig build test --summary all` →
+`215/215 tests passed`, matching the worker's number exactly.
+
+**Ruling part 1 — `BriefMissingKey`, confirmed a true sibling.** `DeriveError`
+(`src/state.zig:343`) gained `BriefMissingKey` alongside `ItemNumberMismatch`/`CloseTargetMissing`/
+`VerdictMissingKey`. The check (`src/state.zig:515-524`) runs inside the same forward-pass `for
+(records)` loop as the `.verdict` arm, immediately after it, and `buildIndexes` — which populates
+`Indexes.byKind(.brief)` — is not called until line 574, well after that loop completes. So a
+malformed `brief` can never reach an index in the first place. Diagnostic shape matches
+`VerdictMissingKey`'s exactly: `"{kind} at seq {d} is missing '{field}'"`, naming both `seq` and the
+absent field. `reportLogError` already covers all of `DeriveError` (carried 17, wired in 6A), so this
+reaches the CLI with the same message shape and exit code as every other fault — confirmed by reading,
+not assumed.
+
+**Ruling part 2 — all three unwraps gone, and I checked the pattern, not just the two named sites.**
+`findLatestBriefForBlock` (`src/main.zig:1446-1455`) now uses `orelse continue` on both fields,
+mirroring `findBriefToRole` exactly. `runResume` (`src/main.zig:1590-1601`) restructures the block
+expression into `rb.common.section orelse break :blk .none` / `rb.common.block orelse break :blk
+.none`, then an `if (findLatestBriefForBlock(...)) |found| ... else .none` — the third unwrap (the
+outer `.?` on `findLatestBriefForBlock`'s own result, which I had not named) is confirmed gone too,
+exactly as the worker reported. Grepped the whole touched surface (`.common.` combined with `.?`) across
+both `src/main.zig` and `src/state.zig`: the only remaining hits are pre-existing test-fixture
+assertions on records the same test just constructed via the real write path (e.g.
+`post.common.section.?` at `main.zig:2339`, `brief_rec.common.to.?` at `:2795`) — known-good values
+under the writer's own invariant, not reads of untrusted log data. None are new in this diff (confirmed
+against the diff directly, not by inspection of HEAD alone). No stray force-unwrap of a write-boundary
+invariant survives anywhere in the block.
+
+**Ruling part 3 — the repro is now a test, and it has the right kind of power.** `main.zig:982-1029`
+hand-writes header + one `brief` with `to` but no `section`/`block` (bypassing `runBrief`'s own
+requirement, same technique the rest of this file uses for malformed-input fixtures), runs `resume
+--role worker`, asserts exit `1` and `stderr` contains both `"brief"` and `"section"`. Verified by
+mutation, not by reading: copied the tree to a scratch directory, removed the `BriefMissingKey` check
+from `state.zig`'s `.brief` arm entirely (the exact defect the ruling forbids — silently tolerating a
+malformed brief), rebuilt, reran. **Exactly three tests failed, nothing else**: the two new
+`state.zig` fault tests (`briefMissingSection`/`briefMissingBlock`) and this repro test in
+`main.zig` — 212/215. With the derive-level fault removed, the `orelse` guards in `runResume` catch the
+malformed brief as `.none` rather than crashing (defense in depth working as designed), so the repro
+test fails on its exit-code/message assertions rather than by crashing the suite — but it fails, which
+is what matters. This is real, targeted test power for the fault the ruling asked for.
+
+**Ruling part 4 — the "no NEXT ever recorded" branch closed, scoped to text as the architect's ruling
+actually said.** `main.zig:1031-1068` posts a header with no `next` record at all, calls both `status`
+and `resume`, and asserts `"(none recorded)"` appears in each. One nit on this below — the ruling's own
+wording narrowed this to "the text branch" (the reviewer's original finding had asked for text and
+JSON both); the worker followed the ruling as written, not a shortfall on the worker's part.
+
+**Binary-level repro re-run, not just in-process.** Built the current tree, hand-wrote a two-record log
+(`devlog header` for a valid header, then a real `devlog brief --section 6 --block 6B --to worker`
+record with `section`/`block` stripped by hand from the resulting line) and ran `resume --role worker`
+against it: `devlog: brief at seq 2 is missing 'section'`, exit `1`. No crash, no SIGABRT, and the
+directory held only the one log file afterward — no temp file, no second file created on the failure
+path. This is the same repro that previously produced `thread panic: attempt to use null value`, exit
+134, now reporting plainly.
+
+**Parser confirmed untouched.** `git diff HEAD -- src/record.zig` is empty — zero lines. Read
+`record.parse`'s `.brief` case directly (`src/record.zig:764`): still `return .{ .brief = .{ .common =
+try common.dupe(allocator) } }`, no kind-specific validation, same as before this block. The parser
+stays able to read whatever a legal historical write produced, exactly as the ruling required — this
+was not quietly "fixed" at the wrong layer.
+
+**The new fault is scoped to `.brief` only.** The `switch (rec)` in `derive`'s forward pass
+(`state.zig:472-526`) has exactly five explicit arms — `.item`, `.close`, `.verdict`, `.brief`, `.next`
+— plus `else => {}` covering `.header`, `.section`, and `.post`, none of which gained any new check.
+`post` and `next` records legitimately lacking `section` are unaffected by construction, not merely by
+luck, and the full 215/215 pass confirms nothing that legitimately lacks these fields regressed into
+faulting.
+
+**Ownership in the restructured `runResume` expression.** The `blk:` block expression
+(`main.zig:1590-1601`) allocates nothing; it only selects among `record.Record`/`BriefSlot` values that
+alias memory already owned by `opened.log.records`, itself alive until `opened.close(allocator)` runs —
+deferred, so it fires after both `writeCurrentStateJson`/`renderCurrentStateText` have read from
+`brief_slot`. No use-after-free, no double free, nothing new to leak.
+
+**Everything already approved stays intact.** Diffed the un-fix-related portions of this block's
+material (the four-part ruling's own tests, `seedResumeFixture`, the boundedness test, the
+single-renderer pair, the carried-16 discipline) against what I approved-with-request-changes
+previously: byte-for-byte the same code and tests, nothing rewritten around the fix. D15 parity for
+this block's new `.brief`/`.next` rendering was already proven by the earlier mutation (deleting
+`renderRecordText`'s `.verdict` `commit` line, from 6A) plus this block's own `resume --json` fixture
+(`main.zig:673-720`), which checks `next`, `items`, and `brief` fields against the text form's content
+in one pass.
+
+**Nits (not blocking):**
+
+1. **The JSON `null` case for `next` (`writeCurrentStateJson`, `main.zig:221-225`) is still
+   untested**, for both `status` and `resume`. The architect's ruling scoped the required fixture to
+   "the text branch" specifically, and the worker followed that instruction exactly — this is not a
+   shortfall against the ruling. But the branch is D15's territory (one derivation, two renderers) and
+   the analogous `brief:null` case *is* proven (`main.zig:771`), so this is the one asymmetry left in
+   an otherwise fully-parity-tested block. Low risk — the branch is one line, structurally identical to
+   the already-proven `brief:null` case — but worth a one-line addition (`root.get("next")` is JSON
+   `null` when no NEXT has been posted) before section 6 closes, at the architect's discretion on
+   timing.
+2. **Reviewer's prior nit 3 (a `blocking`-key assertion in the `status --json` test) is still open.**
+   Confirmed still absent (`main.zig` status-json test ends without checking `items.items[*].blocking`).
+   This was explicitly marked low-priority and was not part of the architect's four-point ruling, so
+   it's fine to carry — flagging only so it isn't lost before the section closes.
+
+**Scope check.** `git diff HEAD --stat`: `DEVLOG.md`, `src/main.zig`, `src/state.zig` only —
+`Makefile` and `tasks.md` untouched (`git diff HEAD -- Makefile tasks.md` is empty). No third-party
+dependency, nothing persisted beyond the log, `openReadOnly` used throughout.
+
+Block 6B (`6.1`, `6.5`) is clear to commit and tick.
+
+**[architect]** **Both nits close in this block too. The first one is my error, not the worker's.**
+
+**Nit 1 is a scoping mistake in my own ruling.** I wrote "close the *text* branch with one fixture" when
+the gap was D15 parity, which is by definition both renderings. The reviewer is right that the JSON
+`next == null` branch is the one asymmetry left in a block that is otherwise fully parity-tested, and
+right that it is not a worker shortfall. **Close it: the `next == null` case asserted in JSON as well as
+text, for both `status` and `resume`.** Worth recording that a ruling written slightly too narrowly
+produces exactly the gap it was written to prevent — the instruction was more specific than the principle,
+and the implementation honoured the instruction.
+
+**Nit 2 — the `blocking`-key JSON assertion for `status --json`** — closes here as well. It was carried
+as low-priority twice; `next-state` requires blocking items be distinguishable and D15 requires the two
+forms agree, so an unasserted `blocking` key in JSON sits on both. Two tiny assertions is less than the
+cost of carrying it to the section close.
+
+**Same standard, third time: an untested branch in a block's binding constraint closes in that block.**
+6A's five kinds, 6B's missing NEXT, now these two. I would rather apply one rule consistently than
+adjudicate each gap on size.
+
+**These are test-only additions to an approved block.** Add them and re-run the gates; **I will verify the
+diff and the gates myself** rather than spending a reviewer round on two assertions — the reviewer has
+already specified precisely what is missing and approved everything else. No commit, no ticks.
+
+**[worker]** **Both nits closed — test-only, `src/main.zig` only.**
+
+**Nit 1 — JSON `next == null` parity.** Extended the existing "no NEXT ever recorded" test with a second
+`inline for (.{ "status", "resume" })` pass: same header-only fixture (no `next` record posted), each
+command run with `--json`, parsed, and `root.get("next")` asserted `.null` — for both commands, alongside
+the text-form assertion already there.
+
+**Nit 2 — `blocking` key in `status --json`.** In the existing `status`/`--json` test (fixture:
+`seedResumeFixture`, items `#1` blocking `true`, `#2`/`#3` blocking `false`), added three assertions
+reading `items.items[n].object.get("item").?.object.get("blocking")` — the same path `resume --json`'s
+test already uses — for all three items, alongside the existing number/brief-absence checks.
+
+No new `test` blocks (both land as added assertions inside the two tests the reviewer named), so the count
+stays 215/215; no production code touched — `record.zig`, `state.zig`'s fix from the prior round, and
+`renderCurrentStateText`/`writeCurrentStateJson` are all unchanged by this edit.
+
+**Gates.** `BUILD_EXIT:0` `TEST_EXIT:0` `FORMAT_EXIT:0` `VALIDATE_EXIT:0` `GATES_EXIT:0` — `zig build test
+--summary all` → `215/215 tests passed`.
+
+Only `src/main.zig` changed. No commit, no ticks. Per the architect's note above, no `→ @reviewer` — the
+architect verifies the diff and gates directly.
+
 ## NEXT
 
 **[architect]** **Section 5 is CLOSED** — supervisor `Approve` on the **first** pass, no remediation

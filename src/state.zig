@@ -340,7 +340,7 @@ pub const State = struct {
     }
 };
 
-pub const DeriveError = error{ ItemNumberMismatch, CloseTargetMissing, VerdictMissingKey } || Allocator.Error;
+pub const DeriveError = error{ ItemNumberMismatch, CloseTargetMissing, VerdictMissingKey, BriefMissingKey } || Allocator.Error;
 
 fn closeStateToItemState(state: record.CloseState) ItemState {
     return switch (state) {
@@ -405,6 +405,18 @@ const BlockKeyContext = struct {
 /// an item that exists". A verdict missing either is therefore a fault,
 /// not a silently dropped grid entry: `derive` reports it via `diag` and
 /// returns `error.VerdictMissingKey`.
+///
+/// **Block 6B review fix.** A `brief` record missing `section` or `block`
+/// is the same invariant class again: `runBrief` requires both
+/// `--section` and `--block`, exactly as `runVerdict` requires
+/// `--section`/`--block`. It holds only for briefs this build's CLI wrote
+/// — not for a hand-written log — so a bare `.?` on either field at a
+/// call site reading `Indexes.byKind(.brief)` is a live panic, not a
+/// theoretical one (proved by the reviewer's repro on block 6B). `derive`
+/// reports it via `diag` and returns `error.BriefMissingKey`, naming the
+/// record's `seq` and which field is absent, before `Indexes` is ever
+/// built — so no read command downstream can observe a malformed brief in
+/// the first place.
 pub fn derive(
     allocator: Allocator,
     records: []const record.Record,
@@ -499,6 +511,16 @@ pub fn derive(
                 };
                 const key = BlockKey{ .section = section, .block = block_id };
                 if (try appendGrouped(&block_verdicts, allocator, key, vr)) try block_order.append(allocator, key);
+            },
+            .brief => |br| {
+                if (br.common.section == null) {
+                    if (diag) |d| d.set("brief at seq {d} is missing 'section'", .{br.common.seq});
+                    return error.BriefMissingKey;
+                }
+                if (br.common.block == null) {
+                    if (diag) |d| d.set("brief at seq {d} is missing 'block'", .{br.common.seq});
+                    return error.BriefMissingKey;
+                }
             },
             .next => |nr| try next_history.append(allocator, nr),
             else => {},
@@ -627,6 +649,18 @@ fn verdictMissingBlock(
         .common = .{ .seq = seq, .ts = "t", .role = "reviewer", .section = section },
         .outcome = outcome,
         .commit = commit,
+    } };
+}
+
+fn briefMissingSection(seq: u64, block_id: []const u8) record.Record {
+    return .{ .brief = .{
+        .common = .{ .seq = seq, .ts = "t", .role = "architect", .block = block_id, .to = "worker" },
+    } };
+}
+
+fn briefMissingBlock(seq: u64, section: []const u8) record.Record {
+    return .{ .brief = .{
+        .common = .{ .seq = seq, .ts = "t", .role = "architect", .section = section, .to = "worker" },
     } };
 }
 
@@ -865,6 +899,26 @@ test "a verdict missing 'block' is a fault, not a silently dropped grid entry" {
     defer diag.deinit();
     const result = derive(allocator, &records, &diag);
     try testing.expectError(error.VerdictMissingKey, result);
+    try testing.expect(std.mem.indexOf(u8, diag.message, "block") != null);
+}
+
+test "a brief missing 'section' is a fault, not a silent gap in the brief index (block 6B review fix)" {
+    const allocator = testing.allocator;
+    const records = [_]record.Record{briefMissingSection(1, "6B")};
+    var diag: record.Diagnostics = .init(allocator);
+    defer diag.deinit();
+    const result = derive(allocator, &records, &diag);
+    try testing.expectError(error.BriefMissingKey, result);
+    try testing.expect(std.mem.indexOf(u8, diag.message, "section") != null);
+}
+
+test "a brief missing 'block' is a fault, not a silent gap in the brief index (block 6B review fix)" {
+    const allocator = testing.allocator;
+    const records = [_]record.Record{briefMissingBlock(1, "6")};
+    var diag: record.Diagnostics = .init(allocator);
+    defer diag.deinit();
+    const result = derive(allocator, &records, &diag);
+    try testing.expectError(error.BriefMissingKey, result);
     try testing.expect(std.mem.indexOf(u8, diag.message, "block") != null);
 }
 
