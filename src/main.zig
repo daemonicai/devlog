@@ -11,18 +11,16 @@ const Allocator = std.mem.Allocator;
 const record = @import("record.zig");
 const log = @import("log.zig");
 const body = @import("body.zig");
+// Aliased `state_mod`, not `state`: a plain `const state = @import(...)`
+// would be shadowed by `runClose`'s own local `state` (the parsed
+// `--state` value) — Zig refuses that shadowing outright. `runShow`
+// (block 6A) is the first command to derive read-side state.
+const state_mod = @import("state.zig");
 test {
     _ = record;
     _ = log;
     _ = body;
-    // Test-discovery only (`zig build test` walks reachable imports from
-    // this root module) — no command in this block calls into `state.zig`.
-    // Not bound to a top-level `const state` because `state` is already a
-    // local identifier elsewhere in this file (the `--state` flag's parsed
-    // value). Wiring `state.zig` into command behaviour belongs to section
-    // 6, per block 5A's brief ("main.zig is not wired to it in this
-    // block").
-    _ = @import("state.zig");
+    _ = state_mod;
 }
 
 /// One subcommand of the surface. `section` names the `tasks.md` section
@@ -230,6 +228,25 @@ const next_usage =
     \\heredoc. Redirect it from a file: `devlog ... next < body.md`.
 ;
 
+const show_usage =
+    \\USAGE
+    \\    devlog --log <path> show --item <n> [--json]
+    \\    devlog --log <path> show --seq <n> [--json]
+    \\
+    \\Retrieves one item, with its current derived state and full close
+    \\history, or one record, by identifier (log-retrieval). `--item` and
+    \\--seq are mutually exclusive; exactly one is required.
+    \\
+    \\FLAGS
+    \\    --item <n>  An item's identifier, without the leading '#'.
+    \\    --seq <n>   A record's sequence number.
+    \\    --json      Emit the same result as JSON instead of rendered
+    \\                text (D15). One derivation, two renderings — never
+    \\                two derivations.
+    \\
+    \\Takes no body: never reads stdin.
+;
+
 /// Names only, from sections 4, 6 and 7 of the change's `tasks.md`. This
 /// block dispatches to them and gives each a `--help`; their behaviour is
 /// those sections' to build. `header`, `post`, `section`, `brief`, and
@@ -244,7 +261,7 @@ const commands = [_]CommandSpec{
     .{ .name = "verdict", .summary = "Record a typed review verdict for a block.", .section = "4", .usage = verdict_usage },
     .{ .name = "next", .summary = "Append the current NEXT narrative.", .section = "4", .usage = next_usage },
     .{ .name = "resume", .summary = "Show the current NEXT, open items for a role, and its latest brief.", .section = "6" },
-    .{ .name = "show", .summary = "Show one item or one record by its identifier.", .section = "6" },
+    .{ .name = "show", .summary = "Show one item or one record by its identifier.", .section = "6", .usage = show_usage },
     .{ .name = "list", .summary = "List records, filtered by section, block, role, kind, state, or addressee.", .section = "6" },
     .{ .name = "refs", .summary = "Show every record carrying a given external reference.", .section = "6" },
     .{ .name = "status", .summary = "Show the rendered current state: NEXT plus open items.", .section = "6" },
@@ -333,6 +350,7 @@ const value_taking_flags = [_][]const u8{
     "--log",   "--role", "--change", "--closer",  "--section",
     "--block", "--to",   "--ref",    "--title",   "--base",
     "--type",  "--item", "--state",  "--outcome", "--commit",
+    "--seq",
 };
 
 fn isValueTakingFlag(name: []const u8) bool {
@@ -429,8 +447,10 @@ const Parsed = struct {
     /// present means true. No arity ambiguity to check — repeating it is
     /// harmless, unlike a value-carrying flag.
     blocking: bool = false,
-    /// `close`-only, exactly-once, required (4.5). The raw digits; parsed
-    /// to a positive `i64` in `runClose`.
+    /// Shared by `close` (4.5: exactly-once, required) and `show` (6.2:
+    /// exactly-once, mutually exclusive with `--seq`, one of the two
+    /// required). The raw digits; parsed to a positive integer in
+    /// `runClose`/`runShow` respectively.
     item_num: ?[]const u8 = null,
     /// `close`-only, exactly-once, required (4.5). Validated against
     /// `record.CloseState`'s permitted set in `runClose`.
@@ -441,6 +461,14 @@ const Parsed = struct {
     /// `verdict`-only, exactly-once, required (4.6). Stored verbatim and
     /// unvalidated — same posture as `section`'s `--base` (D10).
     commit: ?[]const u8 = null,
+    /// `show`-only, exactly-once (6.2), mutually exclusive with
+    /// `--item`. The raw digits; parsed to a positive `u64` in `runShow`.
+    seq_num: ?[]const u8 = null,
+    /// Read-command-only (D15, block 6A wires `show`; 6B/6C wire the
+    /// rest). A bare boolean flag, same shape as `item`'s `--blocking`:
+    /// absent means the default rendered-text form, present means emit
+    /// the same content as JSON instead.
+    json: bool = false,
 
     fn deinit(self: *Parsed, allocator: Allocator) void {
         self.roles.deinit(allocator);
@@ -543,8 +571,9 @@ fn parseArgs(allocator: Allocator, args: []const [:0]const u8) Allocator.Error!P
     const wants_item = command_hint != null and std.mem.eql(u8, command_hint.?, "item");
     const wants_close = command_hint != null and std.mem.eql(u8, command_hint.?, "close");
     const wants_verdict = command_hint != null and std.mem.eql(u8, command_hint.?, "verdict");
+    const wants_show = command_hint != null and std.mem.eql(u8, command_hint.?, "show");
     const strict = wants_header or wants_post or wants_section_cmd or wants_brief or wants_next or
-        wants_item or wants_close or wants_verdict;
+        wants_item or wants_close or wants_verdict or wants_show;
     // Whether the hinted command recognises a bare positional argument at
     // all (B1: `CommandSpec.takes_positional`). Looked up structurally,
     // not by name, so a future command that takes one only has to set the
@@ -595,7 +624,7 @@ fn parseArgs(allocator: Allocator, args: []const [:0]const u8) Allocator.Error!P
             if (takeFlagValue(&p, args, &i, "--type")) |v| setOnce(&p, &p.item_type, "--type", v);
         } else if (wants_item and std.mem.eql(u8, arg, "--blocking")) {
             p.blocking = true;
-        } else if (wants_close and std.mem.eql(u8, arg, "--item")) {
+        } else if ((wants_close or wants_show) and std.mem.eql(u8, arg, "--item")) {
             if (takeFlagValue(&p, args, &i, "--item")) |v| setOnce(&p, &p.item_num, "--item", v);
         } else if (wants_close and std.mem.eql(u8, arg, "--state")) {
             if (takeFlagValue(&p, args, &i, "--state")) |v| setOnce(&p, &p.state, "--state", v);
@@ -603,6 +632,10 @@ fn parseArgs(allocator: Allocator, args: []const [:0]const u8) Allocator.Error!P
             if (takeFlagValue(&p, args, &i, "--outcome")) |v| setOnce(&p, &p.outcome, "--outcome", v);
         } else if (wants_verdict and std.mem.eql(u8, arg, "--commit")) {
             if (takeFlagValue(&p, args, &i, "--commit")) |v| setOnce(&p, &p.commit, "--commit", v);
+        } else if (wants_show and std.mem.eql(u8, arg, "--seq")) {
+            if (takeFlagValue(&p, args, &i, "--seq")) |v| setOnce(&p, &p.seq_num, "--seq", v);
+        } else if (wants_show and std.mem.eql(u8, arg, "--json")) {
+            p.json = true;
         } else if (wants_section_flag and std.mem.eql(u8, arg, "--section")) {
             if (takeFlagValue(&p, args, &i, "--section")) |v| setOnce(&p, &p.section, "--section", v);
         } else if (wants_block_flag and std.mem.eql(u8, arg, "--block")) {
@@ -646,7 +679,14 @@ fn reportFault(stderr: *Io.Writer, fault: ParseFault) u8 {
 /// Prints whatever `record.Diagnostics` named, or a generic fallback
 /// naming the error value when nothing more specific was set (A4: two
 /// message shapes, not three — this is the one call site that prints
-/// both of them uniformly through `fail()`).
+/// both of them uniformly through `fail()`). Despite the name, this
+/// covers any error carried alongside a `record.Diagnostics` — `log.zig`'s
+/// write/read error sets and `state.zig`'s `DeriveError` alike (carried
+/// item 17, block 6A): `state.derive` sets the same `diag` type with the
+/// same message-then-error-name fallback `log.zig` already uses, so
+/// `ItemNumberMismatch`/`CloseTargetMissing`/`VerdictMissingKey` reach the
+/// CLI through this one call site rather than a second reporting path,
+/// with the same message shape and exit code every other fault gets.
 fn reportLogError(stderr: *Io.Writer, err: anyerror, diag: *const record.Diagnostics) u8 {
     if (diag.message.len != 0) return fail(stderr, "{s}", .{diag.message});
     return fail(stderr, "{s}", .{@errorName(err)});
@@ -1180,6 +1220,228 @@ fn runVerdict(
     return 0;
 }
 
+/// Parses a `--seq <n>` value as a positive `u64` sequence number — `null`
+/// for anything that is not a base-10 integer strictly greater than zero.
+/// Mirrors `parsePositiveItemNumber`'s shape, one field over.
+fn parsePositiveSeq(s: []const u8) ?u64 {
+    const n = std.fmt.parseInt(u64, s, 10) catch return null;
+    return if (n > 0) n else null;
+}
+
+/// Writes `common`'s three lead fields shared by every attributed kind —
+/// mirrors `record.zig`'s private `writeAttributedHead`, one field over,
+/// so the text renderer below can never show a field the JSON form
+/// (`record.write`) omits, or vice versa (D15).
+fn writeAttributedHeadText(w: *Io.Writer, common: record.Attributed) void {
+    w.print("ts: {s}\n", .{common.ts}) catch {};
+    w.print("role: {s}\n", .{common.role}) catch {};
+    if (common.section) |s| w.print("section: {s}\n", .{s}) catch {};
+    if (common.block) |b| w.print("block: {s}\n", .{b}) catch {};
+}
+
+/// Writes `common`'s trailing fields shared by every attributed kind —
+/// mirrors `record.zig`'s private `writeAttributedTail`/`writeRefsAndBody`.
+/// `body` is always shown, last, since it is usually the longest field.
+fn writeAttributedTailText(w: *Io.Writer, common: record.Attributed) void {
+    if (common.to) |t| w.print("to: {s}\n", .{t}) catch {};
+    for (common.refs) |ref| w.print("ref: {s}:{s}\n", .{ ref.ns, ref.id }) catch {};
+    w.print("body:\n{s}\n", .{common.body}) catch {};
+}
+
+/// Renders one record as agent-readable text — the text half of D15's
+/// "one derivation, two renderers". Reads off the same `record.Record`
+/// union `record.write` does, one field at a time, in the same per-kind
+/// shape, so this can never show less than the JSON form carries (D15: a
+/// `--json` payload carrying something the text form cannot show would be
+/// the text form under-rendering, not a licence for the two to diverge).
+/// Shared by `runShow`'s `--seq` path directly, and by `writeItemText`
+/// below for the opening `item` record and each `close` record nested
+/// inside an `--item` result — one renderer, not one per call site.
+fn renderRecordText(w: *Io.Writer, rec: record.Record) void {
+    w.print("kind: {s}\n", .{@tagName(std.meta.activeTag(rec))}) catch {};
+    w.print("seq: {d}\n", .{rec.seq()}) catch {};
+    switch (rec) {
+        .header => |r| {
+            w.print("ts: {s}\n", .{r.ts}) catch {};
+            w.print("format: {d}\n", .{r.format}) catch {};
+            w.print("tool: {s}\n", .{r.tool}) catch {};
+            w.print("change: {s}\n", .{r.change}) catch {};
+            w.writeAll("roles: ") catch {};
+            for (r.roles, 0..) |role_name, idx| {
+                if (idx != 0) w.writeAll(", ") catch {};
+                w.writeAll(role_name) catch {};
+            }
+            w.writeAll("\nclosers: ") catch {};
+            for (r.closers, 0..) |closer_name, idx| {
+                if (idx != 0) w.writeAll(", ") catch {};
+                w.writeAll(closer_name) catch {};
+            }
+            w.writeAll("\n") catch {};
+        },
+        .section => |r| {
+            writeAttributedHeadText(w, r.common);
+            w.print("title: {s}\n", .{r.title}) catch {};
+            w.print("base: {s}\n", .{r.base}) catch {};
+            writeAttributedTailText(w, r.common);
+        },
+        .brief, .post, .next => {
+            const common = switch (rec) {
+                inline .brief, .post, .next => |r| r.common,
+                else => unreachable,
+            };
+            writeAttributedHeadText(w, common);
+            writeAttributedTailText(w, common);
+        },
+        .item => |r| {
+            writeAttributedHeadText(w, r.common);
+            w.print("item: #{d}\n", .{r.item}) catch {};
+            w.print("type: {s}\n", .{@tagName(r.type)}) catch {};
+            w.print("blocking: {}\n", .{r.blocking}) catch {};
+            writeAttributedTailText(w, r.common);
+        },
+        .close => |r| {
+            writeAttributedHeadText(w, r.common);
+            w.print("closes item: #{d}\n", .{r.item}) catch {};
+            w.print("state: {s}\n", .{@tagName(r.state)}) catch {};
+            writeAttributedTailText(w, r.common);
+        },
+        .verdict => |r| {
+            writeAttributedHeadText(w, r.common);
+            w.print("outcome: {s}\n", .{@tagName(r.outcome)}) catch {};
+            w.print("commit: {s}\n", .{r.commit}) catch {};
+            writeAttributedTailText(w, r.common);
+        },
+    }
+}
+
+/// The text form of an `--item` result: the derived number and state
+/// (`state_mod.ItemState` — not a record field, `5.1`'s derivation), then
+/// the opening record and every close, each rendered by `renderRecordText`
+/// — the same renderer `--seq` uses directly, so an item's opening record
+/// reads exactly as it would if fetched by its own `--seq`.
+fn writeItemText(w: *Io.Writer, item: state_mod.Item) void {
+    w.print("#{d} — state: {s}\n\n", .{ item.number, @tagName(item.state) }) catch {};
+    w.writeAll("opened:\n") catch {};
+    renderRecordText(w, record.Record{ .item = item.opened });
+    if (item.closes.len == 0) {
+        w.writeAll("\ncloses: none yet\n") catch {};
+        return;
+    }
+    w.print("\ncloses ({d}):\n", .{item.closes.len}) catch {};
+    for (item.closes, 0..) |c, idx| {
+        w.print("--- close {d} of {d} ---\n", .{ idx + 1, item.closes.len }) catch {};
+        renderRecordText(w, record.Record{ .close = c });
+    }
+}
+
+/// The JSON form of an `--item` result. Builds the wrapping object
+/// (`number`, `state`, `item`, `closes`) with plain writer calls, but
+/// reuses `record.write` — "the writer already in `record.zig`" the brief
+/// asks for — for the opening record and every close record it embeds,
+/// rather than a second hand-rolled record emitter (D15). Fails only as
+/// `record.write` can: `WriteError` (an `Io.Writer` failure, or a body
+/// that is not valid UTF-8 — D14 — which cannot occur here, since D14
+/// already refused it at write time, but the type still carries the
+/// possibility rather than asserting it away).
+fn writeItemJson(w: *Io.Writer, item: state_mod.Item, diag: ?*record.Diagnostics) record.WriteError!void {
+    try w.writeAll("{\"number\":");
+    try w.print("{d}", .{item.number});
+    try w.writeAll(",\"state\":\"");
+    try w.writeAll(@tagName(item.state));
+    try w.writeAll("\",\"item\":");
+    try record.write(w, record.Record{ .item = item.opened }, diag);
+    try w.writeAll(",\"closes\":[");
+    for (item.closes, 0..) |c, idx| {
+        if (idx != 0) try w.writeAll(",");
+        try record.write(w, record.Record{ .close = c }, diag);
+    }
+    try w.writeAll("]}\n");
+}
+
+/// `devlog show` (6.2, `log-retrieval`, D15). Retrieves one item — with
+/// its current derived state and full close history — by `--item <n>`, or
+/// one record verbatim by `--seq <n>`. The two are mutually exclusive and
+/// exactly one is required; that, and each value's shape, is checked
+/// before the read-only load ever touches the filesystem (A3's ordering,
+/// applied to a read this time rather than a write). Renders agent-
+/// readable text by default; the same content as JSON on `--json` (D15).
+///
+/// Loads via `log.openReadOnly` (6.6, carried items 10 and 13) — never
+/// `log.appendRecord`'s locked, create-if-missing path, which would be
+/// wrong twice over for a read: it would create the log on a miss, and it
+/// would take a lock this single self-contained snapshot does not need.
+///
+/// A target that does not exist — an `--item` no `item` record ever
+/// raised, or a `--seq` no record carries — is a plain report and a
+/// non-zero exit, the same shape as this tool's other refusals, never an
+/// empty success.
+fn runShow(
+    allocator: Allocator,
+    io: Io,
+    dir: Io.Dir,
+    log_path: []const u8,
+    p: *const Parsed,
+    stdout: *Io.Writer,
+    stderr: *Io.Writer,
+) u8 {
+    if (p.item_num != null and p.seq_num != null) {
+        return fail(stderr, "'show' takes exactly one of --item <n> or --seq <n>, not both", .{});
+    }
+    if (p.item_num == null and p.seq_num == null) {
+        return fail(stderr, "'show' requires --item <n> or --seq <n>", .{});
+    }
+
+    const item_target: ?i64 = if (p.item_num) |s|
+        parsePositiveItemNumber(s) orelse
+            return fail(stderr, "--item '{s}' must be a positive integer", .{s})
+    else
+        null;
+    const seq_target: ?u64 = if (p.seq_num) |s|
+        parsePositiveSeq(s) orelse
+            return fail(stderr, "--seq '{s}' must be a positive integer", .{s})
+    else
+        null;
+
+    var diag: record.Diagnostics = .init(allocator);
+    defer diag.deinit();
+
+    var opened = log.openReadOnly(allocator, io, dir, log_path, &diag) catch |err| {
+        return reportLogError(stderr, err, &diag);
+    };
+    defer opened.close(allocator);
+
+    if (seq_target) |target| {
+        for (opened.log.records) |rec| {
+            if (rec.seq() != target) continue;
+            if (p.json) {
+                record.write(stdout, rec, &diag) catch |err| return reportLogError(stderr, err, &diag);
+                stdout.writeByte('\n') catch {};
+            } else {
+                renderRecordText(stdout, rec);
+            }
+            return 0;
+        }
+        return fail(stderr, "no record with seq {d}", .{target});
+    }
+
+    var derived = state_mod.derive(allocator, opened.log.records, &diag) catch |err| {
+        return reportLogError(stderr, err, &diag);
+    };
+    defer derived.deinit();
+
+    const n = item_target.?;
+    for (derived.items) |it| {
+        if (it.number != n) continue;
+        if (p.json) {
+            writeItemJson(stdout, it, &diag) catch |err| return reportLogError(stderr, err, &diag);
+        } else {
+            writeItemText(stdout, it);
+        }
+        return 0;
+    }
+    return fail(stderr, "item #{d} does not exist — {d} item(s) have been raised so far", .{ n, derived.items.len });
+}
+
 /// Dispatches one invocation and returns the process exit code.
 fn run(
     allocator: Allocator,
@@ -1262,9 +1524,13 @@ fn run(
     if (std.mem.eql(u8, spec.name, "verdict")) {
         return runVerdict(allocator, io, dir, stdin, ts, log_path, &p, stdout, stderr);
     }
+    if (std.mem.eql(u8, spec.name, "show")) {
+        return runShow(allocator, io, dir, log_path, &p, stdout, stderr);
+    }
 
-    // No other subcommand is wired yet (sections 6, 7). Fail honestly
-    // rather than silently succeed, and touch nothing on the way out (D5).
+    // No other subcommand is wired yet (`resume`/`list`/`refs`/`status` —
+    // section 6 blocks 6B/6C; `search` — section 7). Fail honestly rather
+    // than silently succeed, and touch nothing on the way out (D5).
     return fail(stderr, "'{s}' is not implemented yet", .{spec.name});
 }
 
@@ -1579,17 +1845,16 @@ test "an unrecognised global flag before the command is rejected" {
 }
 
 test "flags after the subcommand are left for its own section, not rejected here" {
-    // show's real flags belong to section 6, not yet built — item, close,
-    // and verdict are the ones block 4C makes real, so this test (from
-    // block 4A, pre-4C) now points at a command that's still a
-    // placeholder, retargeted rather than deleted (same standard as the
-    // block 4A retargeting the reviewer accepted).
+    // show is real as of block 6A, so this test (from block 4A, pre-4C,
+    // already retargeted once at 4C) is retargeted again to a command
+    // block 6A does not build — resume, still a placeholder past this
+    // block (6B).
     try expectRun(
         std.testing.allocator,
-        &.{ "--log", "DEVLOG.jsonl", "show", "--item", "5" },
+        &.{ "--log", "DEVLOG.jsonl", "resume", "--role", "architect" },
         1,
         null,
-        "'show' is not implemented yet",
+        "'resume' is not implemented yet",
     );
 }
 
@@ -3791,4 +4056,812 @@ test "header refuses a repeated --closer value, naming it, and the log is unchan
     try std.testing.expect(std.mem.indexOf(u8, err_out.written(), "--closer 'architect' given more than once") != null);
 
     try std.testing.expectError(error.FileNotFound, tmp.dir.openFile(std.testing.io, "DEVLOG.jsonl", .{}));
+}
+
+// --- show (6.2, 6.6) ---------------------------------------------------
+
+test "show requires exactly one of --item or --seq: neither is refused before any filesystem access" {
+    try expectRun(
+        std.testing.allocator,
+        &.{ "--log", "DEVLOG.jsonl", "show" },
+        1,
+        null,
+        "requires --item <n> or --seq <n>",
+    );
+    // No log was even opened — confirmed the same way the write commands'
+    // own required-flag tests already do (A3's ordering, on a read).
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var stdin_file = try openStdinStandin(tmp.dir, std.testing.io, "");
+    defer stdin_file.close(std.testing.io);
+    var out: Io.Writer.Allocating = .init(std.testing.allocator);
+    defer out.deinit();
+    var err_out: Io.Writer.Allocating = .init(std.testing.allocator);
+    defer err_out.deinit();
+    _ = run(std.testing.allocator, std.testing.io, tmp.dir, stdin_file, test_ts, &.{ "--log", "DEVLOG.jsonl", "show" }, &out.writer, &err_out.writer);
+    try std.testing.expectError(error.FileNotFound, tmp.dir.openFile(std.testing.io, "DEVLOG.jsonl", .{}));
+}
+
+test "show refuses both --item and --seq together, and touches nothing" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var stdin_file = try openStdinStandin(tmp.dir, std.testing.io, "");
+    defer stdin_file.close(std.testing.io);
+    var out: Io.Writer.Allocating = .init(std.testing.allocator);
+    defer out.deinit();
+    var err_out: Io.Writer.Allocating = .init(std.testing.allocator);
+    defer err_out.deinit();
+
+    const code = run(
+        std.testing.allocator,
+        std.testing.io,
+        tmp.dir,
+        stdin_file,
+        test_ts,
+        &.{ "--log", "DEVLOG.jsonl", "show", "--item", "1", "--seq", "1" },
+        &out.writer,
+        &err_out.writer,
+    );
+    try std.testing.expectEqual(@as(u8, 1), code);
+    try std.testing.expect(std.mem.indexOf(u8, err_out.written(), "not both") != null);
+    try std.testing.expectError(error.FileNotFound, tmp.dir.openFile(std.testing.io, "DEVLOG.jsonl", .{}));
+}
+
+test "show --item and --seq must each be a positive integer" {
+    try expectRun(
+        std.testing.allocator,
+        &.{ "--log", "DEVLOG.jsonl", "show", "--item", "0" },
+        1,
+        null,
+        "--item '0' must be a positive integer",
+    );
+    try expectRun(
+        std.testing.allocator,
+        &.{ "--log", "DEVLOG.jsonl", "show", "--seq", "abc" },
+        1,
+        null,
+        "--seq 'abc' must be a positive integer",
+    );
+}
+
+test "show against a missing log reports plainly, exits non-zero, and creates nothing (6.6, durable-format)" {
+    // "The file was not created" is only convincing if the test asserts
+    // the directory's contents directly, not merely that the command
+    // failed — so this iterates the tmp dir afterwards.
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var stdin_file = try openStdinStandin(tmp.dir, std.testing.io, "");
+    defer stdin_file.close(std.testing.io);
+    var out: Io.Writer.Allocating = .init(std.testing.allocator);
+    defer out.deinit();
+    var err_out: Io.Writer.Allocating = .init(std.testing.allocator);
+    defer err_out.deinit();
+
+    const code = run(
+        std.testing.allocator,
+        std.testing.io,
+        tmp.dir,
+        stdin_file,
+        test_ts,
+        &.{ "--log", "DEVLOG.jsonl", "show", "--item", "1" },
+        &out.writer,
+        &err_out.writer,
+    );
+    try std.testing.expectEqual(@as(u8, 1), code);
+    try std.testing.expect(std.mem.indexOf(u8, err_out.written(), "devlog header") != null);
+    try std.testing.expectEqualStrings("", out.written());
+
+    // Only the test harness's own stdin stand-in exists — nothing this
+    // command itself could have created.
+    var count: usize = 0;
+    var it = tmp.dir.iterate();
+    while (try it.next(std.testing.io)) |entry| {
+        try std.testing.expectEqualStrings("stdin-standin", entry.name);
+        count += 1;
+    }
+    try std.testing.expectEqual(@as(usize, 1), count);
+}
+
+/// Seeds a fresh tmp dir with a header, one open item (#1, a question from
+/// worker to architect), and one close of it (resolved, by architect) —
+/// the fixture every `show --item` test below builds on.
+fn seedItemAndClose(allocator: Allocator, dir: Io.Dir, io: Io, diag: *record.Diagnostics) !void {
+    _ = try log.appendHeader(
+        allocator,
+        io,
+        dir,
+        "DEVLOG.jsonl",
+        "t0",
+        "devlog 0.1.0",
+        .{ .change = "x", .roles = &.{ "architect", "worker" }, .closers = &.{"architect"} },
+        diag,
+    );
+    const item_rec = record.Record{ .item = .{
+        .common = .{ .seq = 0, .ts = "t1", .role = "worker", .to = "architect", .body = "should we use X?" },
+        .item = 0,
+        .type = .question,
+        .blocking = true,
+    } };
+    _ = try log.appendItem(allocator, io, dir, "DEVLOG.jsonl", item_rec, diag);
+
+    const close_rec = record.Record{ .close = .{
+        .common = .{ .seq = 0, .ts = "t2", .role = "architect", .body = "yes, X it is" },
+        .item = 1,
+        .state = .resolved,
+    } };
+    _ = try log.appendRecord(allocator, io, dir, "DEVLOG.jsonl", close_rec, diag);
+}
+
+test "show --item retrieves the item with its derived state and full close history, rendered as text" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var diag: record.Diagnostics = .init(std.testing.allocator);
+    defer diag.deinit();
+    try seedItemAndClose(std.testing.allocator, tmp.dir, std.testing.io, &diag);
+
+    var stdin_file = try openStdinStandin(tmp.dir, std.testing.io, "");
+    defer stdin_file.close(std.testing.io);
+    var out: Io.Writer.Allocating = .init(std.testing.allocator);
+    defer out.deinit();
+    var err_out: Io.Writer.Allocating = .init(std.testing.allocator);
+    defer err_out.deinit();
+
+    const code = run(
+        std.testing.allocator,
+        std.testing.io,
+        tmp.dir,
+        stdin_file,
+        test_ts,
+        &.{ "--log", "DEVLOG.jsonl", "show", "--item", "1" },
+        &out.writer,
+        &err_out.writer,
+    );
+    try std.testing.expectEqual(@as(u8, 0), code);
+    const text = out.written();
+    // Derived state (work-items: state is one of open/resolved/deferred/
+    // superseded, not a raw record field).
+    try std.testing.expect(std.mem.indexOf(u8, text, "state: resolved") != null);
+    // The opening record's own fields.
+    try std.testing.expect(std.mem.indexOf(u8, text, "type: question") != null);
+    try std.testing.expect(std.mem.indexOf(u8, text, "blocking: true") != null);
+    try std.testing.expect(std.mem.indexOf(u8, text, "should we use X?") != null);
+    // The close record's own fields (work-items: "who closed it, when, and
+    // why are all recoverable").
+    try std.testing.expect(std.mem.indexOf(u8, text, "role: architect") != null);
+    try std.testing.expect(std.mem.indexOf(u8, text, "yes, X it is") != null);
+}
+
+test "show --item --json emits the same content as JSON, reusing record.write rather than a second emitter" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var diag: record.Diagnostics = .init(std.testing.allocator);
+    defer diag.deinit();
+    try seedItemAndClose(std.testing.allocator, tmp.dir, std.testing.io, &diag);
+
+    var stdin_file = try openStdinStandin(tmp.dir, std.testing.io, "");
+    defer stdin_file.close(std.testing.io);
+    var out: Io.Writer.Allocating = .init(std.testing.allocator);
+    defer out.deinit();
+    var err_out: Io.Writer.Allocating = .init(std.testing.allocator);
+    defer err_out.deinit();
+
+    const code = run(
+        std.testing.allocator,
+        std.testing.io,
+        tmp.dir,
+        stdin_file,
+        test_ts,
+        &.{ "--log", "DEVLOG.jsonl", "show", "--item", "1", "--json" },
+        &out.writer,
+        &err_out.writer,
+    );
+    try std.testing.expectEqual(@as(u8, 0), code);
+
+    var parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, out.written(), .{});
+    defer parsed.deinit();
+    const root = parsed.value.object;
+    try std.testing.expectEqual(@as(i64, 1), root.get("number").?.integer);
+    try std.testing.expectEqualStrings("resolved", root.get("state").?.string);
+    const opened = root.get("item").?.object;
+    try std.testing.expectEqualStrings("item", opened.get("kind").?.string);
+    try std.testing.expectEqualStrings("question", opened.get("type").?.string);
+    try std.testing.expectEqualStrings("should we use X?", opened.get("body").?.string);
+    const closes = root.get("closes").?.array;
+    try std.testing.expectEqual(@as(usize, 1), closes.items.len);
+    try std.testing.expectEqualStrings("close", closes.items[0].object.get("kind").?.string);
+    try std.testing.expectEqualStrings("resolved", closes.items[0].object.get("state").?.string);
+    try std.testing.expectEqualStrings("yes, X it is", closes.items[0].object.get("body").?.string);
+
+    // D15: the two forms describe the same log — same body text reachable
+    // in both.
+    _ = run(
+        std.testing.allocator,
+        std.testing.io,
+        tmp.dir,
+        stdin_file,
+        test_ts,
+        &.{ "--log", "DEVLOG.jsonl", "show", "--item", "1" },
+        &out.writer,
+        &err_out.writer,
+    );
+}
+
+test "show --item naming a number no item bears is a plain report, not an empty success" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var diag: record.Diagnostics = .init(std.testing.allocator);
+    defer diag.deinit();
+    _ = try log.appendHeader(
+        std.testing.allocator,
+        std.testing.io,
+        tmp.dir,
+        "DEVLOG.jsonl",
+        "t0",
+        "devlog 0.1.0",
+        .{ .change = "x", .roles = &.{"architect"}, .closers = &.{"architect"} },
+        &diag,
+    );
+
+    var stdin_file = try openStdinStandin(tmp.dir, std.testing.io, "");
+    defer stdin_file.close(std.testing.io);
+    var out: Io.Writer.Allocating = .init(std.testing.allocator);
+    defer out.deinit();
+    var err_out: Io.Writer.Allocating = .init(std.testing.allocator);
+    defer err_out.deinit();
+
+    const code = run(
+        std.testing.allocator,
+        std.testing.io,
+        tmp.dir,
+        stdin_file,
+        test_ts,
+        &.{ "--log", "DEVLOG.jsonl", "show", "--item", "7" },
+        &out.writer,
+        &err_out.writer,
+    );
+    try std.testing.expectEqual(@as(u8, 1), code);
+    try std.testing.expectEqualStrings("", out.written());
+    try std.testing.expect(std.mem.indexOf(u8, err_out.written(), "item #7 does not exist") != null);
+}
+
+test "show --seq retrieves one record verbatim, text and JSON forms agreeing (D15)" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var diag: record.Diagnostics = .init(std.testing.allocator);
+    defer diag.deinit();
+    try seedItemAndClose(std.testing.allocator, tmp.dir, std.testing.io, &diag);
+
+    var stdin_file = try openStdinStandin(tmp.dir, std.testing.io, "");
+    defer stdin_file.close(std.testing.io);
+
+    // seq 2 is the item record (seq 1 is the header).
+    {
+        var out: Io.Writer.Allocating = .init(std.testing.allocator);
+        defer out.deinit();
+        var err_out: Io.Writer.Allocating = .init(std.testing.allocator);
+        defer err_out.deinit();
+        const code = run(
+            std.testing.allocator,
+            std.testing.io,
+            tmp.dir,
+            stdin_file,
+            test_ts,
+            &.{ "--log", "DEVLOG.jsonl", "show", "--seq", "2" },
+            &out.writer,
+            &err_out.writer,
+        );
+        try std.testing.expectEqual(@as(u8, 0), code);
+        const text = out.written();
+        try std.testing.expect(std.mem.indexOf(u8, text, "kind: item") != null);
+        try std.testing.expect(std.mem.indexOf(u8, text, "should we use X?") != null);
+        try std.testing.expect(std.mem.indexOf(u8, text, "to: architect") != null);
+    }
+    {
+        var out: Io.Writer.Allocating = .init(std.testing.allocator);
+        defer out.deinit();
+        var err_out: Io.Writer.Allocating = .init(std.testing.allocator);
+        defer err_out.deinit();
+        const code = run(
+            std.testing.allocator,
+            std.testing.io,
+            tmp.dir,
+            stdin_file,
+            test_ts,
+            &.{ "--log", "DEVLOG.jsonl", "show", "--seq", "2", "--json" },
+            &out.writer,
+            &err_out.writer,
+        );
+        try std.testing.expectEqual(@as(u8, 0), code);
+
+        var parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, out.written(), .{});
+        defer parsed.deinit();
+        const root = parsed.value.object;
+        try std.testing.expectEqualStrings("item", root.get("kind").?.string);
+        try std.testing.expectEqual(@as(i64, 2), root.get("seq").?.integer);
+        try std.testing.expectEqualStrings("should we use X?", root.get("body").?.string);
+        try std.testing.expectEqualStrings("architect", root.get("to").?.string);
+    }
+}
+
+test "show --seq naming a number no record carries is a plain report, not an empty success" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var diag: record.Diagnostics = .init(std.testing.allocator);
+    defer diag.deinit();
+    _ = try log.appendHeader(
+        std.testing.allocator,
+        std.testing.io,
+        tmp.dir,
+        "DEVLOG.jsonl",
+        "t0",
+        "devlog 0.1.0",
+        .{ .change = "x", .roles = &.{"architect"}, .closers = &.{"architect"} },
+        &diag,
+    );
+
+    var stdin_file = try openStdinStandin(tmp.dir, std.testing.io, "");
+    defer stdin_file.close(std.testing.io);
+    var out: Io.Writer.Allocating = .init(std.testing.allocator);
+    defer out.deinit();
+    var err_out: Io.Writer.Allocating = .init(std.testing.allocator);
+    defer err_out.deinit();
+
+    const code = run(
+        std.testing.allocator,
+        std.testing.io,
+        tmp.dir,
+        stdin_file,
+        test_ts,
+        &.{ "--log", "DEVLOG.jsonl", "show", "--seq", "99" },
+        &out.writer,
+        &err_out.writer,
+    );
+    try std.testing.expectEqual(@as(u8, 1), code);
+    try std.testing.expectEqualStrings("", out.written());
+    try std.testing.expect(std.mem.indexOf(u8, err_out.written(), "no record with seq 99") != null);
+}
+
+test "show ignores a leftover temporary file beside the log (durable-format, carried 10)" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var diag: record.Diagnostics = .init(std.testing.allocator);
+    defer diag.deinit();
+    try seedItemAndClose(std.testing.allocator, tmp.dir, std.testing.io, &diag);
+
+    // A decoy temp file, named exactly as a killed write would leave one,
+    // whose content differs from the real log's — if `show` ever read it
+    // instead, the assertions below would fail rather than merely pass by
+    // accident.
+    {
+        var f = try tmp.dir.createFile(std.testing.io, ".DEVLOG.jsonl.tmp-0000000000000000000000000000dead", .{ .truncate = false });
+        defer f.close(std.testing.io);
+        try f.writePositionalAll(std.testing.io, "{\"kind\":\"header\",\"seq\":1,\"ts\":\"decoy\",\"format\":1,\"tool\":\"x\",\"change\":\"x\",\"roles\":[\"architect\"],\"closers\":[\"architect\"]}\n", 0);
+    }
+
+    var stdin_file = try openStdinStandin(tmp.dir, std.testing.io, "");
+    defer stdin_file.close(std.testing.io);
+    var out: Io.Writer.Allocating = .init(std.testing.allocator);
+    defer out.deinit();
+    var err_out: Io.Writer.Allocating = .init(std.testing.allocator);
+    defer err_out.deinit();
+
+    const code = run(
+        std.testing.allocator,
+        std.testing.io,
+        tmp.dir,
+        stdin_file,
+        test_ts,
+        &.{ "--log", "DEVLOG.jsonl", "show", "--seq", "1" },
+        &out.writer,
+        &err_out.writer,
+    );
+    try std.testing.expectEqual(@as(u8, 0), code);
+    try std.testing.expect(std.mem.indexOf(u8, out.written(), "decoy") == null);
+    try std.testing.expect(std.mem.indexOf(u8, out.written(), "kind: header") != null);
+}
+
+test "show --help prints its own usage, mentioning --item, --seq, and --json" {
+    try expectRun(std.testing.allocator, &.{ "show", "--help" }, 0, "devlog show", null);
+    try expectRun(std.testing.allocator, &.{ "show", "--help" }, 0, "--item", null);
+    try expectRun(std.testing.allocator, &.{ "show", "--help" }, 0, "--seq", null);
+    try expectRun(std.testing.allocator, &.{ "show", "--help" }, 0, "--json", null);
+}
+
+/// Seeds a fresh tmp dir with just a header — the shared base each
+/// single-kind `show --seq` fixture below appends its one record onto
+/// (reviewer nit 2, architect ruling: land before this block commits).
+fn seedHeaderOnly(allocator: Allocator, dir: Io.Dir, io: Io, diag: *record.Diagnostics) !void {
+    _ = try log.appendHeader(
+        allocator,
+        io,
+        dir,
+        "DEVLOG.jsonl",
+        "t0",
+        "devlog 0.1.0",
+        .{ .change = "x", .roles = &.{ "architect", "worker", "reviewer" }, .closers = &.{"architect"} },
+        diag,
+    );
+}
+
+test "show --seq on a section record renders the same content in text and JSON (D15)" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var diag: record.Diagnostics = .init(std.testing.allocator);
+    defer diag.deinit();
+    try seedHeaderOnly(std.testing.allocator, tmp.dir, std.testing.io, &diag);
+
+    const rec = record.Record{ .section = .{
+        .common = .{ .seq = 0, .ts = "t1", .role = "architect", .section = "9", .body = "Reviewed the section boundary." },
+        .title = "Read commands",
+        .base = "31eb5e3",
+    } };
+    _ = try log.appendRecord(std.testing.allocator, std.testing.io, tmp.dir, "DEVLOG.jsonl", rec, &diag);
+
+    var stdin_file = try openStdinStandin(tmp.dir, std.testing.io, "");
+    defer stdin_file.close(std.testing.io);
+
+    var text_out: Io.Writer.Allocating = .init(std.testing.allocator);
+    defer text_out.deinit();
+    var text_err: Io.Writer.Allocating = .init(std.testing.allocator);
+    defer text_err.deinit();
+    const text_code = run(
+        std.testing.allocator,
+        std.testing.io,
+        tmp.dir,
+        stdin_file,
+        test_ts,
+        &.{ "--log", "DEVLOG.jsonl", "show", "--seq", "2" },
+        &text_out.writer,
+        &text_err.writer,
+    );
+    try std.testing.expectEqual(@as(u8, 0), text_code);
+    const text = text_out.written();
+    try std.testing.expect(std.mem.indexOf(u8, text, "kind: section") != null);
+    try std.testing.expect(std.mem.indexOf(u8, text, "title: Read commands") != null);
+    try std.testing.expect(std.mem.indexOf(u8, text, "base: 31eb5e3") != null);
+    try std.testing.expect(std.mem.indexOf(u8, text, "section: 9") != null);
+    try std.testing.expect(std.mem.indexOf(u8, text, "Reviewed the section boundary.") != null);
+
+    var json_out: Io.Writer.Allocating = .init(std.testing.allocator);
+    defer json_out.deinit();
+    var json_err: Io.Writer.Allocating = .init(std.testing.allocator);
+    defer json_err.deinit();
+    const json_code = run(
+        std.testing.allocator,
+        std.testing.io,
+        tmp.dir,
+        stdin_file,
+        test_ts,
+        &.{ "--log", "DEVLOG.jsonl", "show", "--seq", "2", "--json" },
+        &json_out.writer,
+        &json_err.writer,
+    );
+    try std.testing.expectEqual(@as(u8, 0), json_code);
+    var parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, json_out.written(), .{});
+    defer parsed.deinit();
+    const root = parsed.value.object;
+    try std.testing.expectEqualStrings("section", root.get("kind").?.string);
+    try std.testing.expectEqualStrings("Read commands", root.get("title").?.string);
+    try std.testing.expectEqualStrings("31eb5e3", root.get("base").?.string);
+    try std.testing.expectEqualStrings("9", root.get("section").?.string);
+    try std.testing.expectEqualStrings("Reviewed the section boundary.", root.get("body").?.string);
+}
+
+test "show --seq on a brief record renders the same content in text and JSON (D15)" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var diag: record.Diagnostics = .init(std.testing.allocator);
+    defer diag.deinit();
+    try seedHeaderOnly(std.testing.allocator, tmp.dir, std.testing.io, &diag);
+
+    const rec = record.Record{ .brief = .{
+        .common = .{
+            .seq = 0,
+            .ts = "t1",
+            .role = "architect",
+            .block = "6A",
+            .to = "worker",
+            .refs = &.{.{ .ns = "D", .id = "15" }},
+            .body = "Implement the read-only load path.",
+        },
+    } };
+    _ = try log.appendRecord(std.testing.allocator, std.testing.io, tmp.dir, "DEVLOG.jsonl", rec, &diag);
+
+    var stdin_file = try openStdinStandin(tmp.dir, std.testing.io, "");
+    defer stdin_file.close(std.testing.io);
+
+    var text_out: Io.Writer.Allocating = .init(std.testing.allocator);
+    defer text_out.deinit();
+    var text_err: Io.Writer.Allocating = .init(std.testing.allocator);
+    defer text_err.deinit();
+    const text_code = run(
+        std.testing.allocator,
+        std.testing.io,
+        tmp.dir,
+        stdin_file,
+        test_ts,
+        &.{ "--log", "DEVLOG.jsonl", "show", "--seq", "2" },
+        &text_out.writer,
+        &text_err.writer,
+    );
+    try std.testing.expectEqual(@as(u8, 0), text_code);
+    const text = text_out.written();
+    try std.testing.expect(std.mem.indexOf(u8, text, "kind: brief") != null);
+    try std.testing.expect(std.mem.indexOf(u8, text, "block: 6A") != null);
+    try std.testing.expect(std.mem.indexOf(u8, text, "to: worker") != null);
+    try std.testing.expect(std.mem.indexOf(u8, text, "ref: D:15") != null);
+    try std.testing.expect(std.mem.indexOf(u8, text, "Implement the read-only load path.") != null);
+
+    var json_out: Io.Writer.Allocating = .init(std.testing.allocator);
+    defer json_out.deinit();
+    var json_err: Io.Writer.Allocating = .init(std.testing.allocator);
+    defer json_err.deinit();
+    const json_code = run(
+        std.testing.allocator,
+        std.testing.io,
+        tmp.dir,
+        stdin_file,
+        test_ts,
+        &.{ "--log", "DEVLOG.jsonl", "show", "--seq", "2", "--json" },
+        &json_out.writer,
+        &json_err.writer,
+    );
+    try std.testing.expectEqual(@as(u8, 0), json_code);
+    var parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, json_out.written(), .{});
+    defer parsed.deinit();
+    const root = parsed.value.object;
+    try std.testing.expectEqualStrings("brief", root.get("kind").?.string);
+    try std.testing.expectEqualStrings("6A", root.get("block").?.string);
+    try std.testing.expectEqualStrings("worker", root.get("to").?.string);
+    try std.testing.expectEqualStrings("Implement the read-only load path.", root.get("body").?.string);
+    const refs = root.get("refs").?.array;
+    try std.testing.expectEqual(@as(usize, 1), refs.items.len);
+    try std.testing.expectEqualStrings("D", refs.items[0].object.get("ns").?.string);
+    try std.testing.expectEqualStrings("15", refs.items[0].object.get("id").?.string);
+}
+
+test "show --seq on a post record renders the same content in text and JSON (D15)" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var diag: record.Diagnostics = .init(std.testing.allocator);
+    defer diag.deinit();
+    try seedHeaderOnly(std.testing.allocator, tmp.dir, std.testing.io, &diag);
+
+    const rec = record.Record{ .post = .{
+        .common = .{ .seq = 0, .ts = "t1", .role = "worker", .body = "Landed the base commit." },
+    } };
+    _ = try log.appendRecord(std.testing.allocator, std.testing.io, tmp.dir, "DEVLOG.jsonl", rec, &diag);
+
+    var stdin_file = try openStdinStandin(tmp.dir, std.testing.io, "");
+    defer stdin_file.close(std.testing.io);
+
+    var text_out: Io.Writer.Allocating = .init(std.testing.allocator);
+    defer text_out.deinit();
+    var text_err: Io.Writer.Allocating = .init(std.testing.allocator);
+    defer text_err.deinit();
+    const text_code = run(
+        std.testing.allocator,
+        std.testing.io,
+        tmp.dir,
+        stdin_file,
+        test_ts,
+        &.{ "--log", "DEVLOG.jsonl", "show", "--seq", "2" },
+        &text_out.writer,
+        &text_err.writer,
+    );
+    try std.testing.expectEqual(@as(u8, 0), text_code);
+    const text = text_out.written();
+    try std.testing.expect(std.mem.indexOf(u8, text, "kind: post") != null);
+    try std.testing.expect(std.mem.indexOf(u8, text, "role: worker") != null);
+    try std.testing.expect(std.mem.indexOf(u8, text, "Landed the base commit.") != null);
+
+    var json_out: Io.Writer.Allocating = .init(std.testing.allocator);
+    defer json_out.deinit();
+    var json_err: Io.Writer.Allocating = .init(std.testing.allocator);
+    defer json_err.deinit();
+    const json_code = run(
+        std.testing.allocator,
+        std.testing.io,
+        tmp.dir,
+        stdin_file,
+        test_ts,
+        &.{ "--log", "DEVLOG.jsonl", "show", "--seq", "2", "--json" },
+        &json_out.writer,
+        &json_err.writer,
+    );
+    try std.testing.expectEqual(@as(u8, 0), json_code);
+    var parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, json_out.written(), .{});
+    defer parsed.deinit();
+    const root = parsed.value.object;
+    try std.testing.expectEqualStrings("post", root.get("kind").?.string);
+    try std.testing.expectEqualStrings("worker", root.get("role").?.string);
+    try std.testing.expectEqualStrings("Landed the base commit.", root.get("body").?.string);
+}
+
+test "show --seq on a verdict record renders the same content in text and JSON (D15)" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var diag: record.Diagnostics = .init(std.testing.allocator);
+    defer diag.deinit();
+    try seedHeaderOnly(std.testing.allocator, tmp.dir, std.testing.io, &diag);
+
+    const rec = record.Record{ .verdict = .{
+        .common = .{ .seq = 0, .ts = "t1", .role = "reviewer", .body = "Approve with nits." },
+        .outcome = .@"approve-with-nits",
+        .commit = "a1b2c3d",
+    } };
+    _ = try log.appendRecord(std.testing.allocator, std.testing.io, tmp.dir, "DEVLOG.jsonl", rec, &diag);
+
+    var stdin_file = try openStdinStandin(tmp.dir, std.testing.io, "");
+    defer stdin_file.close(std.testing.io);
+
+    var text_out: Io.Writer.Allocating = .init(std.testing.allocator);
+    defer text_out.deinit();
+    var text_err: Io.Writer.Allocating = .init(std.testing.allocator);
+    defer text_err.deinit();
+    const text_code = run(
+        std.testing.allocator,
+        std.testing.io,
+        tmp.dir,
+        stdin_file,
+        test_ts,
+        &.{ "--log", "DEVLOG.jsonl", "show", "--seq", "2" },
+        &text_out.writer,
+        &text_err.writer,
+    );
+    try std.testing.expectEqual(@as(u8, 0), text_code);
+    const text = text_out.written();
+    try std.testing.expect(std.mem.indexOf(u8, text, "kind: verdict") != null);
+    try std.testing.expect(std.mem.indexOf(u8, text, "outcome: approve-with-nits") != null);
+    try std.testing.expect(std.mem.indexOf(u8, text, "commit: a1b2c3d") != null);
+    try std.testing.expect(std.mem.indexOf(u8, text, "Approve with nits.") != null);
+
+    var json_out: Io.Writer.Allocating = .init(std.testing.allocator);
+    defer json_out.deinit();
+    var json_err: Io.Writer.Allocating = .init(std.testing.allocator);
+    defer json_err.deinit();
+    const json_code = run(
+        std.testing.allocator,
+        std.testing.io,
+        tmp.dir,
+        stdin_file,
+        test_ts,
+        &.{ "--log", "DEVLOG.jsonl", "show", "--seq", "2", "--json" },
+        &json_out.writer,
+        &json_err.writer,
+    );
+    try std.testing.expectEqual(@as(u8, 0), json_code);
+    var parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, json_out.written(), .{});
+    defer parsed.deinit();
+    const root = parsed.value.object;
+    try std.testing.expectEqualStrings("verdict", root.get("kind").?.string);
+    try std.testing.expectEqualStrings("approve-with-nits", root.get("outcome").?.string);
+    try std.testing.expectEqualStrings("a1b2c3d", root.get("commit").?.string);
+    try std.testing.expectEqualStrings("Approve with nits.", root.get("body").?.string);
+}
+
+test "show --seq on a next record renders the same content in text and JSON (D15)" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var diag: record.Diagnostics = .init(std.testing.allocator);
+    defer diag.deinit();
+    try seedHeaderOnly(std.testing.allocator, tmp.dir, std.testing.io, &diag);
+
+    const rec = record.Record{ .next = .{
+        .common = .{ .seq = 0, .ts = "t1", .role = "architect", .body = "Section 9 continues at block 9B." },
+    } };
+    _ = try log.appendRecord(std.testing.allocator, std.testing.io, tmp.dir, "DEVLOG.jsonl", rec, &diag);
+
+    var stdin_file = try openStdinStandin(tmp.dir, std.testing.io, "");
+    defer stdin_file.close(std.testing.io);
+
+    var text_out: Io.Writer.Allocating = .init(std.testing.allocator);
+    defer text_out.deinit();
+    var text_err: Io.Writer.Allocating = .init(std.testing.allocator);
+    defer text_err.deinit();
+    const text_code = run(
+        std.testing.allocator,
+        std.testing.io,
+        tmp.dir,
+        stdin_file,
+        test_ts,
+        &.{ "--log", "DEVLOG.jsonl", "show", "--seq", "2" },
+        &text_out.writer,
+        &text_err.writer,
+    );
+    try std.testing.expectEqual(@as(u8, 0), text_code);
+    const text = text_out.written();
+    try std.testing.expect(std.mem.indexOf(u8, text, "kind: next") != null);
+    try std.testing.expect(std.mem.indexOf(u8, text, "role: architect") != null);
+    try std.testing.expect(std.mem.indexOf(u8, text, "Section 9 continues at block 9B.") != null);
+
+    var json_out: Io.Writer.Allocating = .init(std.testing.allocator);
+    defer json_out.deinit();
+    var json_err: Io.Writer.Allocating = .init(std.testing.allocator);
+    defer json_err.deinit();
+    const json_code = run(
+        std.testing.allocator,
+        std.testing.io,
+        tmp.dir,
+        stdin_file,
+        test_ts,
+        &.{ "--log", "DEVLOG.jsonl", "show", "--seq", "2", "--json" },
+        &json_out.writer,
+        &json_err.writer,
+    );
+    try std.testing.expectEqual(@as(u8, 0), json_code);
+    var parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, json_out.written(), .{});
+    defer parsed.deinit();
+    const root = parsed.value.object;
+    try std.testing.expectEqualStrings("next", root.get("kind").?.string);
+    try std.testing.expectEqualStrings("architect", root.get("role").?.string);
+    try std.testing.expectEqualStrings("Section 9 continues at block 9B.", root.get("body").?.string);
+}
+
+test "show --item on an item with no close yet renders \"closes: none yet\" in text and an empty array in JSON" {
+    // Deliberately not seedItemAndClose (which always adds a close) — the
+    // ordinary state of an open item is the untested branch this fixture
+    // covers (reviewer nit 1, architect ruling: land before this block
+    // commits). Added alongside seedItemAndClose, not by extending it.
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var diag: record.Diagnostics = .init(std.testing.allocator);
+    defer diag.deinit();
+    try seedHeaderOnly(std.testing.allocator, tmp.dir, std.testing.io, &diag);
+
+    const item_rec = record.Record{ .item = .{
+        .common = .{ .seq = 0, .ts = "t1", .role = "worker", .to = "architect", .body = "should we use Y?" },
+        .item = 0,
+        .type = .question,
+        .blocking = false,
+    } };
+    _ = try log.appendItem(std.testing.allocator, std.testing.io, tmp.dir, "DEVLOG.jsonl", item_rec, &diag);
+
+    var stdin_file = try openStdinStandin(tmp.dir, std.testing.io, "");
+    defer stdin_file.close(std.testing.io);
+
+    {
+        var out: Io.Writer.Allocating = .init(std.testing.allocator);
+        defer out.deinit();
+        var err_out: Io.Writer.Allocating = .init(std.testing.allocator);
+        defer err_out.deinit();
+        const code = run(
+            std.testing.allocator,
+            std.testing.io,
+            tmp.dir,
+            stdin_file,
+            test_ts,
+            &.{ "--log", "DEVLOG.jsonl", "show", "--item", "1" },
+            &out.writer,
+            &err_out.writer,
+        );
+        try std.testing.expectEqual(@as(u8, 0), code);
+        const text = out.written();
+        try std.testing.expect(std.mem.indexOf(u8, text, "state: open") != null);
+        try std.testing.expect(std.mem.indexOf(u8, text, "closes: none yet") != null);
+        try std.testing.expect(std.mem.indexOf(u8, text, "closes (") == null);
+    }
+    {
+        var out: Io.Writer.Allocating = .init(std.testing.allocator);
+        defer out.deinit();
+        var err_out: Io.Writer.Allocating = .init(std.testing.allocator);
+        defer err_out.deinit();
+        const code = run(
+            std.testing.allocator,
+            std.testing.io,
+            tmp.dir,
+            stdin_file,
+            test_ts,
+            &.{ "--log", "DEVLOG.jsonl", "show", "--item", "1", "--json" },
+            &out.writer,
+            &err_out.writer,
+        );
+        try std.testing.expectEqual(@as(u8, 0), code);
+        var parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, out.written(), .{});
+        defer parsed.deinit();
+        const root = parsed.value.object;
+        try std.testing.expectEqualStrings("open", root.get("state").?.string);
+        const closes = root.get("closes").?.array;
+        try std.testing.expectEqual(@as(usize, 0), closes.items.len);
+    }
 }

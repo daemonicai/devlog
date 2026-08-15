@@ -7452,6 +7452,252 @@ commands only. Parse-ambiguity errors still beat `--help`/`--version`.
 **Done-gates.** `make gates` → `GATES_EXIT:0`, quoting every individual `LABEL_EXIT:<n>` line, and the
 counted test total. Then `→ @reviewer`. No commit, no ticks.
 
+**[worker]** **Block 6A (`6.6`, `6.2`) implemented.**
+
+**`log.zig`.** Factored `openLocked`'s inline "read the whole file, then parse it" into a shared
+`readAndParse(allocator, io, file, diag)` helper, and added `openReadOnly(allocator, io, dir, sub_path,
+diag) !ReadOnly` beside it — the read-only counterpart every read command loads through. It differs from
+`openLocked` on exactly the two properties that must differ for a read: **never creates** the log (a
+missing path is `error.NoLog`, same message as `openLocked(.existing_only)`), and **takes no lock at all**
+rather than an exclusive one — a read is a single open-read-close snapshot that never holds anything
+across a later operation, so `openLocked`'s stale-lock recheck (a lock-specific hazard) doesn't apply; what
+makes a lock-free read safe is D11's own guarantee that `rename` never lets a reader observe a torn record.
+It inherently ignores a write's temp file (`tempName`'s differently-named path can never resolve from
+opening `sub_path` by its own name) — carried 10 pinned with three `log.zig` unit tests: missing log
+creates nothing (asserted by iterating the directory, not just checking the error), a temp-file-only
+directory still reports `NoLog` and leaves the temp file untouched, and a real log with a decoy temp file
+beside it reads only the real content.
+
+**`main.zig`.** Wired `state.zig` in for the first time — aliased `const state_mod = @import("state.zig")`
+rather than `state`, since `runClose` already has a local `state` (the parsed `--state` value) and Zig
+refuses that shadow. Added `show` (`--item <n>` / `--seq <n>`, mutually exclusive, one required, checked
+before the read-only load touches the filesystem — same A3 ordering as the write commands) with real
+`--help`. `--item`'s `Parsed` field is now shared between `close` and `show` (same shape: raw digits, "the
+item's identifier"); added `seq_num` and a bare `json` bool, both `show`-only for now, `wants_show` folded
+into the `strict` set exactly like every other real command.
+
+**D15.** `--seq` JSON is literally `record.write` on the matched record — no second emitter. `--item` JSON
+wraps `record.write` on the opening `item` record and each `close` record in a small hand-written object
+(`number`, `state`, `item`, `closes`) — the wrapping punctuation isn't a record emitter, `record.write`
+still owns every record's own field serialisation. Text rendering (`renderRecordText`) reads off the same
+`record.Record` union, kind by kind, in the same field groups `record.write` uses (a shared
+`writeAttributedHeadText`/`writeAttributedTailText` pair mirrors `record.zig`'s private head/tail split),
+so it can't show less than the JSON carries; `--item`'s text form reuses `renderRecordText` for the opening
+record and every close, the same renderer `--seq` uses directly. Covered all eight kinds, not just the ones
+this block's fixtures exercise (`--seq` can land on a `header`, a `verdict`, anything) — that part is
+therefore unexercised by a test past the header/item/close paths block 6A's fixtures reach; flagging rather
+than asserting untested code paths are correct.
+
+**Carried 17.** No new reporting function — `reportLogError` already takes `anyerror` plus a `diag`, so
+`state.derive`'s `DeriveError` (which sets the same `record.Diagnostics` type, same message-then-
+error-name fallback) reaches the CLI through the one existing call site. Doc comment updated to say so
+explicitly; `runShow`'s `--item` path is the first caller.
+
+**Carried 16.** `show --item` looks up by number with a linear scan over `derived.items` (already ordered
+positionally by construction, per `state.zig`'s own derivation — no hash-map enumeration anywhere in
+`runShow`). Nothing else is enumerated in this block.
+
+**Scope note.** `close`-only doc comment on `Parsed.state`/`Parsed.outcome`/`Parsed.commit` untouched;
+only `item_num`'s doc comment was widened to mention `show`, since it's now the one field two commands
+share. Retargeted one pre-existing test ("flags after the subcommand are left for its own section") from
+`show` (now real) to `resume` (still a placeholder past this block) — same standard as its own comment
+already documented for the block-4C retargeting.
+
+**Gates.** `BUILD_EXIT:0` `TEST_EXIT:0` `FORMAT_EXIT:0` `VALIDATE_EXIT:0` `GATES_EXIT:0` — 195/195 tests
+pass (14 new: 3 in `log.zig` for `openReadOnly`, 11 in `main.zig` for `show`).
+
+No commit, no ticks. → @reviewer
+
+**[reviewer]** **Block 6A (`6.6`, `6.2`) audited. Verdict: Approve with nits.**
+
+**Gates, re-run independently.** `BUILD_EXIT:0` `TEST_EXIT:0` `FORMAT_EXIT:0` `VALIDATE_EXIT:0`
+`GATES_EXIT:0`. Test total counted, not quoted: `zig build test --summary all` →
+`195/195 tests passed`, matching the worker's number exactly.
+
+**Test power, verified by mutation, not by reading.** Copied the tree to a scratch directory outside
+the working tree, deleted `openReadOnly`'s no-create branch (had it `createFile` on
+`error.FileNotFound` instead of returning `error.NoLog`, then open the newly-created file — the exact
+defect carried 13 forbids), busted the copied `.zig-cache` so the mutation actually recompiled, and
+reran. Three tests failed exactly as they should: `log.zig`'s two `openReadOnly` "creates nothing"
+tests and `main.zig`'s `show` "creates nothing" test. The absence assertions (directory iteration, not
+just the error) have real power — this is not "there is a test," it is "the test would catch the
+regression."
+
+**Carried 13 — confirmed.** `readAndParse` (`src/log.zig:144-158`) is the one read-and-parse; `openLocked`
+(`src/log.zig:220`) and `openReadOnly` (`src/log.zig:293-300`) both call it, differing only in the two
+properties that must differ (create-or-not, lock-or-not). No copy-paste duplication.
+
+**Carried 10 — confirmed**, at two layers: `log.zig`'s `openReadOnly` tests plant a decoy temp file
+named exactly as `tempName` would produce one and assert both that it's ignored and that it survives
+untouched; `main.zig`'s `show` test repeats the check at the CLI layer with differing decoy content, so
+a read that accidentally parsed the wrong file would fail on content, not just on the happy path.
+
+**Carried 16 — confirmed.** `derived.items` (`state.zig:508`, `std.ArrayList(Item)`) is built positionally,
+not via a hash map; `runShow`'s `--item` lookup (`main.zig:1435-1436`) is a linear scan over that array.
+No hash-map enumeration in this block.
+
+**Carried 17 — confirmed by reading the error set, not the doc comment.** `state.DeriveError`'s three
+variants (`ItemNumberMismatch`, `CloseTargetMissing`, `VerdictMissingKey`, `state.zig:343`) each set
+`diag.message` before returning (`state.zig:465-498`), so `reportLogError` (`main.zig:719-721`) —
+unchanged in behaviour, only its doc comment grew — resolves them through the same `diag.message`
+branch every other fault uses, landing on the same `fail()` (`main.zig:283-286`, always exit `1`,
+`"devlog: {s}\n"` on stderr) as `log.zig`'s faults. No second reporting path, no unreachable branch.
+
+**D15 — the one-derivation rule, checked field-by-field, not taken on trust.** Traced `record.write`
+(`record.zig:356-435`) against `renderRecordText` (`main.zig:1259-1314`) for all eight kinds. Every
+field `record.write` emits for `header`, `section`, `brief`/`post`/`next`, `item`, `close`, and
+`verdict` has a matching line in `renderRecordText` — field order differs in one place (`item`'s `to`
+sits before `blocking` in JSON, after it in text) but content does not, which is what D15 requires. No
+second record emitter: `writeItemJson` (`main.zig:1346-1358`) calls `record.write` for the opening
+`item` and every `close`, wrapping them in hand-written punctuation only. `state_mod.derive`'s items
+(`state.Item`) are the same derivation both `writeItemText` and `writeItemJson` read from — one
+derivation, confirmed.
+
+**The `state_mod` alias — sound.** `state_mod` (`main.zig:18`) is used consistently everywhere `state.zig`
+is referenced in this block (`main.zig:1322, 1346, 1427`); `runClose`'s local `state` (the parsed
+`--state` value) is untouched and never shadowed. Clean resolution of the collision 5A flagged.
+
+**Nits (not blocking):**
+
+1. **`writeItemText`'s "closes: none yet" branch (`main.zig:255-258`) and `writeItemJson`'s empty-`closes`
+   case (`main.zig:283-287`) are untested.** `seedItemAndClose` (`main.zig:529-554`, the only fixture in
+   this block) always adds a close. An item with no close yet is the ordinary case — every open item
+   starts there — and it's the one branch of `show --item` this block leaves completely unexercised in
+   both renderings. Worth a fixture: seed an item with no close, assert `"closes: none yet"` in text and
+   `"closes":[]` in JSON.
+
+2. **The worker's own flag — my judgment, since it was asked for.** `section`/`brief`/`post`/`verdict`/`next`
+   are implemented in `renderRecordText` but untested through `show --seq` in this block; only
+   `header`/`item`/`close` are exercised end to end. I verified the missing five are correct by the
+   field-by-field trace above, so this is not a blocker. But "symmetric by construction" is a claim about
+   code shape, not a guarantee that stays true as the `switch` grows — and I don't see a clear reason
+   6B (`resume`/`status`) or 6C (`list`/`refs`) will ever drive `show --seq` against a `section`, `brief`,
+   `verdict`, or `next` record either, so this gap may simply persist past section 6. D15 is this
+   section's binding constraint and `8.4` needs the surface reimplementable from documentation alone;
+   I'd rather see five cheap fixtures (one record + `show --seq` + `show --seq --json` per remaining
+   kind) land before this section closes than rely on inspection holding forever. Flagging for the
+   Architect to decide whether it belongs in this block, a later 6B/6C block, or the section close.
+
+No architectural notes beyond the above — the block stays inside `6.6`/`6.2`, no drive-by scope, no
+third-party dependency, nothing persisted, `Makefile` and `tasks.md` untouched.
+
+**[architect]** **Both nits land in this block, before it commits. Not carried.**
+
+The reviewer asked me to place its second nit — this block, a later 6B/6C block, or the section close. The
+answer is **this block**, and the reasoning applies to its first nit equally.
+
+**"Symmetric by construction" is precisely the claim this change has been burned by.** Section 4's one
+correctness bug survived three block reviews — one of which byte-diffed the parser's test suite — because
+no test pinned the behaviour and the defect lived in a branch that did nothing. Section 5 then shipped two
+more defects in branches no green test run could reach. That is three instances in three sections, each
+found late or by luck. The reviewer traced all eight kinds field-by-field and I believe it; what I do not
+believe is that the trace stays true as the `switch` grows, and a trace in a review transcript is not a
+gate.
+
+**Carrying it is the option that actually fails.** The reviewer's own reason is the deciding one: nothing
+in 6B or 6C will drive `show --seq` against a `section`, `brief`, `verdict` or `next` record, so a carried
+nit here does not get discharged by the section's later work — it gets discharged only if someone
+remembers. This change already carries twenty numbered items; adding a twenty-first for something that
+costs five fixtures is bad arithmetic. **D15 is this section's binding constraint**, and `8.4` requires the
+surface be reimplementable from documentation alone — a kind whose two renderings have never both been
+executed is exactly where those two obligations fail together and quietly.
+
+**What to add — tests only, no production change:**
+
+1. **Five fixtures for the untested kinds** — one record each of `section`, `brief`, `post`, `verdict`
+   and `next`, driven through both `show --seq` and `show --seq --json`, asserting the two forms carry the
+   same content. That is D15's rule executed rather than inspected, for the five kinds where it currently
+   is not.
+2. **The empty-`closes` case** (`src/main.zig:255-258`, `:283-287`) — an item with no close yet, in both
+   renderings. It is the *ordinary* state of an open item and `seedItemAndClose` always adds one, so the
+   common case is the untested one. Do not extend `seedItemAndClose`; add the case, so both paths stay
+   covered.
+
+**One field-order difference the reviewer found is not a defect and needs no change** — `item`'s `to`
+orders differently between `record.write` and `renderRecordText`, with no content omission. JSON object
+member order is not semantic and the text form is not a parse target. Recorded so it is not rediscovered
+as a finding in 6B.
+
+This is a test-only addition to an already-approved block: add it, re-run the gates, and the reviewer
+confirms the additions rather than re-auditing the block. Still no commit, no ticks.
+
+**[worker]** **Both nits closed — test-only, no production change.**
+
+**Nit 2 (five untested kinds).** Added a shared `seedHeaderOnly` fixture (header only, roles
+`architect`/`worker`/`reviewer` so a `reviewer`-authored verdict is legal) and one test per kind —
+`section`, `brief`, `post`, `verdict`, `next` — each appending one record via `log.appendRecord`, then
+driving `show --seq 2` and `show --seq 2 --json` and asserting the kind-specific fields (`title`/`base`,
+`to`/`refs`/`block`, `outcome`/`commit`) plus the shared `body` land identically in both renderings.
+`verdict`'s fixture uses `.@"approve-with-nits"` deliberately, since that's this very nit's own outcome.
+
+**Nit 1 (empty `closes`).** Added a standalone test seeding a header plus one `item` record via
+`log.appendItem`, with no close — `seedItemAndClose` untouched, per the ruling. Asserts `show --item`
+renders `"state: open"` / `"closes: none yet"` in text (and that the "closes (N):" branch is absent), and
+`"state":"open"` / `"closes":[]` in JSON.
+
+Both discharge in `src/main.zig`, appended after the existing `show --help` test; no changes to
+`renderRecordText`, `writeItemText`, `writeItemJson`, `record.zig`, or any other production code.
+
+**The field-order non-defect (`item`'s `to`) — left alone**, per the architect's ruling: no re-test, no
+change.
+
+**Gates.** `BUILD_EXIT:0` `TEST_EXIT:0` `FORMAT_EXIT:0` `VALIDATE_EXIT:0` `GATES_EXIT:0` — 201/201 tests
+pass (6 new: 5 single-kind `show --seq` fixtures + 1 empty-`closes` fixture), counted via
+`zig build test --summary all`.
+
+No commit, no ticks. → @reviewer for confirmation of the additions.
+
+**[reviewer]** **Block 6A additions confirmed. Verdict: Approve.**
+
+This is a confirmation of the two nits' closure, not a re-audit — the implementation approved with nits
+stands unchanged; verified that directly below.
+
+**Gates, re-run independently.** `BUILD_EXIT:0` `TEST_EXIT:0` `FORMAT_EXIT:0` `VALIDATE_EXIT:0`
+`GATES_EXIT:0`. Test total counted, not quoted: `zig build test --summary all` →
+`201/201 tests passed`, matching the worker's number.
+
+**No production code changed since my prior approval — confirmed by diffing the diff, not by
+trusting the claim.** `git diff HEAD` for `src/main.zig` is one hunk (`@@ -3792,3 +4057,811 @@`) that
+is a pure append at file end. Walked every `+fn `/`+const `/`+test` line in it: everything up to and
+including `test "show --help prints its own usage..."` is the block's already-reviewed material
+(`seedItemAndClose`, the eleven original `show` tests); the new material begins exactly at
+`fn seedHeaderOnly` and runs to end of file — six new `test` blocks, zero new non-test declarations.
+`runShow`, `writeItemText`, `writeItemJson`, `renderRecordText`, `parseArgs`, and every other
+production symbol I cited in the prior review are untouched in this round; `git diff HEAD -- src/log.zig`
+is unchanged since the prior review entirely (no new hunks there at all).
+
+**The five fixtures assert content parity, not just successful rendering — confirmed by reading
+and by mutation.** Each of the `section`/`brief`/`post`/`verdict`/`next` tests (`src/main.zig:4486`,
+`:4550`, `:4623`, `:4681`, `:4743`) runs `show --seq 2` then `show --seq 2 --json` against the same
+seeded record, asserts specific field values in the text output (`std.mem.indexOf` substring checks
+naming the field and its value, e.g. `"base: 31eb5e3"`, `"outcome: approve-with-nits"`), then parses
+the JSON with `std.json.parseFromSlice` and asserts the same values with `expectEqualStrings` against
+named object keys — not "did it parse," but "does this key hold this value." Verified power directly:
+copied the tree to a scratch directory, deleted `commit`'s line from `renderRecordText`'s `.verdict`
+branch (`main.zig:1311` in that copy) so the text form silently dropped a field the JSON form still
+carried — the exact D15 divergence these fixtures exist to catch — and reran. Exactly the verdict
+fixture failed (`main.zig:4715`, "commit: a1b2c3d" not found), nothing else. The five fixtures have
+real power, not just presence.
+
+**The empty-`closes` fixture likewise has power.** `src/main.zig:4801-4867` seeds a header plus one
+open `item` via `log.appendItem` — no close — and asserts `"state: open"` / `"closes: none yet"` /
+absence of a `"closes ("` line in text, and `"state":"open"` / `"closes":[]` (array length 0, not a
+string check) in JSON. Verified in a second scratch copy: hardcoded `writeItemJson`'s `state` field to
+always emit `"closed"` regardless of the real derived state, reran — this fixture failed exactly where
+expected (`main.zig:4863`, expected `"open"`, found `"closed"`), alongside the pre-existing
+`show --item --json` test that also covers `state`. Two independent assertions catching the same class
+of regression is a good sign, not redundancy.
+
+**`seedItemAndClose` confirmed untouched.** `git diff HEAD` shows exactly one `+fn seedItemAndClose`
+addition (part of the block's original, already-reviewed material) and no further hunk touching it.
+The new empty-`closes` fixture is its own standalone seed via `log.appendItem` directly, exactly as
+the worker reported — the with-close path keeps its coverage, the empty path gets its own.
+
+**Both nits — closed.** Nit 1 (empty `closes`, `main.zig:4801`) and nit 2 (five kinds, `main.zig:4486-
+4799`) are both discharged, test-only, with demonstrated assertion power on both. No new findings.
+
+Block 6A (`6.6`, `6.2`) is clear to commit and tick.
+
 ## NEXT
 
 **[architect]** **Section 5 is CLOSED** — supervisor `Approve` on the **first** pass, no remediation

@@ -72,7 +72,7 @@
 
 - [ ] 6.1 `devlog resume --role <r>` — current NEXT narrative, open items addressed to that role, and the
       latest brief for its block; bounded by what is open, not by history (D8, `log-retrieval`)
-- [ ] 6.2 `devlog show --item <n>` and `devlog show --seq <n>` — retrieve one item or record with its
+- [x] 6.2 `devlog show --item <n>` and `devlog show --seq <n>` — retrieve one item or record with its
       current state and closure
 - [ ] 6.3 `devlog list` with filters for section, block, role, kind, state, addressee, and blocking
       (`log-retrieval`)
@@ -80,7 +80,7 @@
       prose scan (`external-references`)
 - [ ] 6.5 `devlog status` — the rendered current state: NEXT narrative plus open items, with blocking
       items distinguishable (`next-state`)
-- [ ] 6.6 Report plainly when the log file does not exist on a read, and never create it silently
+- [x] 6.6 Report plainly when the log file does not exist on a read, and never create it silently
       (`durable-format`)
 
 ## 7. Search

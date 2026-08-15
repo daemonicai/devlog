@@ -135,6 +135,24 @@ fn isStaleLock(file: Io.File, io: Io, dir: Io.Dir, sub_path: []const u8) !bool {
 /// and the section-3 supervisor's carried finding C2 both name.
 const OpenMode = enum { create_if_missing, existing_only };
 
+/// Reads `file`'s entire current content into an owned buffer and parses
+/// it — the "read and parse" step every path that needs the log's content
+/// shares, whether or not it holds a lock (carried item 13, block 6A:
+/// `openLocked`'s read-and-parse must not be duplicated by a second,
+/// near-identical function for reads). `openLocked` below calls this once
+/// it has confirmed its lock is not stale; `openReadOnly` calls it with no
+/// lock at all, since a read is a single self-contained snapshot that
+/// never holds anything across a later operation the way a write does.
+fn readAndParse(allocator: Allocator, io: Io, file: Io.File, diag: ?*record.Diagnostics) !struct { bytes: []u8, log: record.ParsedLog } {
+    const len = try file.length(io);
+    const bytes = try allocator.alloc(u8, len);
+    errdefer allocator.free(bytes);
+    if (len != 0) _ = try file.readPositionalAll(io, bytes, 0);
+
+    const parsed = try record.parseLog(allocator, bytes, diag);
+    return .{ .bytes = bytes, .log = parsed };
+}
+
 /// Opens `sub_path` under `dir` for read-write, taking an exclusive lock
 /// — creating the file if it does not exist **and** `mode` allows it —
 /// confirms the lock is not stale (retrying against whatever the path
@@ -200,15 +218,71 @@ fn openLocked(
             continue;
         }
 
-        const len = try file.length(io);
-        const bytes = try allocator.alloc(u8, len);
-        errdefer allocator.free(bytes);
-        if (len != 0) _ = try file.readPositionalAll(io, bytes, 0);
-
-        const log = try record.parseLog(allocator, bytes, diag);
-
-        return .{ .file = file, .io = io, .bytes = bytes, .log = log };
+        const rp = try readAndParse(allocator, io, file, diag);
+        return .{ .file = file, .io = io, .bytes = rp.bytes, .log = rp.log };
     }
+}
+
+/// Holds the parsed content of one read-only load. Constructed by
+/// `openReadOnly`; always released by `close`, on every path. Unlike
+/// `Opened`, carries no open file handle and no lock — a read is a single
+/// snapshot, not something held across a later write.
+pub const ReadOnly = struct {
+    bytes: []u8,
+    log: record.ParsedLog,
+
+    pub fn close(self: *ReadOnly, allocator: Allocator) void {
+        self.log.deinit();
+        allocator.free(self.bytes);
+    }
+};
+
+/// Opens `sub_path` under `dir` **read-only**, for every read command
+/// (section 6) — the read-side counterpart to `openLocked`, factored so
+/// the two share `readAndParse` rather than each re-implementing "read the
+/// whole file, then parse it" (carried item 13, block 6A). Differs from
+/// `openLocked` on exactly the properties that must differ for a read:
+///
+/// - **Never creates the log.** A missing path is `error.NoLog`, the same
+///   error and message `openLocked(.existing_only)` already reports —
+///   `durable-format`: "a missing log file ... the tool reports plainly
+///   that the change has no log yet, rather than creating one silently".
+///   Nothing is created on this path: no file, no directory, no temporary
+///   file (there is nothing here for a temporary file to stage — a read
+///   never calls `atomicReplace`).
+/// - **Takes no lock at all**, rather than an exclusive one. A read opens,
+///   reads, and closes without holding anything across a subsequent
+///   operation, so `openLocked`'s staleness recheck — which exists only
+///   because a *held* lock can outlive the rename that orphans its inode
+///   — does not apply here. What makes a lock-free read safe is D11's own
+///   guarantee: `atomicReplace`'s `rename` means a reader always observes
+///   either the log's previous content or all of the new content, never a
+///   torn record, regardless of whether a write is concurrently in
+///   flight.
+/// - **Ignores any temporary file beside the log** (`durable-format`: "a
+///   read ignores a temporary file"), inherently rather than by a
+///   separate check: this opens `sub_path` by its own name, and a write's
+///   temporary file (`tempName`) is a different, differently-named path
+///   in the same directory — a plain `openFile` on `sub_path` can never
+///   resolve to it, whatever else the directory contains.
+pub fn openReadOnly(
+    allocator: Allocator,
+    io: Io,
+    dir: Io.Dir,
+    sub_path: []const u8,
+    diag: ?*record.Diagnostics,
+) !ReadOnly {
+    var file = dir.openFile(io, sub_path, .{ .mode = .read_only }) catch |err| switch (err) {
+        error.FileNotFound => {
+            if (diag) |d| d.set("no log at this path yet — run 'devlog header' first", .{});
+            return error.NoLog;
+        },
+        else => return err,
+    };
+    defer file.close(io);
+
+    const rp = try readAndParse(allocator, io, file, diag);
+    return .{ .bytes = rp.bytes, .log = rp.log };
 }
 
 /// The temporary file's name: recognisably this tool's own
@@ -1914,4 +1988,100 @@ test "appendRecord accepts a second close on an already-closed item — a correc
     try testing.expectEqual(@as(usize, 4), parsed.records.len);
     try testing.expectEqual(record.CloseState.deferred, parsed.records[2].close.state);
     try testing.expectEqual(record.CloseState.resolved, parsed.records[3].close.state);
+}
+
+test "openReadOnly against a missing log reports plainly and creates nothing (durable-format, carried 13)" {
+    // "The file was not created" is only convincing if the test asserts
+    // the absence directly, not merely that the call didn't crash — so
+    // this iterates the directory afterwards rather than trusting the
+    // error alone.
+    const allocator = testing.allocator;
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    var diag: record.Diagnostics = .init(allocator);
+    defer diag.deinit();
+
+    const result = openReadOnly(allocator, testing.io, tmp.dir, "DEVLOG.jsonl", &diag);
+    try testing.expectError(error.NoLog, result);
+    try testing.expect(std.mem.indexOf(u8, diag.message, "devlog header") != null);
+
+    var count: usize = 0;
+    var it = tmp.dir.iterate();
+    while (try it.next(testing.io)) |_| count += 1;
+    try testing.expectEqual(@as(usize, 0), count);
+}
+
+test "openReadOnly ignores a leftover temporary file and still reports the log missing (durable-format, carried 10)" {
+    // Simulates the aftermath of a write killed before it could clean up
+    // its temporary file (durable-format: "a temporary file is present
+    // from a write that was killed before it could clean up ... no
+    // command reads it, and it is not mistaken for the log"). Only the
+    // temp file exists here, named exactly as `tempName` would name it —
+    // if a read ever mistook it for the log, this would spuriously
+    // succeed instead of reporting NoLog.
+    const allocator = testing.allocator;
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    {
+        var f = try tmp.dir.createFile(testing.io, ".DEVLOG.jsonl.tmp-deadbeefdeadbeefdeadbeefdeadbeef", .{ .truncate = false });
+        defer f.close(testing.io);
+        try f.writePositionalAll(testing.io, "{\"kind\":\"header\",\"seq\":1,\"ts\":\"t\",\"format\":1,\"tool\":\"x\",\"change\":\"x\",\"roles\":[\"architect\"],\"closers\":[\"architect\"]}\n", 0);
+    }
+
+    var diag: record.Diagnostics = .init(allocator);
+    defer diag.deinit();
+    const result = openReadOnly(allocator, testing.io, tmp.dir, "DEVLOG.jsonl", &diag);
+    try testing.expectError(error.NoLog, result);
+
+    // The temp file itself must survive untouched — a read must not
+    // delete, rename, or otherwise treat it as its own.
+    var count: usize = 0;
+    var it = tmp.dir.iterate();
+    while (try it.next(testing.io)) |entry| {
+        try testing.expectEqualStrings(".DEVLOG.jsonl.tmp-deadbeefdeadbeefdeadbeefdeadbeef", entry.name);
+        count += 1;
+    }
+    try testing.expectEqual(@as(usize, 1), count);
+}
+
+test "openReadOnly reads the real log's content, ignoring a temporary file sitting beside it" {
+    const allocator = testing.allocator;
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    var diag: record.Diagnostics = .init(allocator);
+    defer diag.deinit();
+    _ = try appendHeader(
+        allocator,
+        testing.io,
+        tmp.dir,
+        "DEVLOG.jsonl",
+        "t1",
+        "devlog 0.1.0",
+        .{ .change = "x", .roles = &.{"architect"}, .closers = &.{"architect"} },
+        &diag,
+    );
+
+    // A temp file whose content, if it were ever read instead of the real
+    // log, would parse to a *different* record count — so a test that
+    // read the wrong file would be caught by the assertion below, not
+    // just by a crash.
+    {
+        var f = try tmp.dir.createFile(testing.io, ".DEVLOG.jsonl.tmp-cafebabecafebabecafebabecafebabe", .{ .truncate = false });
+        defer f.close(testing.io);
+        const decoy =
+            \\{"kind":"header","seq":1,"ts":"t1","format":1,"tool":"devlog 0.1.0","change":"x","roles":["architect"],"closers":["architect"]}
+            \\{"kind":"post","seq":2,"ts":"t2","role":"architect","body":"from the decoy temp file"}
+            \\
+        ;
+        try f.writePositionalAll(testing.io, decoy, 0);
+    }
+
+    var opened = try openReadOnly(allocator, testing.io, tmp.dir, "DEVLOG.jsonl", &diag);
+    defer opened.close(allocator);
+
+    try testing.expectEqual(@as(usize, 1), opened.log.records.len);
+    try testing.expectEqual(record.Kind.header, std.meta.activeTag(opened.log.records[0]));
 }
