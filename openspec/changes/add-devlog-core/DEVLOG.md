@@ -10091,6 +10091,173 @@ trip on its own):
    `search --help` (`main.zig:409`). The first matters more than it looks: that list is what a future
    reader uses to check a ranking assertion by hand.
 
+**[supervisor]** **Section 7 review — `Request changes`.** Scope `git diff 6c53fa9..HEAD`, four commits
+(`5616310`, `668ae3b`, `4b3242b`, `e9c9791`), five files, `src/search.zig` new. One blocker, and it is
+the one a block review structurally could not see: the ranking is right, the *result set* is unbounded.
+
+**The section is coherent.** I looked hardest at the seam the architect flagged — 7A built the core with
+no derived state, 7B made `search` derive and lifted `list`'s guts out from under it — and it does not
+read as two passes. `resolveFilterSpec` and `selectCandidates` are genuinely one implementation each
+(`main.zig:2143`, `:2200`); the `--kind`/`--state` conflict message is byte-identical from both commands
+against the built binary, as is the undeclared-role refusal; `record.body()` (`record.zig:250`) is the
+single place that decides what a document is and `search.zig` never switches on the union tag. R1–R6 were
+all honoured, and none of them was wrong. No new dependency (`.dependencies = .{}`), no new file written
+by any path — I ran `search` against a 191-record log and compared the directory listing and the log's
+size and mtime before and after: unchanged, nothing created. No persisted index, no cache, no model, no
+daemon; the Makefile needs no new target because `src/search.zig`'s 13 tests reach the one test binary
+through `main.zig`'s import. Every block quotes its four exit lines, on three independent runs.
+
+**BLOCKER — `log-retrieval` "The log can be searched by meaning" is not satisfied for the input class it
+names.** The requirement is *"records relevant to a question expressed in natural language, so that an
+agent can find what was decided about a topic **without ingesting the log**"*, and its scenario is *"it
+receives the relevant records rather than the entire log"*. I built the realistic corpus D3 argues from —
+this change's own `DEVLOG.md`, 190 posts plus a header, 806 KB of `DEVLOG.jsonl`, median body 481 words —
+and asked it the questions this tool exists to answer:
+
+| query | records returned | `--json` bytes | vs whole-log dump |
+|---|---|---|---|
+| `what was decided about closing items` | 156 / 191 | 774 KB | **96%** |
+| `atomic replace temporary file` | 110 / 191 | 645 KB | 80% |
+| `utf-8 validation` | 77 / 191 | — | 40% |
+| `declared closers` | 61 / 191 | 407 KB | 51% |
+
+`search` matches on **any** query term and returns **every** match, so a natural-language question — which
+is mostly function words, and there is deliberately no stop list — returns the log. An agent that searches
+ingests 96% of what it was searching to avoid reading. That is the proposal's own opening complaint
+(`proposal.md:11`, "reading for context ingests all of it") reproduced inside the command built to fix it.
+
+`7.4`'s test passes honestly and still misses this: `main.zig:8198` asserts `records (5):` against
+`records (9):` for the **single-word** query `lock` over a **nine-record** fixture. The property holds for
+one word over nine records and fails for a sentence over 191. That gap is invisible from any one diff and
+is exactly what this pass is for.
+
+**This is not a D3 revisit — bank the opposite.** Ranking quality is good: across seven probes the top
+three hits were the right records every time (`utf-8 validation` → the Product Owner's B1 decision;
+`stdin terminal hang` → the `body.zig` block; `atomic replace temporary file` → the interrupted-write
+ruling). Lexical BM25 over 50–200 records does the job D3 claims. What is missing is a cap on the tail.
+
+**Suggested remediation shape** — one small block, `runSearch` and its usage only:
+
+1. **A bounded result set on `search`.** Apply it to `ranked` **after** the sort and **before** the
+   renderers (`main.zig:2500–2511`), so the cap is in the one derivation and both renderings show the same
+   thing (D15) — never in the text renderer alone. A `--limit <n>` in the same exactly-once,
+   value-validated shape as `--kind`/`--state`, with an explicit way to ask for everything.
+   Top 10 costs ~50–75 KB instead of 774 KB on the corpus above.
+2. **The count must not lie.** `writeRecordListText` prints `records (N):`; with a cap, `N` is no longer
+   how many matched. Either it reports both (`records (10 of 156):`) or the header changes — a ruling,
+   not a worker's choice, and it is the one place this touches a renderer `list`/`refs` share.
+3. **`list` and `refs` keep their whole-log contract** — dumping everything is what listing *is*. Say so
+   in the brief or a worker will generalise the cap across the read surface.
+4. **Re-cut `7.4`'s assertion** so it bites: a multi-word natural-language query over a fixture where most
+   records match at least one term, asserting the returned count is bounded and not the log. Determinism
+   is unaffected — the cap is a prefix of an already total order — but keep it in the 8-run loop.
+5. **`search_usage` and `8.4`.** The usage today promises "the matching records, most relevant first" with
+   no mention of a bound; `8.4` owes prose for all seven surfaces and has not been written, which is
+   precisely why this is cheap now and expensive after.
+
+**Not the fix, and I checked it so nobody has to:** requiring *all* query terms (AND) collapses these same
+questions to 1–2 hits (`what was decided about closing items` → 1, `concurrency safety` → 1). It trades an
+unusable tail for unusable recall. The cap keeps the ranking that measurably works.
+
+**❓ @architect** — two calls that are yours, and one that may be the Product Owner's: is the cap **on by
+default** (I recommend yes; an opt-in bound is a bound no agent will pass), what is the default N, and
+does the bound get recorded in `design.md` — a sentence on D3, or a new decision — given `8.4` must
+document the surface precisely enough to reimplement, and `9.4` hands it to the `dmon-dev` plugin?
+
+**Architectural notes — `## NEXT`, not the fix block.**
+
+- **`--state`/`--blocking` mean two different result *shapes* on two sibling commands** — items from
+  `list`, records from `search` (R2, deliberate, documented in both usages). It is the one place the read
+  surface is not uniform, and it is the kind of thing a plugin author meets at 2am. State it once,
+  explicitly, in `8.4` and in whatever `9.4` hands the plugin.
+- **No stop list is right under D3, and it is why the tail is long.** Harmless once the cap lands; if the
+  cap is ever rejected, this becomes the thing to fix instead — and that *would* be a D3 revisit, which
+  this evidence does not support.
+- **Confirming, not re-raising, the architect's queue:** carried 21's dead `list` sort (`main.zig:2334`),
+  the `--role`/`--to` duplication (`:2280–2290` / `:2463–2473`), and the two cosmetics. I found the same
+  three independently and agree with the ruling on each; they are already queued and none blocks.
+- The two deliberately-kept unreachable arms (`run`'s not-implemented, `printCommandHelp`'s) are ruled and
+  I am not re-opening them; the comments accurately say why they are there.
+
+No box should be unticked: `7.1`–`7.4` were all built. The gap is a requirement the tasks did not fully
+name, which is why the fix block takes no numbers. → @architect
+
+**[architect]** **Blocker accepted in full, and the finding is the best argument this project has yet
+produced for the outer loop.** Two block reviews checked everything they were asked to check and were
+right about all of it. Neither could see this, because **no block fixture was a realistic corpus** — the
+defect is invisible at nine records and total at 191. `7.4`'s test is honest and still misses it: `records
+(5):` versus `records (9):` for the single word `lock`. It asserts the right property against a corpus too
+small for that property to be able to fail. That is a lesson for how fixtures are sized, not just a bug.
+
+Note what the supervisor did **not** do: it did not treat "search returns too much" as evidence against
+D3. It checked ranking quality first (top-3 correct on all seven probes), then tested the tempting
+alternative — AND-semantics — and found it collapses these same questions to 1–2 hits. So the diagnosis is
+that BM25 works and the *tail* is unbounded. A matching change would have been the wrong fix, adopted
+under pressure from a real number. Recorded because the next person to see "96%" will reach for
+AND-semantics too.
+
+**R7 — a default result cap, and `--json` grows a shape to stay honest.** The Product Owner ruled both
+halves.
+
+- **The cap is on by default at 10**, overridable with `--limit <n>`. `--limit 0` means unbounded, which is
+  how a caller asks for the old behaviour deliberately. The right records landed in the top 3 on all seven
+  probes, so 10 is headroom, not a guess; ~50–75 KB replaces 774 KB.
+- **`search --json` becomes `{"total":156,"limit":10,"records":[…]}`** — this **amends R3**, which chose a
+  bare array precisely to avoid a seventh top-level JSON shape. R3's shape-economy argument was sound and
+  is now outweighed: a bare array cannot say it was truncated, and the consumer at `9.4` is a plugin, not a
+  human who can notice. **Silent loss in the machine-readable rendering is the one outcome this tool must
+  never produce** — the same principle that produced R1, applied to output instead of input. R3's other
+  halves stand unchanged: ties still break by `seq` ascending, and that tiebreak is now *more* load-bearing,
+  because it is what makes the cap's boundary deterministic when scores tie across it.
+- **Text renders `records (10 of 156):` when capped**, and `records (10):` when not.
+
+**The cap goes in the one derivation** — after the sort, before either renderer (`main.zig:2500–2511`) — so
+the two renderings cannot disagree about what was dropped (D15). `writeRecordListText` is **shared with
+`list` and `refs`**, which keep their whole-log contract and their bare arrays: give it an optional total,
+pass `null` from those two, and their output must come out **byte-identical**. That is the property to
+prove, not to assert.
+
+**[architect]** → @worker — **remediation block (section 7 supervisor). No task numbers, and it ticks
+nothing** — every box in section 7 is already ticked and stays ticked. The gap is a requirement the tasks
+did not fully name.
+
+**Read first:** the supervisor's post immediately above (the whole thing, including its table), then
+**R7** above, then **R1–R6** earlier under this heading. R7 amends R3; where they conflict, R7 wins, and
+the parts of R3 it does not name are untouched.
+
+**1. The blocker — the cap.** As specified in R7. `--limit <n>` joins `search`'s flag memberships in the
+same shape as `--kind`/`--state`; a non-numeric or negative value is a refusal in the same first-fault-wins
+structure as every other bad flag value (A6). `--limit 0` is unbounded and is **not** an error.
+
+**2. `list` and `refs` must not move.** They keep the whole-log contract and the bare JSON array. The
+reviewer proved 7B's extraction left `list` untouched with a 750-probe matrix across two binaries; expect
+that standard again, and make it easy to meet by keeping the change additive.
+
+**3. Re-cut `7.4`'s test around a multi-word query.** The existing assertion stays, but it is not
+sufficient on its own — add one over a corpus **large enough that an uncapped any-term match would return
+nearly all of it**, so the test fails if the cap is ever removed. Size the fixture so the property can
+fail. That is the actual lesson of this finding.
+
+**4. The three queued items, now that they travel with a commit** (all previously ruled, none new):
+- **Remove the dead `seq` sort at `main.zig:2334`**, replacing it with one sentence of comment: combined-
+  filter results already arrive in `seq` order because `validateSeqOrder` makes log order and `seq` order
+  the same thing, so if that validation is ever relaxed the sort must come back. Worker, reviewer and
+  supervisor all reached this independently — you are executing a ruling, not re-deciding it.
+- **De-duplicate the `--role`/`--to` history checks** (`main.zig:2280–2290`, `:2463–2473`).
+- **Two cosmetics**: restore `seedSearchFixture`'s numbered record list, which the 7B `block` paragraph
+  split in half (`:7842–7851`), and reword `The filters are 'list''s` at `:409`, which renders as a doubled
+  apostrophe in `search --help`.
+
+**5. `search_usage` documents `--limit`, its default, and `--limit 0`** — `8.4` is written from these.
+
+**Do not touch `design.md`.** Recording the bound as a design decision is mine and I will do it once this
+lands; it is not yours to edit and the block does not need it.
+
+**Done-gates:** `make gates` → `GATES_EXIT:0`, quote all four exit lines individually. Post progress here.
+**You do not commit and you do not tick boxes** — nothing in this block ticks anything. Hand off
+`→ @reviewer`. If R7 is ambiguous, or the shared-renderer change cannot be made without moving `list`'s
+output, **stop and post `❓ @architect`** rather than choosing.
+
 ## NEXT
 
 **[architect]** **Sections 1–6 are CLOSED and fully ticked** — 39 of 52 boxes, no outstanding
