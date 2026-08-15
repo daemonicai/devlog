@@ -9366,14 +9366,134 @@ Landed: `c8a3f25` (opened, **D15**, carve, 6A brief), `778acb6` (6A, `6.6`/`6.2`
 (re-review, two notes actioned). Gates `GATES_EXIT:0`, **252** tests — counted, not quoted. All six boxes
 ticked.
 
+## 7. Search
+
+**[architect]** Base: `6c53fa9` — search: an in-memory BM25 ranking over record bodies (`7.1`), the
+`devlog search <query>` command (`7.2`), narrowed by section 6's filters (`7.3`), with the section's
+tests (`7.4`). The last section that adds a command; `8.x` is documentation and release, `9.x`
+validation and handoff.
+
+**[architect]** **Carve — two blocks.**
+
+- **7A = `7.1`–`7.2`** — tokenisation, the BM25 index built in memory per invocation, the command, its
+  two renderings, and the positional-argument arity that `search` is the first command to need.
+- **7B = `7.3`–`7.4`** — narrowing the query by `6.3`'s filters, and the section's tests, including the
+  one that finally gives carried 21's `runList` sort real power.
+
+**[architect]** **Four rulings, taken before 7A is briefed rather than during its review.** `## NEXT`
+named the first three as decisions the brief owes; R3 surfaced while writing it. The Product Owner chose
+R1's and R2's shape.
+
+**R1 — `search` takes exactly one positional, and refuses everything else about that argument.** A
+second bare token raises `.unexpected_argument` through A6's single `?ParseFault`, first-fault-wins,
+exactly as a stray token after `post` does. `takes_positional` **stays a boolean**: the arity is
+enforced where the query is *stored* — set once into `p.query`, the same shape as `setOnce` for a flag —
+not by promoting the property to a count. Multi-word queries are the caller's to quote. Two corollaries
+that are part of this ruling, not left to the review: **no positional at all** and **an empty positional**
+are both refusals, the latter matching `empty_value_for`'s wording for flags. And **`search` must join
+`strict`** in `parseArgs` — it is absent from that set today, which is why `search --section 6` currently
+reaches the not-implemented message rather than a parse fault. This is the ruling B1 was reopened by; it
+closes here rather than being rediscovered by the reviewer.
+
+**R2 — `--state`/`--blocking` narrow search's candidates; they never switch its output shape.**
+`--state open` restricts the ranked candidate set to `item` records whose derived item is in that state;
+the ranking and the rendering are unchanged, so `search` returns records under every combination of
+flags. `--kind` naming anything but `item` alongside either is refused **by `runList`'s existing guard
+and its existing message**, lifted to one shared place — not copied. This is 7B's to build; it is stated
+now so 7A builds the parse surface once.
+
+**R3 — the ranking is the order, not a score field.** `search` reuses `writeRecordListText` and
+`writeRecordListJson` verbatim, so it emits the shape `list` already emits and adds no seventh top-level
+JSON shape to the six `8.4` already owes prose for (D15: one derivation, two renderings). Three reasons
+beyond the shape count: a score makes BM25's `k1`/`b` observable contract, so tuning them later becomes a
+breaking change; a consumer that renders `list` renders `search` unchanged; and the ranking survives
+intact as the array order. **Ties break by `seq` ascending** — that is what makes `7.4`'s determinism
+requirement testable rather than aspirational. Reversible in the safe direction: adding the field later
+is additive, removing it would not be.
+
+**R4 — the indexed document is `common.body`, and nothing else.** `record.Record` gains `body()`
+alongside `role()` and `to()` — `null` for `header` (no `Attributed` to carry one), `r.common.body`
+otherwise. D3 says "BM25 over bodies"; a `section`'s `title`, a `verdict`'s `commit`, a `close`'s state
+are metadata, not prose, and stay out. The union owns which field is its body exactly as it already owns
+its role and its addressee, so the search module must never switch on the tag itself. A record with no
+body is not a document.
+
+**[architect]** → @worker — **block 7A (`7.1`–`7.2`)**.
+
+**Tasks.**
+
+- `7.1` Implement tokenisation and a BM25 index over record bodies, built in memory per invocation (D3).
+- `7.2` `devlog search <query>` returning ranked matching records, scoped to the one log file.
+
+**The spec** (`specs/log-retrieval/spec.md`, *The log can be searched by meaning*):
+
+> The tool SHALL support searching the log for records relevant to a question expressed in natural
+> language, so that an agent can find what was decided about a topic without ingesting the log. Search
+> SHALL be scoped to a single change.
+>
+> - **WHEN** an agent searches for a topic discussed in earlier records
+>   **THEN** it receives the relevant records rather than the entire log
+> - **WHEN** an agent searches
+>   **THEN** only records belonging to the change being searched are considered
+
+The second scenario needs **no code**: the tool only ever opens the one file `--log` names, so scoping is
+structural. Say so in a comment rather than adding a guard that can only ever be true.
+
+**The binding decision** (`design.md`, D3 — *Lexical search now; embeddings only on evidence*): BM25 over
+bodies. No embeddings, no llama.cpp, no GGUF, no persisted index. The corpus is 50–200 records, so the
+index is built on each invocation from the records already in memory and thrown away with them — **do not
+add caching or an index file**; the log is this tool's only state.
+
+**Also binding: R1–R4 immediately above.** Read them; they are decisions, not suggestions, and three of
+them exist because the review would otherwise have to take them under pressure.
+
+**What to build.**
+
+1. **`src/search.zig`, a new module** — tokenisation and BM25 over a slice of `record.Record`. It takes
+   records and a query and returns them ranked; it does not open files, print, or know about argv.
+2. **The tokeniser is the thing determinism rests on, so define it explicitly and comment it.** ASCII
+   case fold, split on non-alphanumeric, **no stemming and no stop-word list** — D3 licenses neither, and
+   a stop list is a second place for vocabulary to live. It must be **UTF-8-safe**: bodies are validated
+   UTF-8 (C4), and a tokeniser that treats every byte ≥ `0x80` as a separator shatters one non-ASCII word
+   into several. Treat those bytes as token characters.
+3. **BM25 proper** — `k1 = 1.2`, `b = 0.75`, IDF over the record corpus, document length in tokens. Write
+   the formula into a comment; it is not self-evident from the code and `8.4` may have to describe it.
+4. **`runSearch` in `main.zig`** — `log.openReadOnly` (a read **must not create** the log, carried 13),
+   rank `opened.log.records`, render. 7A needs **no** `state_mod.derive`: nothing in this block reads
+   derived state, and 7B will add it when `--state` first needs it.
+5. **Rendering — reuse `writeRecordListText` and `writeRecordListJson` unchanged** (R3, D15). `--json`
+   stays exactly one line, the newline the caller's.
+6. **Refusals**: no query, empty query, a second positional (R1). **Zero matches is an ordinary success** —
+   exit 0, empty list, exactly as `refs` rules it. A search that finds nothing is an answer.
+
+**Tests this block owes** (its own; `7.4`'s explicit boxes are 7B's): the tokeniser on ASCII, punctuation,
+and a multi-byte sequence; ranking order on a corpus where the answer is known by hand; **ties break by
+`seq` ascending**; the three arity refusals with their exit codes; zero-match success; `--json` emitting
+one line. Two existing tests at `src/main.zig:2608` and `:2618` assert `search` is *not implemented* —
+they were deliberately retargeted at `search` because it was the last placeholder, and this block is
+where they get a real destination. Retarget or replace them; do not delete the coverage they carry.
+
+**Memory discipline**: `std.testing.allocator` catches leaks and this project has already paid for two.
+The index owns allocations for one invocation — free them, or arena them and say which.
+
+**Done-gates — read the exit line, never the output.** `make gates` → `GATES_EXIT:0`, and quote
+`BUILD_EXIT`, `TEST_EXIT`, `FORMAT_EXIT`, `VALIDATE_EXIT` individually in your report. Post progress here
+as you go. **You do not commit and you do not tick boxes** — report back and hand off `→ @reviewer`.
+If anything in the spec, in D3, or in R1–R4 is ambiguous or contradicts what the code already does,
+**stop and ask `❓ @architect` in this thread** rather than choosing for me.
+
 ## NEXT
 
 **[architect]** **Sections 1–6 are CLOSED and fully ticked** — 39 of 52 boxes, no outstanding
 human-in-the-loop items. Section 6 closed on `606503c` + the leak nit; section 5 on `31eb5e3`; see the two
 close posts immediately above this heading for each section's landed commits and test counts.
 
-**Section 7 is next** — search (`7.1`–`7.4`). It is the last section that adds a command; `8.x` is
-documentation and release, `9.x` is validation and handoff.
+**Section 7 is OPEN** — search (`7.1`–`7.4`), base `6c53fa9`, carved 7A (`7.1`–`7.2`) + 7B
+(`7.3`–`7.4`). It is the last section that adds a command; `8.x` is documentation and release, `9.x` is
+validation and handoff. **Of the five things below, the three that were open questions are now ruled** —
+see R1–R4 under `## 7.`: one positional and `search` joins `strict` (R1), `--state` narrows candidates
+without switching the output shape (R2), the ranking is the array order with ties by `seq` and no seventh
+JSON shape (R3), the indexed document is `common.body` alone (R4).
 
 **Five things bind section 7, and three of them were written before it started:**
 
