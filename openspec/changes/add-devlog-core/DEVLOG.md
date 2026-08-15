@@ -8778,6 +8778,223 @@ and `brief` but not `section`; the six undocumented top-level JSON shapes `8.4` 
 and what `search --state open` should mean, which `7.3` must answer while `runList` is still the only
 consumer of those filters.
 
+**[worker]** **Remediation block (section 6 supervisor blockers 1-3) implemented. No new N.M numbers, nothing ticked.**
+
+**Blocker 1 — one rule for `--role`.** `parseArgs` gained `wants_role_value` (`src/main.zig`): the set of
+commands that recognise `--role` as their own value — every write command, `resume` (identity, required),
+`list` (filter) — plus `command_hint == null` so a bare `--role` with no command word yet still parses
+(pre-existing edge-case tests pinned this). `show`/`status`/`refs` are deliberately absent, so `--role` on
+any of them now falls through to the ordinary `unknown_flag` fault (A5/A6), same shape as any other flag a
+command doesn't recognise (e.g. `close --to`).
+
+For the two commands that do take a value, added `log.checkDeclaredRole`/`log.checkDeclaredTo`
+(`src/log.zig`) — new `pub` functions sitting beside `checkRoleAllowed`, sharing its
+`containsString`/`setUndeclaredMessage` helpers and its exact message shape (`role '{s}' is not declared
+for this project — declared roles: {s}`, `error.UndeclaredRole`/`error.UndeclaredTo`). `latestHeader` made
+`pub` for them to call. `runResume` validates its required `--role` right after `openReadOnly` succeeds
+(before `derive`); `runList` validates `--role`/`--to` the same way, only when given. A declared
+role/addressee with nothing matching still returns the ordinary empty result at exit 0 — pinned as its own
+test, distinct from the refusal.
+
+**Blocker 2 — the newline belongs to the caller.** `writeItemJson` (`src/main.zig`) no longer emits its own
+trailing `\n` (`"]}\n"` → `"]}"`) — matches `record.write`'s existing contract. `runShow`'s `--item --json`
+branch now adds the newline itself, exactly as `--seq` already does. `writeCurrentStateJson`/
+`writeItemListJson` needed no change — they already add their own container's trailing newline around each
+element.
+
+**Blocker 3 — one predicate.** `runList`'s item-only branch no longer re-answers
+`--section`/`--block`/`--role`/`--to` field by field; it now calls `matchesListFilters(record.Record{
+.item = it.opened }, p, null)` — the same predicate the record path uses. A deletion, not a rewrite, per
+the supervisor's own suggested shape.
+
+**One-liner:** the `runList` combined-filter sort comment now names **carried 21** explicitly, so the next
+reader finds the ruling rather than re-deriving it.
+
+**Tests (6 new, all proved by mutation on a scratch copy — comment out the fix, rerun, confirm exactly the
+intended test fails and no other):**
+- `resume --role wroker` (undeclared) refuses, same message shape as the write side. Mutation: removing
+  the `checkDeclaredRole` call failed exactly this one test (248/249).
+- `resume --role reviewer` (declared, nothing open) is an ordinary exit-0 empty success — pins the
+  distinction blocker 1 is about.
+- `list --role`/`--to wroker` (undeclared) each refuse; `list --role architect --section 999` (declared,
+  no matches) is an ordinary exit-0 empty success.
+- `show`/`status`/`refs` each refuse a bare `--role` as `unknown flag '--role'`, pre-filesystem. Mutation:
+  reverting the parser gating failed exactly this one test.
+- `status --json`/`resume --json`/`list --state open --json` each carry exactly one `\n` (the trailing
+  one), asserted by both a literal count and a JSON `parseFromSlice` round-trip. Mutation: reverting the
+  `writeItemJson` newline fix failed exactly this one test (expected 1, found 4).
+- `list --state open --to worker --json` and `resume --role worker --json` return the same item set, in
+  the same order — a regression guard for blocker 3's "one predicate" claim (structural; not independently
+  mutation-provable since the two paths agreed even before the fix).
+
+Only `src/log.zig` and `src/main.zig` changed — `tasks.md` and `Makefile` untouched, no new dependency,
+nothing persisted beyond the log, `openReadOnly` used throughout.
+
+**Gates.** `BUILD_EXIT:0` `TEST_EXIT:0` `FORMAT_EXIT:0` `VALIDATE_EXIT:0` `GATES_EXIT:0` — **249/249** tests
+pass (6 new), counted via `zig build test --summary all`.
+
+No commit, no ticks (nothing left to tick in this section). → @reviewer
+
+**[reviewer]** **Remediation block (section 6 supervisor blockers 1-3) audited. Verdict: Approve.**
+
+**Gates, re-run independently.** `BUILD_EXIT:0` `TEST_EXIT:0` `FORMAT_EXIT:0` `VALIDATE_EXIT:0`
+`GATES_EXIT:0`. Test total counted, not quoted: `zig build test --summary all` → **249/249 tests
+passed**, matching the worker's number exactly. Scope confirmed by `git diff HEAD --name-only`:
+`DEVLOG.md`, `src/log.zig`, `src/main.zig` only — `Makefile`, `build.zig`, `build.zig.zon`,
+`tasks.md` untouched, no new dependency.
+
+**Blocker 1 — one rule for `--role`, verified uniform across all five read commands, not read
+about it.** Walked the parser and each `runX`:
+
+- `resume` (`main.zig:1750`) — `log.checkDeclaredRole` right after `openReadOnly`, before `derive`
+  (A3 ordering preserved). Required identity, refused if undeclared.
+- `list` (`main.zig:2033-2042`) — `checkDeclaredRole`/`checkDeclaredTo`, each only when the
+  corresponding flag is given, same placement before `derive`.
+- `show`/`status`/`refs` — `wants_role_value` (`main.zig:736-737`) deliberately excludes all
+  three, so `--role` on any of them falls through to the generic `unknown_flag` fault
+  (`main.zig:801`), which fires because `wants_show`/`wants_status`/`wants_refs` are in `strict`
+  (`main.zig:699-701`) — refused regardless of where `--role` sits on the line, since
+  `command_hint` is resolved by a whole-args scan before the loop runs, not incrementally. No
+  fourth behaviour left; the three-way asymmetry the supervisor found is gone.
+- Message shape confirmed identical to the write side: `checkDeclaredValue`
+  (`log.zig:750-770`) calls the same `setUndeclaredMessage`/`containsString` helpers
+  `checkRoleAllowed` (`log.zig:713-737`) uses, same format strings, same
+  `UndeclaredRole`/`UndeclaredTo` error names.
+- A log with no header at all: `checkDeclaredValue`'s `latestHeader(...) orelse` branch
+  (`log.zig:756-759`) sets the identical `"no header declared…"` message `checkRoleAllowed`
+  already uses and returns `error.NoHeader`, which `reportLogError` (`main.zig:841-844`) resolves
+  through `diag.message` — clean exit `1`, no panic, no `.?`. This exact branch has no dedicated
+  read-side test (nit below), but it is the same already-tested code path the write side exercises
+  (`log.zig:1122`), reused verbatim.
+- A declared role/addressee that legitimately has nothing open still returns an ordinary exit-`0`
+  empty result — pinned by its own tests (`resume --role reviewer`, `list --role architect
+  --section 999`), distinct from the refusal case.
+
+**Blocker 2 — the newline, verified by driving the binary in both forms, not by reading.** Built
+`zig-out/bin/devlog`, seeded a fresh log (`header` → `architect`/`architect`, one open `item`, one
+`next`), and measured `wc -l` on all seven `--json` forms directly:
+
+```
+show --seq 1 --json:              1 lines
+show --item 1 --json:             1 lines
+list --json:                      1 lines
+refs --ref design:D1 --json:      1 lines
+status --json:                    1 lines
+resume --role architect --json:   1 lines
+list --state open --json:         1 lines
+```
+
+All seven — the four that were already single-line plus the three composites the supervisor's
+table flagged — are exactly one line, measured, not asserted. Read `status --json`'s and
+`list --state open --json`'s bytes directly too: both are one full JSON value terminated by a
+single trailing `\n`, each carrying the seeded item with no embedded newline inside it.
+`writeItemJson` (`main.zig:1520`) ends `"]}"`, no trailing newline; every caller (`runShow`'s
+`--item` branch at `main.zig:1906-1911`, `writeCurrentStateJson` at `:1694-1705`,
+`writeItemListJson` at `:1564-1571`) adds its own, matching `record.write`'s contract. One JSON
+value per line, uniformly. (Also noticed in passing, not a finding: `status --json`'s object
+correctly carries no `"brief"` key at all — `.not_applicable => {}` — matching D15's "envelope,
+not a null a reader could mistake for checked-and-empty" intent from its own doc comment.)
+
+**Blocker 3 — one predicate, confirmed by trace, not by the worker's word that they agree.**
+`runList`'s item branch (`main.zig:2064`) now calls `matchesListFilters(record.Record{ .item =
+it.opened }, p, null)`. Checked field-by-field against the deleted inline version: `record.Record`'s
+`.role()`/`.to()` (`record.zig:230-248`) and `state_mod.recordSection`/`recordBlock`
+(`state.zig:159-171`) all resolve `.item` to `r.common.{role,to,section,block}` — byte-identical to
+what the inline branch read directly. `role` is never optional at the schema level, so `rec.role()
+orelse return false` inside `matchesListFilters` never actually triggers for an item; behaviour is
+unchanged, not merely re-tested. No new duplication introduced by the extraction.
+
+**Carried 21** — named in the `runList` sort comment (`main.zig:2114`), exactly as ordered.
+
+**Test power — verified independently by mutation, not taken on the worker's report.** Copied the
+tree to a scratch directory, busted the cache, and reran twice:
+
+1. Deleted the `checkDeclaredRole` call from `runResume` — exactly one test failed:
+   `"resume --role naming an undeclared role refuses…"` (248/249, `expected 1, found 0`). No other
+   test moved.
+2. Reverted `writeItemJson`'s `"]}"` back to `"]}\n"` — exactly one test failed: `"status --json,
+   resume --json, and list --state open --json carry no embedded newline…"` (248/249, `expected 1,
+   found 4`). No other test moved.
+
+Both match the worker's own reported mutation results exactly. These are not "there is a test" —
+they are "the test catches the regression it exists to catch."
+
+**No regression in what the supervisor confirmed holds.** `git diff HEAD` shows no new `.?` in
+either file (checked directly); no write command's parsing, output, or `--json` refusal is
+touched; all five read commands still load only through `log.openReadOnly`; nothing new is
+persisted; the diff is additive to `DEVLOG.md`.
+
+**Nits (not blocking):**
+
+1. **No dedicated read-side test for "read against a headerless log."** `checkDeclaredValue`'s
+   `NoHeader` branch is exercised only by trace and by the write side's existing coverage
+   (`log.zig:1122`) — not directly through `resume`/`list` against a real headerless log on disk.
+   Low risk (the branch is a straight reuse of already-tested code, and a log without a header is
+   hard to construct through the CLI at all), but worth a cheap fixture if this file is touched
+   again before the section archives.
+
+No architectural notes beyond what the supervisor and architect already parked in `## NEXT` — this
+block stays inside the three named blockers, no drive-by scope, no new dependency, nothing
+persisted, `Makefile`/`tasks.md` untouched.
+
+Clear to commit. No further round needed.
+
+→ @architect
+
+**[architect]** **The nit closes in this block — and note it is a path this remediation created.**
+
+The standing rule applies and I am applying it a fourth time: an untested branch in a block's binding
+constraint closes in that block. The one waiver was for the `runList` sort, on the ground that the branch
+is **unreachable**; this one is reachable, cheap, and reached by a two-line log.
+
+**What makes it worth the round rather than a carry:** the headerless-read path did not exist before this
+block. Blocker 1's fix made every validating read consult the latest header, so a log with no header now
+has a code path it never had. **A fix for one problem introducing an untested path is the most common way
+a remediation block earns a second remediation block** — and this section's supervisor has already
+demonstrated that this project's real defects live in branches nothing executes.
+
+The reviewer traced it to a clean `error.NoHeader` → `reportLogError` exit with no panic, and I believe
+the trace. But 6B's blocker was also a path everyone believed was fine, and it aborted the process the
+first time anyone actually ran it against a log this tool had not written. A trace is not a gate.
+
+**Add one test: a genuinely headerless log driven through a validating read** (`resume --role X`, and
+`list --role X` if it costs nothing extra), asserting a plain diagnostic and a non-zero exit rather than a
+panic or a misleading empty success. It must fail if the `NoHeader` handling is removed.
+
+**Nothing else.** No production change — the reviewer approved the implementation and measured all seven
+`--json` forms at one line each on the built binary.
+
+**One-test addition to an approved block: I will verify the diff and gates directly** rather than spend a
+fourth review round on it. No commit, no ticks.
+
+**[worker]** **Nit closed — one test, no production change.**
+
+Added `seedHeaderlessLog` (`src/main.zig`): writes two ordinary `post` records directly to the file via
+`writePositionalAll`, bypassing `log.appendHeader`/`appendRecord` entirely — the CLI itself can never
+produce this log, since `checkRoleAllowed` refuses every write until a header exists. Seq `1..2`,
+contiguous, real parseable content, never once a `header` record, so `latestHeader` over it is `null` and
+`checkDeclaredValue` must take the `NoHeader` branch.
+
+New test drives both commands the brief named: `resume --role architect` and `list --role architect`
+against that log, each asserting exit `1`, stderr containing `"no header declared"` and `"devlog header"`
+(same message `checkRoleAllowed`'s write-side refusal already uses), and empty stdout — a plain diagnostic,
+not a panic and not a misleading empty success.
+
+**Verified by mutation, on a scratch copy outside the tree.** Changed `checkDeclaredValue`'s `orelse`
+branch from `{ diag.set(...); return error.NoHeader; }` to a bare `orelse return` — i.e. removed the
+`NoHeader` handling, letting a headerless log fall through as if any value were declared. Reran:
+**exactly** the new test failed (`249/250`, `expected 1, found 0` — `resume --role architect` returned
+exit `0` instead of `1`, precisely the "misleading empty success" the brief warned about), no other test
+moved. Scratch copy discarded after.
+
+`src/main.zig` is the only file this touches — `src/log.zig`, `record.zig`, `Makefile`, `tasks.md`
+untouched.
+
+**Gates.** `BUILD_EXIT:0` `TEST_EXIT:0` `FORMAT_EXIT:0` `VALIDATE_EXIT:0` `GATES_EXIT:0` — **250/250**
+tests pass (1 new), counted via `zig build test --summary all`.
+
+No commit, no ticks. → @architect for the diff/gates check in lieu of a fourth review round.
+
 ## NEXT
 
 **[architect]** **Section 5 is CLOSED** — supervisor `Approve` on the **first** pass, no remediation

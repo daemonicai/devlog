@@ -470,7 +470,7 @@ fn headerUnchanged(latest: record.HeaderRecord, tool: []const u8, decl: HeaderDe
         sameRoleSet(latest.closers, decl.closers);
 }
 
-fn latestHeader(records: []const record.Record) ?record.HeaderRecord {
+pub fn latestHeader(records: []const record.Record) ?record.HeaderRecord {
     var i = records.len;
     while (i > 0) {
         i -= 1;
@@ -734,6 +734,51 @@ fn checkRoleAllowed(records: []const record.Record, rec: record.Record, diag: ?*
         setUndeclaredMessage(diag, "role '{s}' is not a declared closer — declared closers: {s}", "role '{s}' is not a declared closer", writer_role, latest.closers);
         return error.RoleNotCloser;
     }
+}
+
+/// `checkRoleAllowed`'s reasoning, applied from the read side (section 6
+/// supervisor finding, blocker 1). `append-only-log`'s own justification
+/// for the write-side refusal is stated in terms of exactly this read —
+/// "a record addressed to a misspelt role is addressed to nobody, and
+/// every derived per-role view … silently omits it" — which is precisely
+/// what `devlog resume --role <r>` and `devlog list --role`/`--to <r>`
+/// render. Unlike `checkRoleAllowed`, there is no `record.Record` on a
+/// read: only a bare value one of these flags carried, so this validates
+/// the value directly. `subject` selects both the message text and the
+/// error returned, mirroring `checkRoleAllowed`'s own two-case naming
+/// (`UndeclaredRole`/`UndeclaredTo`) rather than collapsing them into one.
+fn checkDeclaredValue(
+    records: []const record.Record,
+    comptime subject: []const u8,
+    value: []const u8,
+    diag: ?*record.Diagnostics,
+) !void {
+    const latest = latestHeader(records) orelse {
+        if (diag) |d| d.set("no header declared for this log yet — run 'devlog header' first", .{});
+        return error.NoHeader;
+    };
+    if (!containsString(latest.roles, value)) {
+        setUndeclaredMessage(
+            diag,
+            subject ++ " '{s}' is not declared for this project — declared roles: {s}",
+            subject ++ " '{s}' is not declared",
+            value,
+            latest.roles,
+        );
+        return if (comptime std.mem.eql(u8, subject, "role")) error.UndeclaredRole else error.UndeclaredTo;
+    }
+}
+
+/// `resume --role <r>`'s identity and `list --role <r>`'s filter: refuses
+/// an undeclared role in the same shape as the write side's own refusal
+/// (blocker 1).
+pub fn checkDeclaredRole(records: []const record.Record, value: []const u8, diag: ?*record.Diagnostics) !void {
+    return checkDeclaredValue(records, "role", value, diag);
+}
+
+/// `list --to <r>`'s filter: refuses an undeclared addressee, same shape.
+pub fn checkDeclaredTo(records: []const record.Record, value: []const u8, diag: ?*record.Diagnostics) !void {
+    return checkDeclaredValue(records, "--to", value, diag);
 }
 
 fn containsString(haystack: []const []const u8, needle: []const u8) bool {
