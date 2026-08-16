@@ -11047,6 +11047,81 @@ x86_64/arm64 (D12), plus the two items carried above. The `Makefile` target is *
 worker's; `NEXT` also owes this block the `-Dversion=X` breakage (the override makes `build_options.version`
 and `manifest.version` disagree) and the umask pin for the permissions test.
 
+**[architect]** Brief — block **8B** (`8.5`), the release build. → @worker
+
+**The `Makefile` is already done and is not yours.** I added `release` (and `VERSION`, `TRIPLES`) in this
+block's first commit. Read it before you start — it fixes your half of the interface. Do not edit it; if it
+needs to change, stop and tell me.
+
+**The split.** `build.zig` owns cross-compilation; the `Makefile` owns packaging. Your job is the first
+half plus the three carried fixes. `make release` expects to find exactly this, and nothing else:
+
+```
+zig-out/release/<triple>/devlog        for each of the three triples
+```
+
+`aarch64-macos`, `x86_64-linux-musl`, `aarch64-linux-musl` — those exact directory names, because the
+Makefile loops over that literal list. Add a `release` step to `build.zig` (`zig build release`) that
+cross-compiles all three and installs them there. It must **not** disturb the default install path
+(`zig build` still produces `zig-out/bin/devlog` for the host) and must not become a dependency of the
+default step — `make build` stays fast.
+
+**Ruling R9 — `ReleaseSafe`, not `ReleaseFast`.** This tool's only state is a permanent, append-only log,
+and a corrupt log is unrecoverable. Safety checks that turn a silent memory error into a loud crash are
+worth more here than speed we have no evidence of needing: every command reads a file, does one pass of
+work and exits. If you think a specific hot path justifies otherwise, raise it — don't decide it.
+
+**Ruling R10 — "statically linked" means two different things on the two platforms, and the task's wording
+hides that.** Linux is genuinely static: build against **musl** for both Linux triples and link fully
+statically, so `ldd` reports "not a dynamic executable". **macOS cannot be fully static** — Apple does not
+support statically linking libSystem, so `otool -L` will always list `/usr/lib/libSystem.B.dylib`. That is
+correct and expected, not a defect, and it is not a failure to be worked around. What `8.5` actually
+requires on macOS is **no third-party linkage** — libSystem and nothing else. Do not chase a fully static
+macOS binary; do write the distinction down where it will be read (see the README point below).
+
+**Three carried fixes, all in this block:**
+
+1. **`zig build test -Dversion=X` fails.** The override makes `build_options.version` and
+   `manifest.version` disagree, and the "version is embedded via the build option, not duplicated" test in
+   `src/main.zig` asserts they match. The invariant that test protects is real and must survive: **no semver
+   literal in tracked source outside `build.zig.zon:3`.** What must not survive is the test failing on a
+   legitimate override. Fix it so `make gates` is green both with and without `-Dversion`, and make sure the
+   test would still fail if someone hardcoded a version string in `src/`. Say in the DEVLOG which property
+   your fix asserts, because a weakened test here is worse than the bug.
+2. **Pin the umask in the permissions test.** It currently depends on the ambient umask and so passes or
+   fails on the environment rather than the code. Set it explicitly for the duration of the test and
+   restore it after.
+3. **`list --help` and `search --help` describe the shared role check differently** in `src/main.zig`;
+   **`search`'s wording is accurate** — align `list`'s to it. 8A documented the accurate rule in
+   `docs/FORMAT.md`, so leaving the divergence would ship help text that disagrees with the docs. Text
+   only: do not change what either command *does*.
+
+**CI — my call, and the Product Owner's to overturn.** Add `.github/workflows/release.yml`, triggered on a
+version tag push, that runs the release build and attaches the tarballs and `SHA256SUMS` to the GitHub
+release. D12 says "statically linked tarballs attached to tagged GitHub releases", and 8A's `README.md`
+already tells a reader to install by downloading one — without the workflow, `8.5` ships a documented
+install path that has nothing behind it. Keep it minimal: pinned action versions, no matrix cleverness (the
+cross-compilation is Zig's job, so one Linux runner builds all three), and pin the Zig version to the
+`minimum_zig_version` in `build.zig.zon`. I cannot gate this locally, so it gets human verification, not a
+green tick from me.
+
+**README.** Update the install section if — and only if — 8B changes what it promises: the real tarball
+names (`devlog-<version>-<triple>.tar.gz`), the `SHA256SUMS` file, and R10's honest linkage statement (Linux
+fully static; macOS libSystem only, no third-party). Keep it short; `README.md` is not a release engineering
+document.
+
+**Done-gates.** `make gates` → `GATES_EXIT:0`, every exit line quoted, and the test count reported (294
+before your changes; it will move if you add tests, which fix 1 and fix 2 both suggest — report the new
+number and what accounts for the delta). Also run **`make release` → `RELEASE_EXIT:0`** and report what
+landed in `zig-out/dist/`. `make release` is **not** in `gates` and never will be; run it explicitly.
+
+**What I cannot gate and will not tick without the Product Owner** (CLAUDE.md §4): that the tarballs are
+correct on a real machine, and the linkage claims. Do not tick `8.5` — you tick nothing anyway — and when
+you hand off, give me the exact commands a human runs and what they should see, for both `otool -L` on
+macOS and `ldd` on Linux, plus the shipped binary size. I pass those to the Product Owner verbatim.
+
+Post progress to this section as `[worker]`; hand off with `→ @reviewer`.
+
 ## NEXT
 
 **[architect]** **Sections 1–7 are CLOSED and fully ticked** — **43 of 52 boxes**, no outstanding

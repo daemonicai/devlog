@@ -17,7 +17,7 @@ SHELL := /bin/bash
 
 CHANGES := $(notdir $(patsubst %/,%,$(filter-out %/archive/,$(wildcard openspec/changes/*/))))
 
-.PHONY: build test format fmt validate changes gates clean
+.PHONY: build test format fmt validate changes gates release clean
 
 # --- zig -----------------------------------------------------------------------
 
@@ -63,6 +63,48 @@ gates:
 	echo "GATES_EXIT:$$code"; exit $$code
 
 # --- release & housekeeping ----------------------------------------------------
+
+# The split is deliberate. `build.zig` owns cross-compilation — it is the thing
+# that knows the targets, the optimize mode and how the version reaches the
+# binary — and leaves three binaries under zig-out/release/<triple>/devlog. This
+# target owns packaging, because `tar` and `shasum` are shell tools and the
+# Makefile is the shell surface. Neither half reaches into the other's job.
+#
+# VERSION is read from build.zig.zon, which is the single source of the semver
+# in tracked code. It is NOT passed back in as -Dversion: the default path
+# already embeds this exact string, and passing it would make the override path
+# — the one that can disagree with the manifest — the one every release uses.
+#
+# Not a gate, and `gates` does not run it: it cross-compiles three targets and
+# is far too slow to sit in the inner loop. It prints its exit code like
+# everything else here, because a release that half-failed must not read as
+# clean either.
+VERSION := $(shell sed -n 's/^[[:space:]]*\.version[[:space:]]*=[[:space:]]*"\(.*\)".*/\1/p' build.zig.zon)
+TRIPLES := aarch64-macos x86_64-linux-musl aarch64-linux-musl
+
+release:
+	@set -o pipefail; fail=0; \
+	if [ -z "$(VERSION)" ]; then \
+		echo "could not read .version from build.zig.zon"; \
+		echo "RELEASE_EXIT:1"; exit 1; \
+	fi; \
+	rm -rf zig-out/release zig-out/dist; \
+	zig build release || fail=1; \
+	if [ $$fail -eq 0 ]; then \
+		mkdir -p zig-out/dist; \
+		for t in $(TRIPLES); do \
+			bin="zig-out/release/$$t/devlog"; \
+			if [ ! -x "$$bin" ]; then echo "missing binary for $$t"; fail=1; continue; fi; \
+			stage="zig-out/dist/devlog-$(VERSION)-$$t"; \
+			mkdir -p "$$stage"; \
+			cp "$$bin" LICENSE README.md "$$stage"/ || { fail=1; continue; }; \
+			tar -C zig-out/dist -czf "zig-out/dist/devlog-$(VERSION)-$$t.tar.gz" \
+				"devlog-$(VERSION)-$$t" || fail=1; \
+			rm -rf "$$stage"; \
+		done; \
+		( cd zig-out/dist && shasum -a 256 *.tar.gz > SHA256SUMS ) || fail=1; \
+	fi; \
+	echo "RELEASE_EXIT:$$fail"; exit $$fail
 
 clean:
 	@rm -rf zig-out .zig-cache; code=$$?; echo "CLEAN_EXIT:$$code"; exit $$code
