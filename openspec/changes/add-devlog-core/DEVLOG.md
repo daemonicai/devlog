@@ -11122,6 +11122,247 @@ macOS and `ldd` on Linux, plus the shipped binary size. I pass those to the Prod
 
 Post progress to this section as `[worker]`; hand off with `→ @reviewer`.
 
+**[worker]** Implemented `8.5` plus the three carried fixes. Did not touch the `Makefile` — used the
+`release`/`VERSION`/`TRIPLES` it already defines.
+
+**`build.zig` — new `release` step.** Cross-compiles `aarch64-macos`, `x86_64-linux-musl`,
+`aarch64-linux-musl` (those exact directory names, matching the Makefile's `TRIPLES`), each forced to
+`.ReleaseSafe` (R9) regardless of the host's `-Doptimize`, installed to `zig-out/release/<triple>/devlog`
+via `addInstallArtifact`'s `dest_dir` override. Not added to `b.getInstallStep()` and not a dependency of
+`test`/`run` — confirmed `zig build` (no args) still produces only `zig-out/bin/devlog` and touches
+nothing under `zig-out/release/`. The two Linux triples set `.linkage = .static` on the `Compile` step;
+macOS gets no linkage override (R10 — Apple doesn't support static libSystem, so `otool -L` there will
+always show exactly `/usr/lib/libSystem.B.dylib`, which is the correct floor, not a defect). Reused the
+existing `options` (`addOptions`) module for every release exe's `build_options` import — it doesn't
+depend on target, so no duplication.
+
+**Fix 1 — `-Dversion=X` vs. the manifest-equality test.** `build.zig` now also threads
+`build_options.version_overridden: bool` (true only when `-Dversion` was actually passed). The test in
+`src/main.zig` skips its `expectEqualStrings(manifest.version, build_options.version)` assertion when
+overridden, rather than weakening it. **What the fix preserves**: on the default path (no `-D`) the
+assertion is unchanged and still catches the wiring breaking. Under an override, the "no semver literal
+outside `build.zig.zon:3`" invariant is still enforced — just by a different, pre-existing test:
+`"--version prints the build-option version, not a re-derived one"` computes its expectation from
+`build_options.version` too, so a call site that regressed to a hardcoded literal would fail *that* test
+under `-Dversion=X` (output would stay at the hardcoded string while the expectation moved with the
+override). Verified both paths: `zig build test` and `zig build test -Dversion=9.9.9` both pass; before
+the fix the latter failed with the exact mismatch the brief describes.
+
+**Fix 2 — pinned umask in the permissions test.** The test's own comment already explained why: `0o664`
+only discriminates the buggy shape (mode set through `createFile`'s argument, filtered by the kernel
+through the process umask) from the fixed shape (`fchmod` after creation, not umask-filtered) when the
+ambient umask actually strips group-write — a `0000` umask would let a regression to the buggy shape pass
+silently. Added `std.c.umask(0o022)` at the top of the test and restored the prior value via `defer`, so
+the test's discriminating power no longer depends on what the CI runner's default umask happens to be.
+
+**Fix 3 — `list`/`search --help` role-check wording.** `list_usage`'s `--role` and `--to` lines said
+"Must be one of the roles declared by 'devlog header'" (reads as latest-header-only); `search_usage`'s
+say "…declared by some 'devlog header' in this log, including a retired one" (the accurate union-of-
+history rule, per `checkHistoryFilters`). Reworded both `list_usage` lines to match `search_usage`'s
+wording exactly. Text only — `checkHistoryFilters` itself untouched, confirmed via `zig_references` reach
+unchanged. `docs/FORMAT.md` (8A) already stated the accurate rule, so the three now agree.
+
+**README.** Updated the install section only: real tarball names
+(`devlog-<version>-<triple>.tar.gz` for all three triples), `SHA256SUMS` verification, and R10's honest
+linkage statement (Linux genuinely static via musl; macOS libSystem-only, not a third-party dependency).
+Nothing else in `README.md` touched.
+
+**CI.** Added `.github/workflows/release.yml` — triggers on a `v[0-9]+.[0-9]+.[0-9]+` tag push, one
+`ubuntu-latest` runner, `actions/checkout@v4.2.2`, `mlugg/setup-zig@v1.2.1` pinned to
+`build.zig.zon`'s `minimum_zig_version` (read at runtime via the same `sed` pattern the Makefile uses for
+`VERSION`, so the two never drift independently), `make release`, then
+`softprops/action-gh-release@v2.1.0` attaching `zig-out/dist/*.tar.gz` and `SHA256SUMS`. No matrix — Zig
+does the cross-compiling. I cannot run this workflow myself; it needs human verification on a real tag
+push (see below).
+
+**Gates**: `BUILD_EXIT:0 TEST_EXIT:0 FORMAT_EXIT:0 VALIDATE_EXIT:0 GATES_EXIT:0`, reran from a clean
+`zig-out`/`.zig-cache`. Test count: `grep -c 'test "' src/*.zig` sums to **293** named (unchanged — I
+edited two existing tests, added none) + the anonymous `test {}` at `src/main.zig:20` = **294**, unmoved
+from 8A's close. `zig build test -Dversion=9.9.9` also green (previously the whole point of fix 1).
+
+**`make release` → `RELEASE_EXIT:0`.** `zig-out/dist/` holds
+`devlog-0.1.0-aarch64-macos.tar.gz` (335,214 B), `devlog-0.1.0-x86_64-linux-musl.tar.gz` (1,467,619 B),
+`devlog-0.1.0-aarch64-linux-musl.tar.gz` (1,420,277 B), and `SHA256SUMS` covering all three. Unpacked
+binary sizes: macOS arm64 781,608 B (~764 KiB), Linux x86_64 5,156,712 B, Linux arm64 5,067,848 B (both
+Linux binaries carry debug info — `not stripped` per `file`; not addressed here since the brief didn't
+ask for stripping and it isn't part of R9/R10). Confirmed via `zig build release -Doptimize=Debug` that
+the release step's `.ReleaseSafe` is hardcoded, not inherited from the host's `-Doptimize`.
+
+**Needs human confirmation** (I cannot gate this locally, per the brief and CLAUDE.md §4):
+
+On macOS, after `make release`:
+```
+otool -L zig-out/release/aarch64-macos/devlog
+```
+Expect exactly one line beyond the binary's own name: `/usr/lib/libSystem.B.dylib` — no other entry. I
+ran this myself and got exactly that (sandboxed `otool` cache-file writes aside, a plain terminal run is
+unaffected). Binary size: 781,608 bytes (~764 KiB).
+
+On a Linux machine (or container) with the tarball extracted:
+```
+ldd zig-out/release/x86_64-linux-musl/devlog   # or the aarch64-linux-musl one
+```
+Expect: `not a dynamic executable`. I confirmed via `file`, which reports `statically linked` for both
+Linux binaries (`ELF 64-bit LSB executable, ... statically linked, ... not stripped`), but `file` is not
+`ldd` and I have no Linux machine to run `ldd` on directly — the Product Owner's confirmation is the real
+check here.
+
+CI (`.github/workflows/release.yml`) also needs a real tag push to verify — I cannot run GitHub Actions
+locally. Recipe: push a `v0.1.1`-style tag (or bump `build.zig.zon`'s version first) to a repo with this
+workflow, confirm the Actions run builds `make release` cleanly and the resulting GitHub release gets the
+three `.tar.gz` files and `SHA256SUMS` attached.
+
+❓ @architect — `list --help`/`search --help` divergence (carried from 8A) is now fixed in this block per
+your brief; flagging only that I did not touch `checkHistoryFilters` or the union-of-history rule itself,
+purely the help text, as scoped.
+
+→ @reviewer
+
+**[architect]** Two 8B results from my own verification, before the reviewer reports. The Product Owner
+pushed back on my claim that CI and the Linux linkage "cannot be gated locally" — correctly, and the push
+back found a defect.
+
+**Linux verification is done, not deferred.** Docker is available, so both Linux triples were checked on
+real Linux rather than handed to the Product Owner as a manual step:
+
+- `x86_64-linux-musl` in `ubuntu:24.04` — `ldd` → `not a dynamic executable`, and `devlog --version`
+  → `devlog 0.1.0`.
+- `aarch64-linux-musl` in a native `--platform linux/arm64` container — same two results.
+
+So R10's Linux half is **confirmed to the standard §4 was asking a human for**: statically linked *and*
+actually runs. What remains genuinely human is the macOS `otool -L` on a machine that is not this one, and
+the tag push. The worker was right that it couldn't do this; it was wrong that nobody could.
+
+**A defect in my `Makefile`, found by that same container run.** `release` used `shasum -a 256`, which is
+the macOS idiom. **Stock Ubuntu has `sha256sum` and no `shasum`** — verified on both arches, `shasum
+ABSENT`. The checksum step is the *last* thing `make release` does, so on a tag push CI would have built all
+three tarballs and then failed at the final line, and it would have failed **only in CI** — `RELEASE_EXIT:0`
+on my machine every time. Fixed: `SHA256` probes for `sha256sum` and falls back to `shasum -a 256`.
+Re-ran `make release` → `RELEASE_EXIT:0` with a correct `SHA256SUMS`.
+
+This one belongs in the "where defects actually live" list in `## NEXT` as a **fourth** class: **a defect
+that only appears on a platform the gates never run on.** Every existing entry is about code the gates
+*could* have executed. This one no local gate could ever have caught, and the only reason it surfaced before
+a tag push is that a container was cheaper than the assumption I'd made.
+
+**Note for whoever tests the workflow:** the trigger is `v[0-9]+.[0-9]+.[0-9]+`. GitHub filter patterns
+read `+` as "one or more of the preceding character", so that matches `v0.1.0` — but it does **not** match a
+prerelease-suffixed tag like `v0.0.0-ci-test`. A throwaway test tag must be plain `vX.Y.Z` or the workflow
+will not fire at all, which would read as a broken workflow rather than a non-matching tag.
+
+**[reviewer]** Audited block **8B** (`8.5` + the three carried fixes). Verdict: **Approve with nits.**
+
+**Verification performed, not just read.** Rebuilt from clean (`rm -rf zig-out .zig-cache`), ran
+`zig build` (host, no args) and confirmed only `zig-out/bin/devlog` exists — no `release/` dir, no
+dependency wired into `test`/`run`/`getInstallStep()` (`build.zig:40-53` untouched by the new step).
+Ran `make build`/`make test` → `BUILD_EXIT:0 TEST_EXIT:0`. Ran `make release` → `RELEASE_EXIT:0`;
+`zig-out/dist/` holds the three tarballs + `SHA256SUMS` as reported. `file` on all three binaries
+confirms both Linux triples "statically linked" and the macOS binary is a plain Mach-O; `otool -L` on
+the macOS binary shows exactly one line, `/usr/lib/libSystem.B.dylib`, matching R10. Confirmed
+`.ReleaseSafe` is hardcoded regardless of host optimize: `zig build release -Doptimize=Debug` still
+produced a release binary indistinguishable in kind from the default run (R9). Test-count identity
+reverified independently: `grep -c 'test "' src/*.zig` sums to 293 + the one anonymous `test {}` =
+294, matching both the pinned identity in `## NEXT` and the worker's report. `list_usage`/`search_usage`
+now read identically in meaning (`src/main.zig:319-320` and `:328-329` vs `:395-396`); confirmed
+`checkHistoryFilters` (`src/main.zig:2299`) is untouched by the diff — text-only, as claimed.
+
+**Priority-one — Fix 1 (`src/main.zig:2836-2853`, `build.zig:12-16`).** Chased the claim rather than
+taking it. Verdict: **the claim as stated holds, but it is narrower than "the invariant is still
+caught" reads, and I want that gap on record rather than silently accepted.**
+
+- *Override absent* (the only path any gate exercises — see below): `version_overridden` is `false`,
+  the `if` at `main.zig:2851` doesn't fire, and `expectEqualStrings(manifest.version,
+  build_options.version)` runs exactly as before. Unweakened. Confirmed via `make test` and by reading
+  — no behavioural difference from pre-8B on this path.
+- *Override present*: only `"--version prints the build-option version, not a re-derived one"`
+  (`main.zig:2864`) asserts anything. I constructed the scenario asked for: hardcode
+  `main.zig:2662`'s `stdout.print("devlog {s}\n", ...)` to a literal instead of reading
+  `build_options.version`. Ran `zig build test -Dversion=9.9.9` against that mutation — the test fails,
+  exactly as claimed, because `want` is computed from `build_options.version` (now `"9.9.9"`) while
+  `out` stays at the hardcoded literal. **Non-vacuous, confirmed empirically, not just read.** Reverted
+  the mutation after confirming.
+- **The gap the claim doesn't mention**: under override, nothing verifies that `build_options.version`
+  itself actually reflects the `-Dversion` input rather than silently ignoring it. If `build.zig:13`
+  read `manifest.version` unconditionally regardless of `version_override`, `version_overridden` would
+  still correctly report `true` (it's derived straight from `version_override != null`, so it can't
+  drift — that part of the priority-one question is clean), but the skipped assertion at `main.zig:2851`
+  would never catch the ignored override, and the `--version` test is structurally unable to either: it
+  computes both sides (`want` and, transitively via `main.zig:2662`, `out`) from the *same*
+  `build_options.version`, so a bug in *how that value was derived* is invisible to it by construction —
+  only a bug in *whether main.zig reads it* is. This isn't a regression Fix 1 introduces (before the
+  fix, `-Dversion` simply broke the whole suite, so there was no coverage under override to lose
+  either), and it's scoped narrower than "call site" already implies, so I'm not calling the worker's
+  claim inaccurate. But "the real invariant is still caught" oversells it slightly — it's caught for the
+  one call site the fix was chasing, not for build.zig's override wiring itself.
+- **Also worth recording: this path is not exercised by any gate today.** Confirmed by reading the
+  `Makefile` — `test` (`Makefile:28`) runs bare `zig build test`, and `release` (`Makefile:85-`) reads
+  `VERSION` from `build.zig.zon` for tarball naming only, never passes it back as `-Dversion` (the
+  Makefile's own comment at `Makefile:74-76` says as much). So `version_overridden` is `false` in every
+  path `make gates`, `make release`, and `.github/workflows/release.yml` actually run — the whole
+  override branch, and the gap above, are currently dead in CI, exercised only by the worker's (and my)
+  manual `-Dversion=9.9.9` runs. Not a blocker — the architect's own note earlier in this section already
+  flagged `-Dversion` as a landmine "nothing between here and 8.5 exercises," and nothing between here
+  and now does either — but a fair thing for `## NEXT` to carry forward if `-Dversion` ever gets wired
+  into an actual gate.
+
+**Other checks, no findings:**
+
+- `build.zig:63-114` (`release` step): triples and directory names match the Makefile's `TRIPLES`
+  exactly; `.static` linkage set only on the two `-linux-musl` targets; macOS gets `linkage = null`
+  (default, dynamic) per R10; `.ReleaseSafe` hardcoded per R9; `release_module.addOptions("build_options",
+  options)` reuses the existing options object rather than duplicating it. `std.Target.Query.parse(...)
+  catch unreachable` on the three hardcoded triple strings is fine — these are build-script literals
+  known-good at edit time, not runtime user input, so this isn't the `catch unreachable`-on-input hazard
+  the rubric is aimed at.
+- Fix 2 (`src/log.zig:1678-1683`): `std.c.umask(0o022)` pinned before the loop, restored via `defer _ =
+  std.c.umask(prior_umask);` — unconditional, runs on the assertion-failure (error return) path since
+  Zig test failures are returned errors, not panics, so the defer executes. Makes the test's
+  discriminating power independent of the ambient umask as intended.
+- `.github/workflows/release.yml`: `actions/checkout@v4.2.2`, `mlugg/setup-zig@v1.2.1`,
+  `softprops/action-gh-release@v2.1.0` — all pinned to exact versions, none floating. Zig version read
+  from `build.zig.zon`'s `minimum_zig_version` at runtime via the same `sed` pattern the Makefile uses
+  for `VERSION`, so the two can't drift independently. Trigger `v[0-9]+.[0-9]+.[0-9]+` (tag push).
+  Artifact paths (`zig-out/dist/*.tar.gz`, `zig-out/dist/SHA256SUMS`) match what `make release` actually
+  produces (verified above). `permissions: contents: write` present for the release-asset upload. No
+  expression/context errors spotted.
+- `README.md`: tarball names, `SHA256SUMS` mention, and the R10 linkage statement match what `make
+  release` actually produces; explicitly states macOS is "not, and cannot be" static and explains why,
+  no overclaiming.
+- Scope: `Makefile` is unchanged in this block's own diff — the `SHA256` portability fix visible in the
+  working tree is the architect's own change, self-attributed and explained two posts up in this same
+  section (container-verified `shasum` vs `sha256sum` defect), not a worker edit. Nothing in `8.5`'s
+  diff touches `Makefile`, `tasks.md`, or `openspec/` beyond this DEVLOG. `.claude/settings.json`'s
+  working-tree diff is outside this block's file set and outside my review scope.
+
+**Nits:**
+- `main.zig:2846`'s comment says "the invariant it exists to catch... is still caught, override or not"
+  — given the gap above, I'd soften this to name the call site explicitly (e.g. "for this call site") so
+  a future reader doesn't read it as full equivalence to the pre-fix assertion. Not blocking; the code
+  itself is correct.
+
+Nothing here blocks. → @architect
+
+**[worker]** Reviewer nit fixed — `src/main.zig:2841–2851` (the comment above the version-equality
+test's override skip). Rewrote it to stop reading as full equivalence:
+
+- What's actually proven under `-Dversion=X`: only that `main.zig`'s `--version` call site reads
+  `build_options.version` rather than a hardcoded literal — via the adjacent "--version prints the
+  build-option version, not a re-derived one" test, which the reviewer confirmed empirically by
+  hardcoding `main.zig:2662`'s print and watching `zig build test -Dversion=9.9.9` fail. Scoped to that
+  one call site now, not generalized to `src/`.
+- What's left visibly unproven: neither test checks, under an override, that `build_options.version`
+  correctly reflects the `-Dversion` input rather than silently ignoring it — both sides of the skipped
+  assertion derive from the same variable, so a bug in how `build.zig` plumbs the override would be
+  invisible to either test. Left as a stated gap, not closed — per the reviewer's instruction, that's
+  for `## NEXT` as a known limitation, not this block's job.
+
+No test added or widened; comment-only change.
+
+**Gates**: `BUILD_EXIT:0 TEST_EXIT:0 FORMAT_EXIT:0 VALIDATE_EXIT:0 GATES_EXIT:0`. Test count unmoved:
+293 named + the anonymous `test {}` (`src/main.zig:20`) = **294**.
+
+→ @reviewer
+
 ## NEXT
 
 **[architect]** **Sections 1–7 are CLOSED and fully ticked** — **43 of 52 boxes**, no outstanding

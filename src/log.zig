@@ -1658,19 +1658,24 @@ test "atomic replace preserves the log's existing file permissions rather than r
     );
 
     // `0o664` is the discriminating case: it is *more* permissive than a
-    // typical `022` umask default (`0o644`) would produce — it has the
-    // group-write bit a `022` umask always strips. A mode that is a
-    // *subset* of the umask default (e.g. `0o640`) would survive whether
-    // or not `atomicReplace` actually bypasses umask, because masking an
-    // already-masked-down value is a no-op — that shape was tried first
-    // and it could not fail, which is exactly the failure mode this test
-    // exists to not repeat (reviewer finding, block 2B, round two).
-    // Confirmed before writing the fix: with `atomicReplace` applying the
-    // mode through `createFile`'s own argument (the buggy shape), this
-    // assertion failed with `0o644` on disk under this environment's
-    // `022` umask — group-write silently stripped on the very write this
-    // test is exercising. `0o640` is kept alongside as a second data
-    // point, not the load-bearing one.
+    // `022` umask default (`0o644`) would produce — it has the group-write
+    // bit a `022` umask always strips. A mode that is a *subset* of the
+    // umask default (e.g. `0o640`) would survive whether or not
+    // `atomicReplace` actually bypasses umask, because masking an
+    // already-masked-down value is a no-op — that shape was tried first and
+    // it could not fail, which is exactly the failure mode this test exists
+    // to not repeat (reviewer finding, block 2B, round two).
+    //
+    // Because the discriminating case only discriminates under a umask that
+    // actually strips group-write, this test's ability to catch a
+    // regression to the buggy shape used to depend on the ambient
+    // environment's umask (a `0000` umask would let the buggy shape pass
+    // undetected). Pinned here rather than left to whatever the process
+    // inherited — carried fix, block 8B — and restored unconditionally so
+    // this test cannot leak a changed umask into whatever runs after it.
+    const prior_umask = std.c.umask(0o022);
+    defer _ = std.c.umask(prior_umask);
+
     for ([_]std.posix.mode_t{ 0o664, 0o640 }) |mode| {
         const distinctive = Io.File.Permissions.fromMode(mode);
         {

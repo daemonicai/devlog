@@ -316,7 +316,8 @@ const list_usage =
     \\                   are the intersection — the one identified block.
     \\    --role <r>     Only records authored by this role (for an item,
     \\                   the role that raised it). Must be one of the
-    \\                   roles declared by 'devlog header'.
+    \\                   roles declared by some 'devlog header' in this
+    \\                   log, including a retired one.
     \\    --kind <k>     Only records of this kind: header, section, brief,
     \\                   post, item, close, verdict, next. Refused alongside
     \\                   --state or --blocking unless it names 'item'.
@@ -324,7 +325,8 @@ const list_usage =
     \\                   deferred, superseded. Narrows the result from
     \\                   records to items (only an item has a state).
     \\    --to <role>    Only records/items addressed to this role. Must be
-    \\                   one of the roles declared by 'devlog header'.
+    \\                   one of the roles declared by some 'devlog header'
+    \\                   in this log, including a retired one.
     \\    --blocking     Only items flagged blocking. Narrows the result
     \\                   from records to items. There is no --no-blocking:
     \\                   absent means no filtering on it.
@@ -2835,6 +2837,25 @@ test "version is embedded via the build option, not duplicated" {
     // (build.zig.zon), threaded through by build.zig. Comparing against the
     // manifest itself — not a hardcoded literal — catches skew if that wiring
     // ever breaks.
+    //
+    // `-Dversion=X` is a legitimate override that makes the two deliberately
+    // disagree — asserting equality unconditionally would fail on a correct
+    // override, not on skew. This assertion is only meaningful on the
+    // default path, so it is skipped (not weakened) when
+    // `build_options.version_overridden`.
+    //
+    // What still holds under an override, and why: "--version prints the
+    // build-option version, not a re-derived one" below computes its
+    // expectation from `build_options.version` too, so it fails the moment
+    // `main.zig`'s `--version` call site stops reading that option — i.e. a
+    // hardcoded literal there is still caught, with or without -D. That is
+    // the one call site it covers, not a general guarantee about `src/`.
+    // What neither test checks under an override: that `build_options.version`
+    // itself correctly reflects the `-Dversion` input rather than silently
+    // ignoring it — both sides of that test are derived from the same
+    // variable, so a bug in how build.zig plumbed the override would be
+    // invisible here. Known gap, not this test's job to close.
+    if (build_options.version_overridden) return;
     try std.testing.expectEqualStrings(manifest.version, build_options.version);
 }
 

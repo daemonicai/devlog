@@ -15,9 +15,17 @@ then discards it on exit. `devlog` is a single self-contained binary with **no t
 
 ## Install
 
-Download the release tarball for your platform (macOS arm64, Linux x86_64/arm64) from this repo's
-GitHub releases, extract it, and put the `devlog` binary on your `PATH`. There is nothing else to
-install — no runtime, no library, no config file.
+Download the release tarball for your platform from this repo's GitHub releases —
+`devlog-<version>-aarch64-macos.tar.gz`, `devlog-<version>-x86_64-linux-musl.tar.gz`, or
+`devlog-<version>-aarch64-linux-musl.tar.gz` — verify it against the release's `SHA256SUMS`, extract
+it, and put the `devlog` binary on your `PATH`. There is nothing else to install — no runtime, no
+library, no config file.
+
+The two Linux builds are genuinely static (musl, statically linked): `ldd` reports "not a dynamic
+executable". The macOS build is not, and cannot be — Apple does not support statically linking
+libSystem — so `otool -L` on it will always show exactly one entry, `/usr/lib/libSystem.B.dylib`. That
+is the honest floor on macOS, not a third-party dependency: no other linkage of any kind is present on
+either platform.
 
 ## Build from source
 

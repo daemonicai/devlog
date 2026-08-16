@@ -82,6 +82,13 @@ gates:
 VERSION := $(shell sed -n 's/^[[:space:]]*\.version[[:space:]]*=[[:space:]]*"\(.*\)".*/\1/p' build.zig.zon)
 TRIPLES := aarch64-macos x86_64-linux-musl aarch64-linux-musl
 
+# macOS ships `shasum` and no `sha256sum`; a stock Ubuntu (including the image
+# CI builds in) ships `sha256sum` and no `shasum`. Hardcoding either one means
+# the checksum step fails on the other platform — and since `make release` is
+# the last thing a tag push runs, that failure would first appear in CI, after
+# the tarballs were already built. Verified by running both in a container.
+SHA256 := $(shell command -v sha256sum >/dev/null 2>&1 && echo "sha256sum" || echo "shasum -a 256")
+
 release:
 	@set -o pipefail; fail=0; \
 	if [ -z "$(VERSION)" ]; then \
@@ -102,7 +109,7 @@ release:
 				"devlog-$(VERSION)-$$t" || fail=1; \
 			rm -rf "$$stage"; \
 		done; \
-		( cd zig-out/dist && shasum -a 256 *.tar.gz > SHA256SUMS ) || fail=1; \
+		( cd zig-out/dist && $(SHA256) *.tar.gz > SHA256SUMS ) || fail=1; \
 	fi; \
 	echo "RELEASE_EXIT:$$fail"; exit $$fail
 
