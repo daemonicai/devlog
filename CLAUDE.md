@@ -51,12 +51,17 @@ like an inventory rather than a failure.
 - Test: `make test` → `TEST_EXIT:0`, all green.
 - Format: `make format` → `FORMAT_EXIT:0`.
 - Validate the active change(s): `make validate` → `VALIDATE_EXIT:0`.
+- Lint the GitHub workflows: `make actions` → `ACTIONS_EXIT:0`. Requires `actionlint` on `PATH`
+  (`brew install actionlint`); a missing checker **fails** rather than skipping, because a gate that
+  reports 0 for want of a checker is the exact failure this Makefile exists to prevent.
 - Whole gate set in one pass: `make gates` → `GATES_EXIT:0`. It runs the set with `-k`, so one
   invocation reports **every** failing gate instead of hiding the rest behind the first.
 - List active changes: `make changes` (or the directories under `openspec/changes/`, excluding
   `archive/`).
 
-`make clean` is **not** a gate and no agent runs it — it is the Product Owner's.
+`make clean` is **not** a gate and no agent runs it — it is the Product Owner's. Neither is
+`make release`, which cross-compiles three targets and is far too slow for the inner loop; it prints
+`RELEASE_EXIT:<n>` like everything else, because a half-failed release must not read as clean.
 
 **The Makefile is yours (Architect), not the workers'.** When a block adds a project, a test suite, or a
 stack that the existing targets don't cover, *you* update the Makefile and say so in the DEVLOG. A worker

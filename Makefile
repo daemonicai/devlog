@@ -17,7 +17,9 @@ SHELL := /bin/bash
 
 CHANGES := $(notdir $(patsubst %/,%,$(filter-out %/archive/,$(wildcard openspec/changes/*/))))
 
-.PHONY: build test format fmt validate changes gates release clean
+.PHONY: build test format fmt validate actions changes gates release clean
+
+WORKFLOWS := $(wildcard .github/workflows/*.yml) $(wildcard .github/workflows/*.yaml)
 
 # --- zig -----------------------------------------------------------------------
 
@@ -56,10 +58,37 @@ validate:
 changes:
 	@echo "$(CHANGES)"
 
+# --- github actions ------------------------------------------------------------
+
+# Lints the workflow files. Worth a gate because the release workflow is the one
+# thing here that cannot be run locally: its first real execution is a tag push,
+# and a typo in it surfaces as a failed release rather than a failed build.
+#
+# Two ways to pass vacuously, both refused, following `validate` above:
+#   - actionlint missing -> fail with an install hint, never skip. A gate that
+#     prints 0 because the checker was absent is exactly the failure this
+#     Makefile exists to prevent.
+#   - no workflow files -> fail. In this repo that means the release workflow
+#     was deleted, not that there is nothing to check.
+#
+# actionlint shells out to shellcheck for `run:` blocks when shellcheck is on
+# PATH, so it finds strictly more on a machine that has it. It never finds less
+# that matters: the workflow-level errors are actionlint's own either way.
+actions:
+	@fail=0; \
+	if ! command -v actionlint >/dev/null 2>&1; then \
+		echo "actionlint not found — install it (brew install actionlint)"; fail=1; \
+	elif [ -z "$(WORKFLOWS)" ]; then \
+		echo "no workflow files found under .github/workflows/"; fail=1; \
+	else \
+		actionlint || fail=1; \
+	fi; \
+	echo "ACTIONS_EXIT:$$fail"; exit $$fail
+
 # --- gate sets -----------------------------------------------------------------
 
 gates:
-	@$(MAKE) --no-print-directory -k build test format validate; code=$$?; \
+	@$(MAKE) --no-print-directory -k build test format validate actions; code=$$?; \
 	echo "GATES_EXIT:$$code"; exit $$code
 
 # --- release & housekeeping ----------------------------------------------------
