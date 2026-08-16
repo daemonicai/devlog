@@ -43,11 +43,15 @@ A further six fields — the **attributed** fields — are carried by every kind
 | Field | Type | Required? | Notes |
 |---|---|---|---|
 | `role` | string | required | the writer's role; must be one of the roles declared in the log's **latest** `header` (§6) |
-| `section` | string | optional | the `tasks.md` section this record concerns, e.g. `"4"` |
-| `block` | string | optional | the task range this record concerns, e.g. `"4.1-4.3"` |
-| `to` | string | optional | an addressed role; when present, must also be one of the roles declared in the latest `header` |
+| `section` | string | optional in general; **required for `brief`, `verdict`, and `section`** — see §3's per-kind table | the `tasks.md` section this record concerns, e.g. `"4"` |
+| `block` | string | optional in general; **required for `brief` and `verdict`** — see §3 | the task range this record concerns, e.g. `"4.1-4.3"` |
+| `to` | string | optional in general; **required for `brief`** — see §3 | an addressed role; when present, must also be one of the roles declared in the latest `header` |
 | `refs` | array of `{"ns": string, "id": string}` | optional, omitted when empty | structured external references; any `ns` is accepted, unvalidated (e.g. `[{"ns":"D","id":"2"}]`) |
 | `body` | string | required (may be `""` on the wire — see below) | Markdown, stored verbatim, never parsed or reformatted |
+
+"Optional" above means: legal to omit for *some* kind. Three kinds narrow that per §3's table below, and two
+of those three narrowings are **read-side fatal**, not merely a write-side convenience — see "Per-kind
+field requiredness" after §3.
 
 **`header` carries none of the six attributed fields — including no `role` of its own.** A `header`
 record is provenance and a declaration, not a post from someone to someone about something; it has no
@@ -68,17 +72,63 @@ but `header`) §2's six attributed fields:
 | `kind` | Additional fields | Notes |
 |---|---|---|
 | `header` | `format` int, `tool` string, `change` string, `roles` array of string, `closers` array of string | `format` is currently `1` — the only value this build ever writes; see §6 |
-| `section` | `title` string, `base` string | `title`: one line naming what the section delivers. `base`: a commit sha, stored verbatim and never validated — `devlog` never runs `git`. |
-| `brief` | — | the architect's block brief; carries no fields beyond the attributed set |
+| `section` | `title` string, `base` string | `title`: one line naming what the section delivers. `base`: a commit sha, stored verbatim and never validated — `devlog` never runs `git`. **Also requires its own attributed `section` field** (e.g. a `section`-kind record with `section: "4"` announces section 4) — write-side only, not a read-side fatal fault; see "Per-kind field requiredness" below. |
+| `brief` | — | the architect's block brief; carries no fields beyond the attributed set, but **requires `section`, `block`, and `to`** from that set — see "Per-kind field requiredness" below |
 | `post` | — | general working-channel traffic; carries no fields beyond the attributed set |
 | `item` | `item` int, `type` string, `blocking` bool | `item` is the raised item's identifier (see "Item identity", below). `type` ∈ `question`, `finding`, `decision`, `note`, `task`. `blocking` is independent of `type`. |
-| `close` | `item` int, `state` string | `item` identifies the item being closed. `state` ∈ `resolved`, `deferred`, `superseded`. `body` is the mandatory reason for the closure — not optional prose the way it is for other kinds. |
-| `verdict` | `outcome` string, `commit` string | `outcome` ∈ `approve`, `approve-with-nits`, `request-changes`. `commit`: stored verbatim, never validated. |
+| `close` | `item` int, `state` string | `item` identifies the item being closed. `state` ∈ `resolved`, `deferred`, `superseded`. `body` is the mandatory reason for the closure — not optional prose the way it is for other kinds. `item` must name an item raised **earlier** in the log — see "Cross-record integrity" below. |
+| `verdict` | `outcome` string, `commit` string | `outcome` ∈ `approve`, `approve-with-nits`, `request-changes`. `commit`: stored verbatim, never validated. **Also requires `section` and `block`** from the attributed set — see "Per-kind field requiredness" below. |
 | `next` | — | the current NEXT narrative; the most recently appended `next` record is the current one, earlier ones remain as history |
 
-`type`, `state`, and `outcome` are each one of a **closed enumeration**. A value outside the
-enumeration is a refused write on the write side; a reader that encounters one from foreign or future
-data should treat it as a parse fault for that field, not guess at its meaning.
+`kind` itself is one such closed enumeration (the eight values above); `type`, `state`, and `outcome` are
+each a further closed enumeration on top of that. A value outside any of these four enumerations is a
+refused write on the write side; a reader that encounters one from foreign or future data must treat it,
+and the whole line it appears on, as a parse fault — not guess at its meaning, and not merely skip that one
+field. `devlog`'s own reader does not parse a log partially: an unparseable line anywhere in the file (this
+includes invalid JSON, a line that isn't a JSON object, a required field missing or wrong-typed, and all
+four closed enumerations above) fails `parseLog` for the **entire file**, the same "corrupt log, not a
+legal one to reason about further" consequence §1 already states for a broken `seq` sequence.
+
+### Per-kind field requiredness
+
+Beyond §2's general table, three kinds require specific attributed fields that are otherwise optional:
+
+- **`brief`** requires `section`, `block`, and `to`. **Absence of `section` or `block` is a read-side
+  fatal fault** — state derivation for the whole log fails (`error.BriefMissingKey`) the moment it
+  reaches a `brief` record missing either. `to`'s absence is refused on the write side (every `brief`
+  `devlog` itself writes carries it) but is **not** separately checked at read time — nothing in state
+  derivation keys on a `brief`'s `to`, so a foreign `brief` record with no `to` still derives, unlike one
+  missing `section` or `block`.
+- **`verdict`** requires `section` and `block`. Same consequence: absence of either is a read-side fatal
+  fault (`error.VerdictMissingKey`), not a tolerated omission — `resume`, `status`, `show --item`, and
+  `list --state` all fail to derive state for the **entire log**, not just skip the offending record.
+- **`section`** requires its own attributed `section` field (distinct from its kind-specific `title`/
+  `base`). This is a **write-side-only** requirement, in the same category as §6's empty-`roles`/
+  empty-`closers` rule: nothing in state derivation reads a `section`-kind record's own `section` field,
+  so a foreign or historical `section` record without one still derives without error. A reimplementation
+  that omits it on write produces a record `devlog` can still read, but not one `devlog` itself would ever
+  write.
+
+A reimplementer who builds a writer from §2's general table alone — treating `section`/`block`/`to` as
+uniformly optional — produces `brief` and `verdict` records this tool cannot derive state from at all, in
+an append-only format with no repair path.
+
+### Cross-record integrity
+
+Two further rules hold across records, not within one, and both are corrupt-log conditions on read —
+alongside §1's `seq` rule, which they mirror in shape:
+
+- **A `close` record's `item` must name an item raised *earlier* in the log** — an `item` record with
+  that same number must already have appeared at a lower `seq`. A `close` naming a number no `item` record
+  has ever carried, or one that only appears *later*, is refused on the write side and is a fatal
+  derivation fault on read (`error.CloseTargetMissing`) — the whole log fails to derive, not just that
+  record. This is unrelated to, and does not conflict with, the deliberate non-rule already stated under
+  "Item-state derivation": **closing an already-closed item is legal** — only a target that never
+  precedes the `close` is refused.
+- **An `item` record's own `item` field must equal its positional ordinal** — the *n*th `item` record in
+  the log must carry `item: n` (see "Item identity" below). A mismatch is refused on the write side and is
+  a fatal derivation fault on read (`error.ItemNumberMismatch`), the same "whole log, not just this
+  record" consequence as every other fault on this list.
 
 **Field order on the wire**, as the shipped writer emits it (not itself a compatibility requirement — a
 reader must not depend on key order in JSON — but recorded here so a `git diff` on the log stays legible

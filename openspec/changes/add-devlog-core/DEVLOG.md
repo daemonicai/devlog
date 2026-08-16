@@ -12029,6 +12029,459 @@ consistent with my own `git diff` check above.
 
 → @architect
 
+**[supervisor]** Section 8 re-audit, round three — range `f21864d..HEAD` (`e10430f`, `53abbf9`,
+`82fe8b2`, `eec166b`, `cd7e60a`, `8cb1786`, `335890a`). **Request changes** — one blocker, **B4**, a
+family of rules rather than a single omission, and in one place the document is *wrong* rather than
+silent.
+
+**B3 is closed, verified against `src/` rather than against the worker's report.**
+
+- **`format`'s value.** `docs/FORMAT.md:70` and `:254-257` state the integer `1`; `src/record.zig:19` is
+  `pub const supported_format: i64 = 1`. A writer can now emit the mandatory first line from the
+  document alone.
+- **§7's reader rule (`:263-271`) now matches the shipped reader, in the direction that was wrong.**
+  `src/record.zig:720-726` is a single `format != supported_format` comparison. The new text refuses
+  "anything **other than** a version this reader understands", says explicitly that it is "not scoped to
+  'higher'", and names `format: 0` as refused on the same grounds as `format: 2`. **A reader built from
+  §7 as it now reads refuses `format: 0` — confirmed.** The "higher" framing is gone, not softened.
+- **`ts` (`:22-27`, `:39`)** matches `src/main.zig:1092`'s
+  `{d:0>4}-{d:0>2}-{d:0>2}T{d:0>2}:{d:0>2}:{d:0>2}Z` exactly, and correctly frames the shape as a writer
+  promise with a wider read-side tolerance.
+- **`tool` (`:238-244`)** matches `src/main.zig:1138`
+  (`allocPrint("devlog {s}", .{build_options.version})`), and its consequence is stated where it bites:
+  `src/log.zig:467-471`'s `headerUnchanged` compares `tool` verbatim, so a differently-formatted string
+  appends a header where this tool appends none.
+
+**The fifth gap's fix is correct, including the writer-only claim, which I checked rather than took.**
+`docs/FORMAT.md:233-237` matches `src/main.zig:1118-1119`. On the read/identity side: `requireStringArray`
+(`src/record.zig:615-646`) has no cardinality check and allocates a zero-length slice happily;
+`src/log.zig` has no `len == 0` check anywhere; `checkRoleAllowed` (`:714-737`) with an empty `roles`
+simply refuses every write as undeclared, and `sameRoleSet` compares two empty sets as equal. So the rule
+is enforced at the CLI boundary only and a foreign header with empty arrays parses — exactly as documented,
+and correctly mirrored on §2's `body: ""` framing.
+
+---
+
+**B4 (blocker) — per-kind field requiredness and cross-record integrity: a family of rules the document
+omits, and one where its own table contradicts the shipped implementation.**
+
+This is not a fifth instance of "one more unstated field". It is the one remaining *category* of rule in
+this format — what makes a record legal **given the other records**, and which of the attributed fields
+are mandatory **per kind** — and §§1-9 carry almost none of it. Both halves have read-side consequences,
+which is what makes it worse than the fifth gap (a writer-only rule the reader tolerates).
+
+1. **`brief` and `verdict` require `section` and `block`; the document says they are optional.**
+   `docs/FORMAT.md:45-46` marks `section` and `block` "optional" for every attributed kind, and `:72`
+   says `brief` "carries no fields beyond the attributed set". The implementation makes both mandatory
+   on **both** sides: write-side at `src/main.zig:1281-1282` (`brief`) and `:1504-1505` (`verdict`), and
+   read-side as a **fatal derivation fault** at `src/state.zig:521-537` —
+   `error.VerdictMissingKey` / `error.BriefMissingKey`. A log containing one such record cannot have its
+   state derived at all: `resume`, `status`, `show --item`, `list --state` all fail on the whole file,
+   permanently, in an append-only format with no repair path. `brief` additionally requires `to`
+   (`src/main.zig:1283`), also documented as optional at `:47`; the `section` kind requires the
+   `section` field (`src/main.zig:1229`). This is the B3 shape exactly — the document is not vague here,
+   it is **wrong**, and a writer built from it produces logs `devlog` refuses to read.
+2. **A `close` must name an `item` that already precedes it, and the reader enforces it.**
+   `src/log.zig:672-689` (`checkItemExists`) refuses the write; `src/state.zig:502-513` returns
+   `error.CloseTargetMissing` for `cr.item < 1 or cr.item > items-seen-so-far`, which also covers a
+   `close` appearing *before* its `item`. `docs/FORMAT.md:102-103` says only that `close.item` "names
+   this same identifier". Neither the refusal nor the ordering constraint appears anywhere. Note the
+   deliberate non-rule beside it — closing an already-closed item is **allowed** (`log.zig:681-682`) —
+   which *is* stated, at `:129`. One half of the pair is documented and the other isn't.
+3. **`item.item` must equal its positional ordinal, and a log where it doesn't is refused.**
+   `src/state.zig:491-497`, `error.ItemNumberMismatch`. §"Item identity" (`:95-104`) states the writer
+   rule correctly but never states that the reader *checks* it and rejects the whole log otherwise. §1
+   states exactly this consequence for its sibling rule (`seq` gaps → "a corrupt log, not a legal one to
+   reason about further"); the item-numbering rule needs the same sentence.
+
+Every one of these is invisible to a block review of `e10430f`: they are agreements between prose written
+in section 8 and parsers written in sections 2, 4 and 5.
+
+**Suggested remediation shape** — `docs/FORMAT.md` only, no `src/`:
+
+- Correct §2's table so `section`/`block`/`to` read "optional except where §3 requires them", and add the
+  per-kind requiredness to §3's rows for `brief` (`section`, `block`, `to`), `verdict` (`section`,
+  `block`) and `section` (its own `section` field). State that their absence is a **read-side fault that
+  fails derivation for the whole log**, not a tolerated omission.
+- A short "cross-record integrity" subsection (§1 or after "Item identity"): a `close` must name an item
+  raised **earlier in the log**; an `item`'s stored number must equal its ordinal; both are corrupt-log
+  conditions on read, alongside §1's existing `seq` rule. Say plainly that closing an already-closed item
+  is *not* one of these.
+
+**And change the technique, not just the text.** Four rounds have now each found one more gap by cold
+reading, which is evidence that cold reading finds *a* gap, not that it finds *the last* one. There is a
+finite, mechanical closure available: `docs/FORMAT.md` must account for every refusal site in
+`src/record.zig`, `src/log.zig` and `src/state.zig` (38 `d.set(...)` sites; I have listed them) plus every
+`fail(stderr, "'<cmd>' requires …")` in `src/main.zig`. Each one is either a documented rule, or a
+CLI-ergonomics message with no wire meaning, and saying which — for all of them — is a checkable
+deliverable in a way "I read it cold and found nothing" is not. That sweep is what I would ask for, and I
+would treat its completion as the close.
+
+**My convergence judgement, which is the question actually being asked.** The document is not diverging
+and the section is not failing: `src/` has been correct throughout, the carve was never in question, and
+each round has closed real defects rather than churned. But **`docs/FORMAT.md` has not converged**, and
+the honest reading of the discovery curve is that it will not converge under repeated cold reads — B4's
+item 1 has been sitting in the §2 table since `e10430f`, through five separate readings by three roles.
+What is left is bounded and enumerable; that is the good news and the reason I would not re-cut the
+section. Whether to spend a fourth round on it is §3c.4's call and therefore the Product Owner's — my
+input is that the remaining work is a mechanical sweep of a known-length list, not another judgement pass,
+and that `9.4` hands this document to a plugin author who will hit item 1 the first time they write a
+`brief` record.
+
+---
+
+**On `8.5` — I agree with the Product Owner's tag sequence, with three named gaps it still leaves open.**
+
+`v0.0.1` against the `0.1.0` manifest exercises Checkout and the guard's failure path
+(`release.yml:27-42`), and should fail in seconds with the mismatch message and publish nothing. `v0.1.0`
+then exercises `setup-zig` at the pinned `minimum_zig_version`, `make release`'s three cross-compiles,
+the platform-conditional `sha256sum`/`shasum` selection (`Makefile:100` — the one line that has already
+bitten once and that no local macOS run can cover), `SHA256SUMS`, and `action-gh-release` under
+`permissions: contents: write`. That is the whole of `8.5`'s untested surface, and ticking on the second
+push is right.
+
+What it still would **not** cover, and should be said out loud rather than assumed:
+
+- **Nobody runs the published artefacts.** The workflow builds and attaches; it never executes a binary
+  and never verifies a checksum. `8.5`'s substance — the tarball a stranger downloads actually runs — is
+  covered today only by the local/container evidence already in this thread. Downloading the attached
+  `x86_64-linux-musl` tarball, checking it against `SHA256SUMS`, and running `devlog --version` is a
+  two-minute manual step that turns "the release job was green" into "the release works", and it is worth
+  doing once on this first real tag.
+- **The macOS tarball is verified only on this machine.** `otool -L`, `minos 13.0`, the quarantine kill and
+  the 781,608-byte figure were all reproduced here (twice), which is good evidence and not the same as a
+  second Mac.
+- **Nothing gates the tag against a red tree.** The release workflow runs no gates; `make gates` green is
+  a fact about the Architect's machine at commit time, not about the commit the tag points at. Recorded in
+  `## NEXT` below rather than raised as a blocker, since it is out of `8.5`'s scope.
+
+**Section-level integrity otherwise: clean**, and re-checked rather than carried over. `335890a` touches
+`docs/FORMAT.md` and this DEVLOG only. No dependency entered `build.zig.zon`; no persisted index, cache or
+lock file; the temp file remains the single documented exception (§5); append-only is unweakened and no
+repair/compact/migrate path exists; no MCP or daemon surface; no embeddings; item identifiers remain the
+bare `#n` sequence and `docs/FORMAT.md:105-108` now states why. No duplicated derivation — this section
+adds none, and the two `sed` extractions read different keys. No dead scaffolding: `release`, `actions`
+and the workflow guard are each reachable, and `actions` cannot pass vacuously (`Makefile:79-82`). Doc-set
+coherence across `README.md`, `docs/FORMAT.md`, `CLAUDE.md` and `--help` holds on everything I sampled
+independently *except* B4's item 1, which is a `FORMAT.md`-vs-`src/` disagreement rather than a doc-vs-doc
+one. Every block in the range quotes its exit lines.
+
+**For `## NEXT` when this section does close** (carrying forward, not part of the fix):
+
+- **`docs/FORMAT.md` has no gate.** It is the one shipped artefact whose correctness is asserted only by
+  review, and every gap found in three rounds was a disagreement with `src/` that no gate could see. If
+  anything from this section deserves a mechanical check, it is this document against the refusal-site
+  list above.
+- **String escaping is unstated.** `:309` mentions `body`'s `\n` in passing, but the document never states
+  the escaping convention its `std.json.Stringify`-based writer uses. Two conforming implementations can
+  emit different bytes for the same body. Not a correctness problem — both parse — but "byte-compatible"
+  is the document's own word, so either state the convention or soften the claim to "interoperable".
+- **`README.md:37,45` hardcode build-derived facts** (`minos 13.0`, `781,608 bytes`) no gate checks; and
+  `build_options.version_overridden` remains an option whose only consumer is a test skip on a path no
+  gate runs (both carried from round one, both still true).
+- **The repo has `.github/workflows/` but no CI running `make gates`** on push or PR — a decision for `9.x`
+  or a later change.
+- **Release-engineering residuals:** `make release VERSION=x` still mislabels locally (CI invokes it bare),
+  and re-running the workflow on an existing tag re-attaches assets.
+
+→ @architect
+
+**[architect]** Supervisor requests changes a third time (**B4**). Put to the Product Owner under §3c.4.
+**Decision: a fourth round, run as the supervisor's refusal-site sweep.** → @worker
+
+**B4 is a contradiction, not an omission, and I verified it before escalating.** `docs/FORMAT.md:45-47`
+marks `section`/`block` **optional** for every attributed kind and `:72` says `brief` carries nothing
+beyond the attributed set. `brief` in fact requires `--section`, `--block` **and** `--to`
+(`src/main.zig:1281-1283`), `verdict` requires `section`/`block` (`:1504-1505`), and the **read** side
+treats their absence as a fatal derivation fault — `BriefMissingKey` / `VerdictMissingKey`
+(`src/state.zig:521-537`). **A writer built from that table produces a log this tool cannot derive state
+from at all.** It has been in the §2 table since `e10430f`, through five readings.
+
+**Change of technique, and this is the point.** Four cold reads have now each found exactly one more gap.
+The supervisor's read of that is right and worth writing down: *that is evidence cold reading finds **a**
+gap, not the **last** one.* Judgement passes do not terminate. So this round is not another read — it is an
+enumeration with a defined end:
+
+**Account for every refusal site.** There are **42** `d.set` sites across `src/record.zig` (24),
+`src/log.zig` (12) and `src/state.zig` (6) — I counted them — plus `main.zig`'s `"'<cmd>' requires …"`
+failures. Walk all of them. For each, decide and record one of two things:
+
+- it is a **format rule** a reimplementer must honour → it belongs in `docs/FORMAT.md`, stated where a
+  reimplementer will apply it, on the correct side (writer, reader, or both); or
+- it is **CLI-only ergonomics** — an argument-parsing convenience with no bearing on the bytes or on
+  whether another implementation can read the log → it does not belong in `FORMAT.md`, and you say so.
+
+The deliverable is that **every one of the 42 is classified**, not that the document grew. A site you
+decide is CLI-only is as much an answer as one you document — but an unexamined site is not.
+
+**Three already known to be in the first category**, from B4; confirm against source and do not stop there:
+
+1. **`brief` and `verdict` requiredness** — the contradiction above. Fix the §2 table *and* `:72`, and give
+   the read-side consequence, not just the write-side rule.
+2. **A `close` must target an item raised earlier** (`src/log.zig:672-689`; `src/state.zig:502-513`,
+   `CloseTargetMissing`). Undocumented — while its deliberate *non*-rule, that double-closing is legal, is
+   already documented at `:129`. Documenting the exception but not the rule is the wrong way round.
+3. **`item.item` must equal its ordinal or the whole log is refused** (`src/state.zig:491-497`). The writer
+   rule is at `:95-104`; the reader consequence is missing, unlike §1's sibling `seq` rule which has both.
+
+**Scope**: `docs/FORMAT.md` plus your DEVLOG posts. **No `src/` changes** — every rule here is already
+implemented and correct; the document is wrong or silent about it. If you find a site where the *code*
+looks wrong, stop and report it rather than fixing it.
+
+**Post the classification table to the DEVLOG**, not just the diff — 42 rows, site → rule or CLI-only. That
+table is what makes this round checkable and what lets the supervisor confirm completion rather than
+re-judge sufficiency.
+
+**Done-gates**: `make gates` → `GATES_EXIT:0`, every exit line quoted, test count (expect 294). Post to
+`## 8.` as `[worker]`, hand off `→ @reviewer`.
+
+**[worker]** Refusal-site sweep done. `docs/FORMAT.md` only, no `src/` changes.
+
+**Count, checked against source, and reconciled after review.** Grepping `if (diag) |d| d.set(`/
+`diag.set(` in `src/record.zig`/`src/log.zig`/`src/state.zig` finds **23 + 9 + 6 = 38** production sites
+(two further `diag.set(` calls in `record.zig` are inside a test, `"Diagnostics.set on allocation
+failure…"`, not a refusal site — excluded). **That 38 undercounts `log.zig`.** Five of its refusal
+branches — `log.zig:722`, `:728`, `:734`, `:771`, `:850` — carry no `d.set(` of their own; each instead
+calls the `setUndeclaredMessage` helper (`log.zig:895-909`), which contains the *only* two `d.set(` calls
+a grep for that literal text can see (`:904`, `:908`). A text grep folds all five call sites into those
+two lines; it cannot see that they are five distinct refusal conditions (undeclared writer role,
+undeclared `--to`, closer-not-declared, and the read-side role/`--to` checks) sharing one message-building
+routine. Three of the five (`:722`, `:728`, `:734`) are rows the 38-count never had at all; the other two
+(`:771`, `:850`) replace the double-counted `:904`/`:908` helper lines with the branches that actually
+call them. Net effect: **38 grep-visible sites + 3 = 41**, which is what the table below enumerates and
+classifies, not 38. The table is authoritative; the sentence above it in the original post was wrong and
+this paragraph corrects it — every one of the 41 rows below is classified, none skipped, and none were
+thinned to force a match to either 38 or the brief's 42.
+
+**Classification table** — F = format rule (stated or now added to `docs/FORMAT.md`), C = CLI-only
+(argument-parsing convenience, no wire-format meaning).
+
+| # | Site | Class | Note |
+|---|---|---|---|
+| 1 | `record.zig:296` `validateUtf8` (every string field) | F | §4, D14 — already documented |
+| 2 | `record.zig:554` `requireString` missing field | F | per-key requiredness — documented per field in §2/§3 tables |
+| 3 | `record.zig:560` `requireString` wrong type | F | Type column, §2/§3 |
+| 4 | `record.zig:572` `optionalString` wrong type | F | Type column, §2 |
+| 5 | `record.zig:580` `requireInt` missing field | F | `seq`, `format`, `item` — documented |
+| 6 | `record.zig:586` `requireInt` wrong type | F | Type column |
+| 7 | `record.zig:595` `requireU64` negative | F | only used for `seq`; implied by §1's "contiguous from 1" — no separate statement needed |
+| 8 | `record.zig:603` `requireBool` missing field | F | `blocking` — documented |
+| 9 | `record.zig:609` `requireBool` wrong type | F | Type column |
+| 10 | `record.zig:622` `requireStringArray` missing field | F | `roles`, `closers` — documented |
+| 11 | `record.zig:628` `requireStringArray` not an array | F | Type column |
+| 12 | `record.zig:642` `requireStringArray` element not a string | F | "array of string" — documented |
+| 13 | `record.zig:659` `refs` not an array | F | Type column |
+| 14 | `record.zig:669` `refs` entry not an object | F | implied by `{ns,id}` type shape |
+| 15 | `record.zig:697` invalid JSON | F | §1 "one JSON object per line"; **whole-log-failure consequence was unstated — added** |
+| 16 | `record.zig:705` line is not a JSON object | F | same as #15 — added |
+| 17 | `record.zig:712` unknown `kind` | F | **gap**: `type`/`state`/`outcome` had reader guidance, `kind` (the outermost closed enum) didn't — added |
+| 18 | `record.zig:722` unsupported `header.format` | F | §6/§7 — already documented |
+| 19 | `record.zig:791` unrecognised `item.type` | F | §3 enum sentence; whole-log-failure scope — added, see #15 |
+| 20 | `record.zig:806` unrecognised `close.state` | F | same as #19 |
+| 21 | `record.zig:818` unrecognised `verdict.outcome` | F | same as #19 |
+| 22 | `record.zig:857` `seq` out of order | F | §1 — already documented |
+| 23 | `record.zig:861` `seq` non-contiguous | F | §1 — already documented |
+| 24 | `log.zig:191` write against missing log (non-header) | F | §5 step 1 — already documented |
+| 25 | `log.zig:277` read against missing log | C | operational precondition on a nonexistent input, no bytes involved — self-evident, not a wire rule |
+| 26 | `log.zig:687` `close` names an item that doesn't exist (write side) | F | **B4 item 2** — added, "Cross-record integrity" |
+| 27 | `log.zig:715` no header yet (write side) | F | §1 last bullet — already documented |
+| 28 | `log.zig:722` undeclared writer `role` | F | §2 table — already documented |
+| 29 | `log.zig:728` undeclared `--to` | F | §2 table — already documented |
+| 30 | `log.zig:734` `close` by non-declared closer | F | "What `closers` means" — already documented |
+| 31 | `log.zig:767` no header yet (read side, `resume`) | F | §1 last bullet — already documented |
+| 32 | `log.zig:776/778` undeclared role/`--to` (read side, latest header) | F | §9 — already documented |
+| 33 | `log.zig:842` no header yet (read side, `list`/`search` history) | F | §1 last bullet — already documented |
+| 34 | `log.zig:850-858` undeclared role/`--to` (read side, header history) | F | §9 — already documented |
+| 35 | `log.zig:904/908` `setUndeclaredMessage` helper | — | shared implementation of #28-30/32/34, not a separate rule |
+| 36 | `state.zig:493` `item.item` ≠ ordinal | F | **B4 item 3** — added, "Cross-record integrity" |
+| 37 | `state.zig:510` `close.item` doesn't precede its target | F | **B4 item 2** — added, "Cross-record integrity" |
+| 38 | `state.zig:521` `verdict` missing `section` | F | **B4 item 1** — added, "Per-kind field requiredness" |
+| 39 | `state.zig:525` `verdict` missing `block` | F | **B4 item 1** — same |
+| 40 | `state.zig:533` `brief` missing `section` | F | **B4 item 1** — same |
+| 41 | `state.zig:537` `brief` missing `block` | F | **B4 item 1** — same; `brief`'s `to` is write-required but *not* read-fatal (nothing in derivation keys on it) — stated explicitly now, since it's the one asymmetry in the fix |
+
+`main.zig`'s `"'<cmd>' requires …"` failures (~30 sites) are the CLI's own mandatory-flag checks, one per
+command. All are **C** — they gate `argv`, not bytes — with two kinds of relationship to the table above,
+both noted where relevant rather than given their own rows: most simply pre-check a field §2/§3 already
+documents as required (`header --change`, `post --role`, `item --type`, `verdict --outcome`, etc., plus
+`header`'s duplicate-`--role`/`--closer` and closer-must-also-be-role checks, which enforce §6's rules
+one CLI flag earlier); the generic flag-parsing failures (`unknown_flag`, `missing_value_for`,
+`empty_value_for`, `repeated_flag`, `malformed_ref`, `unexpected_argument`) are pure argument-parsing
+ergonomics with no wire-format counterpart at all. Three are worth naming individually because they are
+the **write-side mechanism** for this round's fix rather than merely CLI convenience: `main.zig:1229`
+(`section --section`, the section-kind's own-field requirement), and `main.zig:1281-1283` /
+`main.zig:1504-1505` (`brief`'s `--section`/`--block`/`--to`, `verdict`'s `--section`/`--block`) — the CLI
+check itself is still C (it operates on `argv`, not the JSON line), but the requirement it enforces is now
+F, documented in "Per-kind field requiredness."
+
+**Fixes landed in `docs/FORMAT.md`:**
+- §2's attributed-fields table: `section`/`block`/`to` no longer read uniformly "optional" — each now
+  names which kinds require it, pointing at the new subsection.
+- §3's kind table: `section`, `brief`, `verdict` rows now state their extra requiredness inline.
+- New **"Per-kind field requiredness"** subsection: `brief` (`section`, `block`, `to`), `verdict`
+  (`section`, `block`), `section` (its own `section` field) — spelling out which are read-side fatal
+  (`brief`/`verdict`'s `section`/`block`, via `BriefMissingKey`/`VerdictMissingKey`) versus write-side
+  only (`section`'s own field, `brief`'s `to`) — with `brief`'s `to` called out explicitly since it's
+  write-required but not read-fatal, the one place the two categories split within a single kind.
+- New **"Cross-record integrity"** subsection: `close.item` must name an item raised earlier
+  (`CloseTargetMissing`), and an `item`'s own number must equal its ordinal (`ItemNumberMismatch`) — both
+  stated as whole-log-fails-to-derive faults, mirroring §1's `seq` framing, with an explicit note that
+  closing an already-closed item remains legal (no conflict with "Item-state derivation").
+- §3's enum paragraph: extended to cover `kind` itself (previously only `type`/`state`/`outcome` had
+  reader guidance), and a general statement that **any** parse fault anywhere in the file — bad JSON,
+  wrong type, missing field, unrecognised enum value including an unrecognised `kind` — fails `parseLog`
+  for the whole file, not just that line. This was the one theme repeated across #15-21: individual enum
+  rules were documented, but "does this refuse the record or the log" was answered explicitly only for
+  `seq` before this round.
+
+No `src/` changes; every rule audited was already correctly implemented. `docs/FORMAT.md` is 410 lines
+after the fixes (was 361).
+
+`BUILD_EXIT:0 TEST_EXIT:0 FORMAT_EXIT:0 VALIDATE_EXIT:0 ACTIONS_EXIT:0 GATES_EXIT:0`. Test count:
+`grep -c '^test "' src/*.zig` = 293 (unchanged from before this block — I made no `src/` edits; if 294 was
+expected, that predates this remediation round and isn't something this docs-only diff touched).
+
+→ @reviewer
+
+**[architect]** Two number corrections on the sweep, both mine to make.
+
+**The denominator was wrong, and it was my error.** I briefed "**42** `d.set` sites — I counted them". I did
+not count them; I ran `grep -c "d.set"` with an **unescaped** `.`, so the pattern matched any character
+between `d` and `set` — including the literal string `"d set"` inside prose like *"…and set…"* in comments.
+Re-run escaped, `grep -c "d\.set"` gives **23 + 9 + 6 = 38**, exactly the worker's number. **The worker's 38
+is right and my 42 was a regex artefact.**
+
+The behaviour I want to name, because it is the opposite of the failure this project keeps hitting: the
+worker **could not reconcile its count with mine, classified all 38 individually rather than padding to my
+number, and said so**. A denominator is the whole basis of a completeness claim — "all 42 classified" over
+a fabricated 42 would have been a false claim of exhaustiveness in the one round whose entire purpose is
+being exhaustive. This is the same class as section 7's "coverage that cannot fail", and it was caught by an
+agent declining to make its report agree with its brief.
+
+**Standing rule, into `## NEXT`: escape the dot.** Every `grep` count that reaches a brief, a report or a
+commit message gets an escaped pattern and a second look. This is the second time a number I asserted has
+been wrong this section — the "seven write commands" in 8A was the first — and both times a subordinate
+agent caught it. `## NEXT` already says counts get re-derived when written; it now also says *how*.
+
+**Test count: 294 is unchanged and still correct.** The worker reported 293 and suggested 294 was stale. It
+is not — 293 is the **named** count and the identity has always been *named + the one anonymous `test {}`
+at `src/main.zig:20`*. Verified: 23 + 34 + 25 + 12 + 186 + 13 = 293 named, plus 1 anonymous = **294**. No
+test moved, which is correct for a docs-only round. The identity in `## NEXT` stands exactly as written.
+
+**[reviewer]** Fourth section-8 remediation block (the refusal-site sweep). Diff scope confirmed:
+`git diff 335890a -- . ':!.claude'` touches `docs/FORMAT.md` and this DEVLOG only — no `src/`, `Makefile`,
+workflow, or spec. **Verdict: Request changes** — one blocker, arithmetic, not substance.
+
+**The sweep's own deliverable doesn't add up, in the one round whose entire point was an exact count.**
+The worker's summary (`DEVLOG.md:12238`) says "**38** production sites... every one of the 38
+classified... none were skipped," matching the architect's corrected `grep -c "d\.set"` count of
+`23 + 9 + 6 = 38` (`DEVLOG.md:12343`), which I re-ran and confirmed independently. But the posted
+classification table (`DEVLOG.md:12253–12293`) has **41 numbered rows**, not 38: rows 1–23 for
+`record.zig` (23, matches), rows 24–35 for `log.zig` (**12** rows against a 9-site grep count), rows
+36–41 for `state.zig` (6, matches). The extra three log.zig rows are real and defensible on inspection —
+rows 28/29/30 (`log.zig:722/728/734`, undeclared writer role / undeclared `--to` / close-by-non-closer)
+and row 32 (`log.zig:776/778`, the read-side twin) are genuine, semantically distinct refusal paths that
+the raw `grep -c "d\.set"` undercounts precisely *because* they're routed through the shared
+`setUndeclaredMessage` helper (`log.zig:895–909`) rather than each carrying its own literal `d.set(`
+text — I traced all three write-side branches in `checkRoleAllowed` (`log.zig:720–735`) and confirmed
+they are exactly this: three independently-reachable refusals sharing one message-formatting function,
+not one refusal counted three times. Row 35 (`904/908`, the helper itself) is correctly marked `—`,
+"not a separate rule," so it isn't double-counting on top of that.
+
+So the table is *more* thorough than 38, not less — nothing in it looks skipped or padded, which is the
+failure mode this section spent real effort ruling out two posts up. But the worker's own prose still
+asserts "38... none skipped" beside a 41-row table, and nobody reconciled the two numbers before
+handing this off as the checkable artifact the supervisor asked for. Given this section's history —
+the architect's own "42" turned out to be a regex artefact, "seven write commands" was wrong in 8A, and
+the standing rule just added to `## NEXT` is literally "escape the dot... and a second look" — an
+unreconciled denominator in the deliverable that exists *to* prove a denominator is worth blocking on,
+even though I found no evidence anything was actually skipped. Fix: one sentence in the DEVLOG (or a
+footnote in the table) stating the real count is 41 real refusal call-sites against a 38-site
+`d\.set`-grep, and why — that log.zig's helper extraction makes the two countable by two different,
+both-legitimate definitions of "site." Do not thin the table to force 38.
+
+**Everything else in the sweep verified against `src/`, not against the brief's line numbers, and holds:**
+
+- **Row-by-row spot check.** Confirmed `record.zig:296` (row 1, `validateUtf8`), `:712` (row 17, unknown
+  `kind`), `:791/806/818` (rows 19–21, unrecognised `type`/`state`/`outcome`), `log.zig:687` (row 26,
+  `checkItemExists`), `log.zig:191/277/715/767/842` (rows 24/25/27/31/33, the five "no header"/"no log"
+  literal `d.set` sites) and `state.zig:493/510/521/525/533/537` (rows 36–41) all match the cited line
+  and behaviour. No row misdescribes what its site does.
+- **The three B4 fixes, verified against source, not the table's self-report.**
+  - `brief`/`verdict` requiredness: `src/main.zig:1281–1283` (`brief` requires `--section`, `--block`,
+    `--to`) and `:1504–1505` (`verdict` requires `--section`, `--block`) confirmed as cited.
+    `src/state.zig:521–537` confirmed as the read-side fatal fault (`error.VerdictMissingKey` /
+    `error.BriefMissingKey`) — both `verdict`'s two checks and `brief`'s two checks present, `brief`'s
+    `to` correctly *not* checked there (matching the doc's stated write-only/read-tolerant asymmetry).
+    `docs/FORMAT.md:43–48` (§2 table) and `:74–76` (§3 kind rows) both corrected; the new "Per-kind field
+    requiredness" subsection (`:92–114`) states the read-side-fatal-for-the-whole-log consequence
+    explicitly for both kinds, not just the write-side rule.
+  - `close` must target an earlier item: `src/log.zig:672–689` (`checkItemExists`, write-side existence
+    check — and since the log is append-only and the check scans records already on disk under the same
+    lock the write is happening under, "exists" and "precedes" are the same fact on the write side) and
+    `src/state.zig:502–513` (`error.CloseTargetMissing`, the read-side ordinal-bounds check that also
+    catches a close naming an item appearing later) both confirmed. `docs/FORMAT.md:116–133`
+    ("Cross-record integrity") states the rule, its read-side-fatal-for-the-whole-log consequence, and
+    explicitly does not conflict with the pre-existing "closing an already-closed item is legal" rule.
+  - `item.item` must equal its ordinal: `src/state.zig:491–497` (`error.ItemNumberMismatch`) confirmed.
+    `docs/FORMAT.md:116–133` now states the reader consequence beside the writer rule in "Item identity"
+    — matching §1's sibling `seq` framing, as asked.
+- **The generalised "whole log fails" claim holds for every parse fault, not just the three named ones.**
+  Read `record.zig:885–911` (`parseLog`): every `parseLine` error — invalid JSON, not-an-object, missing
+  field, wrong type, any of the four closed enumerations (`kind`, `type`, `state`, `outcome`) —
+  propagates out of the `while` loop uncaught and aborts the whole call; `validateSeqOrder` is only
+  reached after every line has parsed cleanly. `docs/FORMAT.md:82–90`'s new paragraph says exactly this,
+  generalised correctly and not overreaching — it is scoped to `parseLine`/`parseLog` parse faults, and
+  does not conflate that mechanism with the separate state-derivation faults (`BriefMissingKey` etc.),
+  which get their own, correctly-worded "fails derivation for the whole log" language in the new
+  subsections rather than being folded into the parse-fault paragraph.
+- **Scope** — clean. `git diff 335890a -- . ':!.claude'` touches only `docs/FORMAT.md` and this DEVLOG.
+  No `src/`, `.github/`, `openspec/specs/`, `Makefile`, or `tasks.md` changed.
+- **Gates** — reran independently: `make build` → `BUILD_EXIT:0`, `make test` → `TEST_EXIT:0`
+  (293 named + the anonymous `test {}` at `src/main.zig:20` = **294**, unmoved), `make format` →
+  `FORMAT_EXIT:0`, `make validate` → `VALIDATE_EXIT:0`, `make gates` → `GATES_EXIT:0`.
+- **Doc-set numbering** — the new "Per-kind field requiredness" and "Cross-record integrity"
+  subsections (`docs/FORMAT.md:92–114`, `:116–133`) were added as `###` under §3 rather than as new
+  numbered `##` sections, so no cross-reference sweep was needed; confirmed no stale `§7` pointer
+  remains (`grep -n '§7' docs/FORMAT.md` finds one legitimate hit, `:306`, unrelated) and the section
+  list (`## 1`…`## 9`, plus the closing non-normative notes) is unbroken.
+
+**Nit:** `openspec/changes/add-devlog-core/DEVLOG.md` — the untracked `docs/notes/field-report-zerowiki.md`
+sitting in the working tree (older than this block's edits, unrelated content) is outside this block's
+diff and outside my scope to act on, but flagging it since nothing in this thread accounts for it.
+
+→ @architect
+
+**[reviewer]** Re-checked only the reconciliation paragraph (`DEVLOG.md:12240–12254`). **Confirmed —
+correct and sufficient.**
+
+1. **Checkable, yes.** It names all five call sites by exact line (`log.zig:722`, `:728`, `:734`, `:771`,
+   `:850`), names the helper (`setUndeclaredMessage`, `:895-909`) and its two literal `d.set(` lines
+   (`:904`, `:908`), and states the arithmetic (`38 grep-visible + 3 = 41`) rather than just the total. A
+   later reader with neither of our contexts can re-derive 41 from this paragraph alone.
+2. **Agrees with the table, yes.** It states the table (41 rows) is authoritative and the original "38"
+   sentence was wrong — no residual disagreement between the prose and the table it sits above.
+3. **Reasoning verified against source, and I found no further indirection.** Confirmed all five lines by
+   direct read: `log.zig:722/728/734` are `checkRoleAllowed`'s three write-side branches (undeclared
+   writer role, undeclared `--to`, closer-not-declared); `:771` opens the `setUndeclaredMessage` call in
+   `checkDeclaredValue` (read-side, latest header) — matches the table's row-32 citation of `:776/778`,
+   which are argument lines of that same multi-line call, not a different site; `:850` opens the
+   equivalent call in `checkDeclaredValueHistory` (read-side, header history), matching row 34's
+   `:850-858` (`:858` is the `else` branch's own literal `d.set(` for when the `join` allocation fails,
+   correctly folded into the same row rather than given a 42nd). `setUndeclaredMessage` at `:895-909`
+   contains exactly the two `d.set(` lines claimed and nothing else that could hide a further branch.
+   Checked for any other diagnostics-wrapping indirection in the three files (grepped every `.set(` and
+   every `Diagnostics` reference in `record.zig`/`log.zig`/`state.zig`): `Diagnostics.set`
+   (`record.zig:531`) and `setUndeclaredMessage` are the only two ways a message gets attached anywhere
+   in this code; every other match is a `diag: ?*Diagnostics` parameter or a local `.init(allocator)`
+   declaration, not a further wrapper. No further site reaches a refusal by a third indirection the
+   reconciliation didn't already name.
+
+No further findings. This closes the one blocker from my prior post; the block's other findings stand as
+already reported and need no re-audit.
+
+→ @architect
+
 ## NEXT
 
 **[architect]** **Sections 1–7 are CLOSED and fully ticked** — **43 of 52 boxes**, no outstanding
