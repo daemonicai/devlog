@@ -11780,6 +11780,255 @@ pre-existing dirty state, unrelated to this block.
 
 No blockers, no nits. → @architect
 
+**[supervisor]** Section 8 re-audit, round two — range `f21864d..HEAD` (`e10430f`, `53abbf9`, `82fe8b2`,
+`eec166b`, `cd7e60a`, `8cb1786`). **Request changes** — one blocker, in the same class as B1 and in the
+same document, found by re-reading `docs/FORMAT.md` cold rather than against B1's three items.
+
+**B2 is closed.** `.github/workflows/release.yml:27-42` is correct and correctly placed: the guard is the
+first step after Checkout, ahead of the `minimum_zig_version` read, `Set up Zig`, `make release` and the
+attach step, so the `v0.2.0`-against-`0.1.0` case I described now costs seconds and publishes nothing.
+Fails closed on an unreadable tag (`:30-33`) and an unreadable manifest (`:35-38`); the `sed` at `:34` is
+byte-identical to `Makefile:111`'s. What it does **not** cover, and does not need to: a bumped manifest
+against unbumped code cannot mislabel a tarball here, because the embedded version comes from the same
+literal — `build.zig` takes `build_options.version` from `build.zig.zon` by default and `make release`
+never passes `-Dversion` (`Makefile:102-111`), so tag → manifest → tarball name → `devlog --version` are
+one string by construction, and the guard pins the one link that was free. The residual holes are
+release-engineering only: `make release VERSION=x` would still mislabel locally (CI invokes it bare,
+`release.yml:60`), and re-running the workflow on an existing tag re-attaches assets. Neither is worth a
+block; both are `## NEXT`.
+
+**R11 is in the right place and correctly stated.** `specs/log-retrieval/spec.md:72-98` — a retrieval
+requirement with three scenarios that match `src/log.zig:785-787` (`checkDeclaredRole`, latest header,
+reached from `main.zig:1999`) and `src/log.zig:868-870` (`checkDeclaredRoleHistory`, union of every
+header's `roles`, via `checkHistoryFilters`). It neither overstates (no claim that the check is
+enforcement) nor narrows (scenario 3 covers `--to` as well as `--role`, and the undeclared case at both
+scopes). `docs/FORMAT.md:292-317` restates it in full rather than cross-referencing, which is the right
+resolution of the sole-ownership problem.
+
+**B1's three named gaps are genuinely closed to the bar, not merely mentioned.** I re-derived each from
+source before reading the new prose. Item identity (`docs/FORMAT.md:91-104`) is now sufficient to write
+the field: the *n*th `item` record is `#n`, assigned under the write lock, non-`item` kinds consume no
+slot, and the `#n`-has-no-prefix rationale is stated. Item-state derivation (`:117-133`) is sufficient to
+implement §8 shapes 2-5, and explicitly warns that the four-member item-state enumeration is wider than
+`close.state`'s three. `closers` (`:106-115`) now defines the field rather than leaning on
+`README.md:101-106`, with the D13 guardrail-not-enforcement framing intact.
+
+**B3 (blocker) — a fourth gap: the `format` version's actual value is stated in no shipped document, and
+§7's refusal rule contradicts the shipped reader.**
+
+`format` is a mandatory field of the mandatory first line of every legal log (`docs/FORMAT.md:24-25`,
+`:66`). The document names the field three times — `:66`, `:238` ("the only format version this tool ever
+writes"), `:244-248` — and **never states the integer**. `README.md:124-135` does not state it either; it
+re-asserts the byte-compatible claim and defers to `FORMAT.md`. The value is `1`
+(`src/record.zig:19`, `supported_format`). This is item 1 of B1 exactly repeated one field over: **a
+byte-compatible writer cannot emit its first line from this document alone**, which is the claim
+`docs/FORMAT.md:3-6` and `README.md:132-134` both make.
+
+The reader half is worse than omitted — it is stated wrongly. `:244-246` requires refusal only of a
+`format` **higher** than the reader understands and says a value the reader "does understand" is processed
+normally, leaving lower values undefined. `src/record.zig:720-726` refuses **any** `format != 1`, in one
+comparison, with one message. A reimplementer following §7 literally builds a reader that accepts
+`format: 0` where `devlog` refuses it — a behavioural divergence between the normative document and the
+binary, produced by §7 (written in `8.1-8.4`) describing a parser written back in section 2. That is the
+cross-block shape, and it is why a block review over `e10430f`'s diff could not see it.
+
+I am aware this is round two and what CLAUDE.md §3c.4 says. I am not going to soften a finding to avoid
+that rule: `8.4`'s bar is a document from which the format can be reimplemented, and a required field
+whose only legal value is unstated is below that bar however small the fix is. Its size is the point I
+would put to the Product Owner — see below.
+
+**Suggested remediation shape** (one paragraph and one bullet, `docs/FORMAT.md` only, no `src/`):
+
+1. State the value where the field is introduced — `:66`'s table row, or a line in §6 near `:238`: the
+   current format version is **`1`**, and `1` is the only value this tool writes.
+2. Correct `:244-248` to the implemented rule: a reader refuses **any** `format` value it does not
+   understand — this build understands exactly `1` — not only values higher than its own. Keep the
+   "never guess" rationale; it is right, it is just currently scoped to one direction.
+3. While in there, two adjacent omissions of the same family, cheap to close in the same edit and
+   otherwise left to `## NEXT`: `ts`'s emitted shape is given only by example at `:22-23` (the writer
+   emits second-precision `YYYY-MM-DDTHH:MM:SSZ`, `src/main.zig:1092`), and `tool`'s content is never
+   specified (`"devlog <semver>"`, `src/main.zig:1138`) though §6's identity comparison at `:229-230`
+   turns on it.
+
+**On the section's remaining work — no, the tag push is not the only thing outstanding, and verifying only
+the guard would not close `8.5`.** B3 is against ticked work (`8.4`) again. On `8.5`: a `v0.0.1` push
+against the `0.1.0` manifest now exercises Checkout and the guard's failure path and **nothing else** —
+not `setup-zig`, not the three cross-compiles, not `SHA256SUMS` (whose `sha256sum`/`shasum` selection is
+platform-conditional, `Makefile:100`), not the `action-gh-release` attach under `permissions:
+contents: write`. Those are where `8.5`'s untested risk actually lives. My recommendation to the Product
+Owner: push `v0.0.1` first if you want to *see* the guard refuse (it should fail in seconds with the
+mismatch message, and no release should appear), then push **`v0.1.0`** — matching the manifest — for the
+path that actually needs verifying, and delete the release and tag afterwards if it is unwanted. `8.5`
+should be ticked on the second push, not the first.
+
+**Section-level integrity otherwise: clean.** Doc-set coherence across `README.md`, `docs/FORMAT.md`,
+`CLAUDE.md` and `--help` holds on the counts and rules I sampled independently (eight write / six read
+commands, seven `--json` shapes, the one-line-per-payload rule, the `--limit` digit rule, exit codes and
+the closed-pipe `WriteFailed` path); the `list`/`search --help` divergence raised in 8A was fixed in
+`src/main.zig` in a later block rather than left as prose drift. No dead scaffolding: the guard, the
+`release`/`actions` targets and the workflow are each reachable and gated (`ACTIONS_EXIT:0`). No
+duplicated derivation — this section adds no derivation. No new state outside the log, no dependency, no
+`src/` behaviour change in the remediation block (`git diff --stat` on `8cb1786` confirms: workflow, doc,
+spec, DEVLOG). Every block in the range quotes its exit lines.
+
+→ @architect — this is round two, so per §3c.4 it goes to the Product Owner rather than to a third
+remediation block. My own read, offered as input to that call and not as a decision: the finding is real
+and the section should not close over it, but it is a one-paragraph documentation edit with no `src/`
+consequence and no bearing on the section breakdown or the spec — the case §3c.4 exists to catch (a
+section that cannot converge) is not this one. If the Product Owner waves it through as a third block, it
+needs no re-audit from me beyond confirming `docs/FORMAT.md` names `1` and §7 refuses in both directions.
+
+**[architect]** Supervisor requests changes a second time (**B3**). Under §3c.4 that is the Product Owner's
+call, not mine, so I put it to them with the supervisor's own read attached — that this is a one-paragraph
+documentation edit with no `src/` consequence and no bearing on the section breakdown or the spec, and
+therefore not the non-convergence case the two-round rule was written to catch.
+
+**Product Owner's decision: carve a third remediation block.** Also ruled: the tag plan is **`v0.0.1`
+first, then `v0.1.0`**, with `8.5` ticked on the second push.
+
+**I verified B3 myself before escalating it, and both halves hold.** `src/record.zig:19` sets
+`supported_format = 1` and `:721` refuses **any** `format != 1`. `docs/FORMAT.md:244-246` tells a
+reimplementer to refuse only a **higher** value, and the document states the current version's value
+**nowhere** — grep finds no occurrence. So a reader built from the document accepts `format: 0` where
+`devlog` refuses it, and a writer built from the document cannot emit the mandatory first line at all.
+
+**Why the two-round rule bends here rather than breaks.** §3c.4 exists because a section that will not
+converge in two rounds usually means the breakdown or the spec is wrong, and more fixing resolves neither.
+That diagnosis does not fit: nothing about section 8's carve or `8.4`'s spec is in question, `src/` is
+untouched and correct, and each round has closed real defects rather than churning. What the three rounds
+actually measure is that **`8.4`'s bar is unusually hard to hit** — "reimplementable from this document
+alone" is a claim about the *absence* of things, and absence is what review is worst at seeing. B1 found
+three, B3 found a fourth, all the same shape: a field named in several places with its rule stated in none.
+
+**The lesson, for `## NEXT`:** every gap found in `FORMAT.md` across both rounds was invisible to a
+checklist and visible only to someone reading the document cold as an implementer. That is the review
+technique this document needs, and it is not the technique a diff review applies. Section 9's `9.4` hands
+this document to a plugin author, who will be exactly that cold reader.
+
+**Remediation block — third and final for this section.** → @worker
+
+Scope is **`docs/FORMAT.md` only**. No `src/`, no workflow, no spec, no `Makefile`. The behaviour is
+correct; the document is wrong about it.
+
+1. **State the format version.** `format` is `1` (`src/record.zig:19`), it is the only value this tool
+   writes, and it is mandatory on the `header`. A writer must be able to emit the first line from this
+   document alone.
+2. **Correct the reader rule at `:244-248`.** It currently says refuse a **higher** value. The
+   implementation refuses **any value it does not understand** (`src/record.zig:720-726`). Say that, and
+   drop the "higher" framing entirely — it is not a narrower statement of the rule, it is a different and
+   wrong one.
+3. **Close the two adjacent same-family omissions** the supervisor identified, both mandatory fields whose
+   emitted content is unstated: **`ts`'s emitted shape** (`src/main.zig:1092`) and **`tool`'s content**
+   (`src/main.zig:1138`). `tool` matters more than it looks — §6's header-identity comparison at
+   `:229-230` turns on it, so a reimplementer that formats `tool` differently will append headers where
+   this tool appends nothing.
+
+Read `src/` for each of these rather than trusting the line references above. **Then do the thing the
+checklist cannot:** read §§1–8 straight through as an implementer with no access to the source, and report
+any *further* mandatory field whose value or emitted shape is unstated. If you find none, say so
+explicitly — that statement is the deliverable, not a formality.
+
+**Done-gates**: `make gates` → `GATES_EXIT:0`, every exit line quoted, test count reported (expect 294).
+Post to `## 8.` as `[worker]`, hand off `→ @reviewer`.
+
+**[worker]** B3 remediation. `docs/FORMAT.md` only — verified every claim against `src/` before writing,
+not against the brief's line numbers (they held).
+
+**1. Stated the format version.** `src/record.zig:19` (`supported_format: i64 = 1`) confirmed. Added
+"`format` is currently `1` — the only value this build ever writes" to the `header` row of §3's kind
+table, and a full paragraph at the end of §6 stating "its value is the integer `1`" and that a
+byte-compatible writer emits `"format": 1` on every header it produces.
+
+**2. Corrected §7.** Verified `src/record.zig:720–726`: `if (format != supported_format)` — one
+comparison, refuses any value that isn't `1`, both directions. Rewrote §7's bullet to drop "higher"
+entirely: a reader refuses any `format` value other than one it understands, stated explicitly as not
+scoped to "higher" — "a reader that only understands `format: 1` has no more grounds to guess at
+`format: 0` than at `format: 2`."
+
+**3. Closed the two adjacent omissions.**
+- `ts`'s emitted shape: confirmed against `src/main.zig:1092` (`formatTimestamp`,
+  `{d:0>4}-{d:0>2}-{d:0>2}T{d:0>2}:{d:0>2}:{d:0>2}Z`). §1's `ts` bullet and §2's universal-fields table
+  row now state the fixed shape explicitly — `YYYY-MM-DDTHH:MM:SSZ`, second-precision, UTC, literal `Z`
+  — rather than leaving it inferable only from one example, and note this is a writer promise, not a
+  reader restriction (a reader still accepts any valid ISO 8601 UTC timestamp).
+- `tool`'s content: confirmed against `src/main.zig:1138`
+  (`std.fmt.allocPrint(allocator, "devlog {s}", .{build_options.version})`). Added a bullet to §6 stating
+  the literal shape `"devlog <semver>"` (space-separated, no `v` prefix) and spelling out why it matters
+  beyond completeness: it's one of the three fields header-identity comparison (D13) compares verbatim,
+  so a differently-formatted `tool` string never round-trips as "unchanged" and a reimplementation would
+  append a header where this tool appends none.
+
+**Cold read of §§1–8, no access to `src/` assumed — one further gap found, documented in the same pass.**
+`main.zig:1118–1119` refuses a `header` write with zero `--role` or zero `--closer` (CLI-level, before a
+record is ever built) — a write-side minimum-cardinality rule that had no mention anywhere in
+`docs/FORMAT.md`. Same shape as the three above: a field (`roles`/`closers`) whose rule was unstated.
+Checked whether it's also enforced in `record.zig`/`log.zig` (the reader/identity path) — it is **not**,
+so this is a writer-only guarantee, not a wire constraint; a reader must still accept a foreign header
+with an empty `roles` or `closers` array. Added one bullet to §6, phrased the same way §2 already treats
+`body: ""`: `devlog` never writes it, a reader must still tolerate it. No other gap found in §§1–8 read
+straight through as a cold implementer — the eight kinds, the enumerations, the field-order table, the
+temp-file protocol, the `--json` shapes, and the read-side role rule all state a checkable value or rule
+everywhere I looked for one.
+
+**Scope**: `docs/FORMAT.md` only, confirmed by `git status --porcelain` — no `src/`, `Makefile`, workflow,
+or spec touched.
+
+**Gates**: `BUILD_EXIT:0 TEST_EXIT:0 FORMAT_EXIT:0 VALIDATE_EXIT:0 ACTIONS_EXIT:0 GATES_EXIT:0`. Test
+count unmoved: 293 named `test "..."` plus the anonymous `test {}` at `src/main.zig:20` = **294**,
+confirmed.
+
+→ @reviewer
+
+**[reviewer]** Third section-8 remediation block (B3 + the worker's own find). Diff scope confirmed:
+`git diff 8cb1786 -- . ':!.claude'` touches `docs/FORMAT.md` and `DEVLOG.md` only — no `src/`, `Makefile`,
+workflow, or spec. **Verdict: Approve.**
+
+Verified each claim against `src/`, not the brief's line numbers:
+
+1. **Format version stated** — `docs/FORMAT.md:70` ("`format` is currently `1`") and `:254-257` ("its
+   value is the integer `1`") match `src/record.zig:19` (`supported_format: i64 = 1`). A writer can now
+   emit `"format": 1` on the first line from the document alone.
+2. **Reader rule corrected** — `docs/FORMAT.md:263-271` now reads "anything **other than** a version
+   this reader understands... not scoped to 'higher'... has no more grounds to guess at `format: 0` than
+   at `format: 2`." Matches `src/record.zig:720-726` (`if (format != supported_format)`, one comparison,
+   both directions). The "higher" framing is gone, not softened; the new text explicitly names
+   `format: 0` as refused, satisfying the check.
+3. **`ts`'s emitted shape** — `docs/FORMAT.md:22-27` and `:39` state `YYYY-MM-DDTHH:MM:SSZ`,
+   second-precision, UTC, literal `Z`, never fractional, never `+HH:MM`. Matches `src/main.zig:1092`
+   exactly (`{d:0>4}-{d:0>2}-{d:0>2}T{d:0>2}:{d:0>2}:{d:0>2}Z`).
+4. **`tool`'s content** — `docs/FORMAT.md:238-244` states the literal `"devlog <semver>"` shape and
+   explicitly ties it to header-identity comparison: "a reimplementation that formats this string
+   differently... will compare unequal to a real `devlog` header on every write and append a new
+   `header` record where the shipped tool appends none." Matches `src/main.zig:1138`
+   (`std.fmt.allocPrint(allocator, "devlog {s}", .{build_options.version})`) and `src/log.zig:467-471`
+   (`headerUnchanged` compares `tool` via `std.mem.eql`). Load-bearing point is made explicit, not left
+   implicit.
+5. **Worker's own find (roles/closers minimum cardinality)** — `docs/FORMAT.md:233-237` documents the
+   write-side refusal of an empty `roles` or `closers` array, matching `src/main.zig:1118-1119`.
+   Correctly placed in §6 (write-side header rules) rather than §2/§3, and correctly scoped as
+   writer-only: confirmed `src/record.zig`/`src/log.zig` parse and accept an empty array on the
+   read/identity path (no cardinality check there), and the document says so explicitly — "a reader must
+   still accept a foreign or historical `header` record whose `roles` or `closers` array is empty... it
+   is just something `devlog` itself never produces," mirrored from §2's existing `body: ""` framing.
+   Correct side, correct place.
+
+**My own independent cold read of §§1–8** (not checking the worker's list or the supervisor's): traced
+every mandatory field's value/emitted shape/rule against `src/record.zig` and `src/main.zig` directly —
+the eight kinds and their additional fields, the four closed enumerations (`type`, `close.state`,
+`verdict.outcome`, and the wider derived item-state set), `roles`/`closers` set semantics and
+cardinality, `tool`'s literal shape, `format`'s value and refusal rule, the temp-file/rename protocol,
+all seven `--json` shapes, and §9's latest-header-vs-history split. Cross-checked the enumerations
+directly against `src/record.zig:65-67` (`ItemType`, `CloseState`, `VerdictOutcome`) and confirmed every
+wire value the document names. **Found no further gap of this shape.** Nothing left that a cold
+implementer would have to guess.
+
+No nits, no architectural notes beyond what `## NEXT` already carries forward.
+
+Gates: worker reports `GATES_EXIT:0`, 294 tests, scope confirmed by `git status --porcelain` —
+consistent with my own `git diff` check above.
+
+→ @architect
+
 ## NEXT
 
 **[architect]** **Sections 1–7 are CLOSED and fully ticked** — **43 of 52 boxes**, no outstanding
