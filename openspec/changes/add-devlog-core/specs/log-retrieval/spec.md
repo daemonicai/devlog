@@ -69,6 +69,34 @@ reader can ask a precise question and receive a precise answer.
 - **WHEN** an agent asks for items that are open and blocking
 - **THEN** only those items are returned, regardless of kind or addressee
 
+### Requirement: Role and addressee filters validate against the right header scope
+
+The tool SHALL validate a `role` or addressee (`to`) filter against the log's declared role set before
+using it to narrow a read, so that a filter naming a role that was never declared fails loudly rather
+than silently returning nothing. Which declaration a filter is validated against SHALL depend on what
+the read is answering: a read of the project's *current* identity SHALL validate against the **latest**
+header only, while a read of the project's *history* SHALL validate against the **union of every role
+ever declared** across every header in the log, so that a role retired from a later header remains a
+valid filter for a search of the log's past.
+
+#### Scenario: Resuming validates against the current role set only
+
+- **WHEN** a worker resumes with `--role <r>` and `<r>` was declared by an earlier header but has since
+  been retired from the latest header
+- **THEN** the resume is refused, because resuming is a claim about the project's current identity
+
+#### Scenario: Listing or searching accepts a retired role
+
+- **WHEN** an agent lists or searches with `--role <r>` or `--to <r>`, and `<r>` was declared by an
+  earlier header but has since been retired from the latest header
+- **THEN** the read succeeds and returns the records that role authored or was addressed to, because
+  listing and searching answer questions about the log's whole history
+
+#### Scenario: An undeclared role is refused everywhere
+
+- **WHEN** any read filter names a role that was never declared by any header in the log
+- **THEN** the read is refused, regardless of which header scope that read validates against
+
 ### Requirement: Every read is available both rendered and machine-readable
 
 Each read SHALL present its result as rendered text by default, for a reader working in a terminal or

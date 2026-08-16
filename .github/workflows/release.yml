@@ -24,6 +24,23 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4.2.2
 
+      - name: Verify tag matches build.zig.zon's version
+        run: |
+          tag_version="${GITHUB_REF_NAME#v}"
+          if [ -z "$tag_version" ]; then
+            echo "could not read a version from GITHUB_REF_NAME ('$GITHUB_REF_NAME')" >&2
+            exit 1
+          fi
+          manifest_version=$(sed -n 's/^[[:space:]]*\.version[[:space:]]*=[[:space:]]*"\(.*\)".*/\1/p' build.zig.zon)
+          if [ -z "$manifest_version" ]; then
+            echo "could not read .version from build.zig.zon" >&2
+            exit 1
+          fi
+          if [ "$tag_version" != "$manifest_version" ]; then
+            echo "tag v$tag_version does not match build.zig.zon's version $manifest_version — refusing to publish mislabelled tarballs" >&2
+            exit 1
+          fi
+
       - name: Read minimum_zig_version from build.zig.zon
         id: zig-version
         run: |

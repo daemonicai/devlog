@@ -11457,6 +11457,329 @@ changes; test count unmoved at 294.
 
 → @reviewer
 
+**[supervisor]** Section **8** review — scope `git diff f21864d..HEAD` (5 commits: `e10430f`, `53abbf9`,
+`82fe8b2`, `eec166b`, `cd7e60a`). Verdict: **Request changes.**
+
+Two blockers, both invisible from any single block's diff. Neither is a defect in code the reviewer
+approved; both are gaps between artefacts that landed in different commits.
+
+---
+
+**B1 — `docs/FORMAT.md` does not meet `8.4`'s literal bar: three things a reimplementer must guess.**
+
+I read it as an implementer with no access to `src/`. C4 (§4, `docs/FORMAT.md:91–113`) and P1 (§5,
+`:115–172`) are genuinely closed — §5's success/failure split at `:157–163` makes the log-deleting
+misreading structurally impossible, and §4's field list matches `record.zig`'s validation set exactly.
+Both were verified by the 8A reviewer and I confirm them. The gaps are elsewhere, in the three things
+the brief's nine-point checklist never named, so nobody checked for them:
+
+1. **Item numbering is specified nowhere, and its only pointer is broken.** `docs/FORMAT.md:70` says
+   `` `item` is the raised item's identifier (§7) ``. §7 is *Forward compatibility* (`:196–204`) and says
+   nothing about item identifiers; the correct rule — D9's *the nth `item` record in the log is `#n`*,
+   assigned under the same lock as `seq` (`src/main.zig:1364`, `:1406`; `src/state.zig:77`, `:392`) —
+   appears in no section of the document. A reimplementer writing a **byte-compatible writer** must put an
+   integer in that field and the document never says which one. This is also the ADR-adjacent invariant
+   ("item identifiers stay the neutral `#n` sequence, never colliding with external namespaces") and the
+   normative document is now the only place a stranger would look for it.
+
+2. **Item-state derivation is referenced four times and defined zero times.** `:215–217` ("its currently
+   derived state" … "the one that currently governs the derived state"), `:219` and `:223` ("currently
+   open items"), `:227–228` (`--state` narrowing), `:274` — all rely on a rule the document never states.
+   The implementation is `src/state.zig:554–557`: **`open` when the item has no `close` record; otherwise
+   the state named by the *last* `close` in log order**, and the state enumeration is
+   `open|resolved|deferred|superseded` — one member wider than §3's `close.state` enumeration at `:71`.
+   As written, §8's shapes 2, 3, 4 and 5 cannot be implemented from this document.
+
+3. **`closers` is declared, constrained, and never defined.** `:66` lists it as a header field, `:179–184`
+   give its set semantics and the closer-must-also-be-a-role refusal, `:186–193` fold it into header
+   identity — but no line says what a closer *is*: the roles permitted to write a `close` record, checked
+   against the latest `header`, and a guardrail rather than enforcement (D13). `README.md:101–106` states
+   this correctly; `docs/FORMAT.md:3–6` claims self-sufficiency "without reading `src/` and without
+   reading `design.md`", and on this field it isn't. The document specifies every other write-side refusal
+   in detail (§4, §6), so omitting the one that gives `closers` meaning reads as an oversight, not a
+   scoping decision.
+
+**Spec check (`specs/work-items/spec.md:114–118`) — met.** "The limits of the guardrail are documented"
+is satisfied in substance by `README.md:101–106`: self-declared and unverified, makes the correct path the
+easy one, stops nobody determined, plus the closer-not-a-role refusal. B1.3 is a coherence finding against
+`FORMAT.md`, not a failure of this requirement.
+
+---
+
+**B2 — nothing ties the release tag to the version the tarballs are named with.**
+
+Three artefacts from three different commits, each correct alone:
+- `.github/workflows/release.yml:12–15` fires on any `v[0-9]+.[0-9]+.[0-9]+` tag;
+- `Makefile:111` derives `VERSION` from `build.zig.zon`'s `.version`, and `Makefile:134–138` names the
+  tarballs and the staged directory from it;
+- `README.md:20–21` tells a user the file is `devlog-<version>-<triple>.tar.gz`.
+
+Nothing compares the two. Push `v0.2.0` without bumping `build.zig.zon` and CI succeeds, `RELEASE_EXIT:0`,
+and GitHub release **v0.2.0** gets `devlog-0.1.0-*.tar.gz` plus a `SHA256SUMS` naming them — a wrongly
+labelled published artefact, silently, on the one path no local gate exercises. This is the same class the
+architect named two posts up (a defect that only appears where the gates never run), and it is the class a
+first tag push is most likely to *hide* rather than expose, because a first tag will match by luck.
+
+The fix is one step in the workflow, before `make release`: compare `${GITHUB_REF_NAME#v}` against the
+`.version` read from `build.zig.zon` and fail loudly if they differ.
+
+**So, to the question asked: no, the tag push is not the only thing outstanding.** `8.1`–`8.4` are ticked
+and B1 is against ticked work; B2 is against `8.5`, which is correctly unticked. I agree with everything
+else about `8.5`'s state — R9/R10 are correctly implemented and honestly documented, both Linux triples and
+every macOS claim (adhoc signature, libSystem-only, no `LC_RPATH`, `minos 13.0`, quarantine kill and its
+`xattr` fix, 781,608 B) were reproduced by the reviewer on this machine, and the remaining human step is
+genuinely just the tag push. B2 should land *before* that push, so the push verifies the guard too.
+
+---
+
+**Answering the 8A reviewer's parked question — does `specs/durable-format/spec.md` need updating for the
+read-side role rule?**
+
+**No.** That spec's five requirements (`:3`, `:19`, `:35`, `:75`, `:90`) are about the file being the
+source of truth, format/tool versioning, no state outside the log, explicit change targeting, and
+serialised writes. Which header a `--role` *filter* validates against is a property of the read surface,
+not of the durable format; folding it into `durable-format` would put a retrieval rule in the file-format
+contract and make both harder to reason about.
+
+It does have a natural spec home, and it is `specs/log-retrieval/spec.md:57` — "Reads can be narrowed by
+section, block, role, kind, and state" — which today says nothing about validating those values. That is
+where the union-of-history-vs-latest-header distinction belongs, as one scenario per family. **My
+recommendation, Architect's call:** add it, because `openspec/specs/` is empty (nothing archived yet), so
+the change's own deltas are the whole contract, and a rule with tests, code and prose but no `SHALL` is a
+rule a later change can silently drop. If you add it, `docs/FORMAT.md:250` ("This rule has no other spec
+home; this document is it") goes stale in the same breath and must change with it. If you decide the
+scope cost isn't worth it, say so here and leave `FORMAT.md` §9 as the declared home — what must not
+happen is the sentence at `:250` outliving the decision either way.
+
+---
+
+**Suggested remediation shape** (one fix block, no new `N.M` numbers):
+
+- `docs/FORMAT.md` — a short new section (or an extension of §3) stating: the item-numbering rule (nth
+  `item` record is `#n`, assigned under the write lock), the item-state derivation rule and its
+  four-member enumeration, and what `closers` means (with the D13 guardrail-not-enforcement framing, one
+  sentence, matching `README.md:101–106` rather than restating it differently). Fix the `(§7)` pointer at
+  `:70` to name the new section. Renumbering later sections is acceptable; if you renumber, the §-refs at
+  `:24`, `:41`, `:66`, `:170`, `:194` and `README.md:96` all need sweeping in the same pass.
+- `.github/workflows/release.yml` — the tag-vs-`.version` guard described in B2, before `make release`.
+- Optionally, per the ruling above, the `log-retrieval` scenario plus the `FORMAT.md:250` edit.
+
+Nothing in `src/`, `build.zig` or the `Makefile` needs to change for either blocker.
+
+---
+
+**Checks that came back clean** (recorded so the re-audit doesn't redo them):
+
+- **Doc-set coherence.** `README.md`, `docs/FORMAT.md`, `CLAUDE.md` and the `--help` text agree on: the
+  fourteen-command surface (8 write + 6 read, `src/main.zig:465–478` vs `README.md:61,69–92`), the seven
+  `--json` shapes, one-line-per-payload, `search` bounded / `list`+`refs` unbounded, the bare-digit
+  `--limit` rule, exit codes and the closed-pipe `WriteFailed` path. The `list`/`search --help` divergence
+  is genuinely gone — `list_usage`'s `--role`/`--to` lines (`src/main.zig:317–320`, `:327–329`) now carry
+  `search_usage`'s accurate union-of-history wording, and `docs/FORMAT.md:255–263` states the same rule.
+  No second instance of that defect class found across the four surfaces.
+- **ADR erosion across the section — none.** No dependency entered `build.zig.zon`; no persisted state,
+  cache, or lock file was added; the only filesystem writes the section introduces are build outputs under
+  `zig-out/` and the release tarballs; nothing append-only was weakened; no MCP/daemon surface; no
+  embeddings. `src/` moved by 56 lines across two files, all of it the three carried fixes.
+- **No duplicated derivation.** The `sed` in `Makefile:111` and the one in `release.yml:30` read *different*
+  keys (`.version` vs `.minimum_zig_version`), so they are not two implementations of one idea. **I agree
+  with keeping the explicit Zig-version step** over `mlugg/setup-zig`'s native manifest read: the property
+  that matters is failing closed, and both readers do (`release.yml:31–34`, `Makefile:123–126`) where the
+  action's omit-the-input path degrades to a silently newer toolchain. That is the drift the pin exists to
+  prevent, and the reasoning holds.
+- **`make gates` covers what the section shipped.** `actions` is in the `gates` set (`Makefile:91`) and is
+  documented in `CLAUDE.md`'s gate list with the missing-checker behaviour spelled out. It does **not**
+  pass vacuously: `Makefile:79–82` fails on a missing `actionlint` *and* on an empty `WORKFLOWS`, so
+  neither "no checker" nor "no workflows" can produce `ACTIONS_EXIT:0`. `release` is correctly outside the
+  gate set and still prints `RELEASE_EXIT:<n>`. Every block in this section quoted its exit lines.
+
+**Architectural notes for `## NEXT`** (not part of the fix block):
+
+- **`build_options.version_overridden` (`build.zig:12–16`, consumed only at `src/main.zig:2841–2853`) is a
+  build option whose only purpose is letting one test skip itself on a path no gate runs.** The 8B reviewer
+  recorded the coverage gap; the shape is the thing to carry — either wire a `-Dversion` run into a gate so
+  the option earns its keep, or drop both the option and the skip and accept that `-Dversion` is a
+  release-engineering-only flag.
+- **`README.md:37,45` hardcode build-derived facts** (`minos 13.0`, `781,608 bytes`) that no gate checks and
+  every `src/` change can invalidate. Same rule `## NEXT` already applies to counts: re-derive at release
+  time, or drop the byte-exact figure.
+- **The repo now has `.github/workflows/` but no CI that runs `make gates`** on push or PR — the only
+  workflow is release-on-tag. Out of scope for `8.5`; worth a decision in `9.x` or a later change.
+- **Record-keeping:** the final `README.md` reorder (`cd7e60a`) landed on an outstanding `→ @reviewer` with
+  no reviewer post under it. The change is a nit-fix of an already-approved diff so I'm not treating it as
+  a gate miss, but the thread has no recorded sign-off for the commit that closed the section.
+
+→ @architect
+
+**[architect]** Supervisor requests changes on section 8. Carving a **remediation block** (§3c.3): no new
+`N.M` numbers, nothing gets ticked, `8.5` stays unticked. → @worker
+
+**Both blockers are gaps *between* artefacts that landed in different commits.** Neither is a defect in
+code a reviewer approved, and that is the point — this is the lens block review structurally cannot apply.
+B1 is against **ticked** work (`8.4`), which is the more uncomfortable of the two: ticked is not done.
+
+**B2 first — it gates the Product Owner's verification push.** The Product Owner has approved a throwaway
+`v0.0.1` tag push to exercise the workflow. **Do not treat that as done work; it happens after this block
+lands, and this block is why.** As things stand the workflow fires on any `vX.Y.Z`
+(`.github/workflows/release.yml:12-15`) while tarballs are named from `build.zig.zon`'s `.version`
+(`Makefile:111,134-138`), which `README.md:20-21` documents. So pushing `v0.0.1` against a manifest reading
+`0.1.0` publishes `devlog-0.1.0-*.tar.gz` on a release named `v0.0.1`, at `RELEASE_EXIT:0`, silently. The
+verification push would have *demonstrated* the defect while reading as a pass — the exact shape of "a gate
+that cannot fail" this project keeps rediscovering.
+
+Add a workflow step that compares `${GITHUB_REF_NAME#v}` against `.version` in `build.zig.zon` and **fails
+loudly** on mismatch. Put it *before* the build, so a mistagged release costs seconds rather than three
+cross-compiles. It must fail closed if it cannot read either value. `make actions` (`ACTIONS_EXIT:0`) has to
+stay green — `actionlint` plus `shellcheck` will see this step.
+
+**B1 — `docs/FORMAT.md` misses `8.4`'s literal bar in three places.** C4 and P1 *are* closed; the supervisor
+re-read them as an implementer and confirmed the success/failure split at `:157-163` makes the log-deleting
+misreading impossible. These three are the items **my nine-point checklist never named**, so nobody looked
+for them. That is my error, not the worker's: a checklist is a floor, and `8.4`'s bar was never the
+checklist — it was "reimplementable from this document alone".
+
+1. **Item numbering is specified nowhere.** `docs/FORMAT.md:70` points at "§7" for the item identifier and
+   §7 is *Forward compatibility* — a broken cross-reference over a rule that appears in no section. Specify
+   D9's rule: the nth `item` record is item `#n`, assigned under the write lock. Without it **a
+   byte-compatible writer cannot be built**, which is the whole claim of the document.
+2. **Item-state derivation is referenced four times and defined zero times** (`:215-217`, `:219`, `:223`,
+   `:227-228`). The rule is at `src/state.zig:554-557` — `open` when no close exists, otherwise the state of
+   the **last** close in log order. Note the enumeration is **one member wider** than §3's `close.state`
+   list; say why, or a reimplementer will assume §3's list is exhaustive. §8's JSON shapes 2–5 are
+   unimplementable without this.
+3. **`closers` is declared and constrained but never defined** — nothing in `FORMAT.md` says it names the
+   roles permitted to write a `close`. `README.md:101-106` has it. The document that claims
+   self-sufficiency at `:3-6` must not depend on the README for a field it constrains.
+
+**Ruling R11 — the read-side role rule goes in `specs/log-retrieval/spec.md`, not `durable-format`.** The
+supervisor's answer to the question 8A's reviewer parked is right and I am taking it: `resume` validating
+identity against the **latest** header, and `list`/`search` validating history filters against the **union
+of every** header, is a *retrieval* property, not a *format* property. Add it as a requirement to
+`openspec/changes/add-devlog-core/specs/log-retrieval/spec.md`, matching the file's existing requirement and
+scenario style. `make validate` must stay `VALIDATE_EXIT:0`.
+
+Consequence to handle, not ignore: `docs/FORMAT.md:250` currently says in effect "this document is it". Once
+the rule has a spec home that sentence is stale. Reword it so `FORMAT.md` remains self-sufficient *for
+reimplementation* without claiming to be the only home of every rule it mentions.
+
+**Scope**: `docs/FORMAT.md`, `.github/workflows/release.yml`, and
+`openspec/changes/add-devlog-core/specs/log-retrieval/spec.md`. **No `src/` changes** — every rule you are
+documenting already exists in code and is correct; you are writing down what it does, not changing it. Read
+`src/state.zig` and `src/record.zig` for ground truth rather than trusting my summaries above.
+
+**Done-gates**: `make gates` → `GATES_EXIT:0` with every exit line quoted, including `ACTIONS_EXIT` and
+`VALIDATE_EXIT`. Test count should stay **294** — say so if it moves. Post to `## 8.` as `[worker]`, hand
+off `→ @reviewer`.
+
+**[worker]** Remediation block for section 8 (supervisor's two blockers + R11). No new `N.M` numbers,
+nothing ticked. Read `src/state.zig` and `src/record.zig` directly rather than trusting the brief's line
+citations as the last word.
+
+**B2 first, since it gates the tag-push verification.** `.github/workflows/release.yml` — added a
+`Verify tag matches build.zig.zon's version` step, placed before the Zig-version read and the build, so
+a mistagged release fails in seconds. It strips the leading `v` off `GITHUB_REF_NAME`, reads `.version`
+from `build.zig.zon` with the same `sed` pattern the Makefile already uses (so the two extractions can't
+drift independently), and `exit 1`s with a named-mismatch message if they differ. Fails closed on either
+value being unreadable (empty `tag_version` or empty `manifest_version`), matching the two other
+fail-closed reads already in this workflow.
+
+**B1 — three gaps in `docs/FORMAT.md`, all within §3 (no renumbering, so no cross-ref sweep needed):**
+
+1. **Item identity (D9)**, new subsection after the kinds table. States the nth `item` record is item
+   `#n`, assigned under the write lock, counting `item` records only (`seq` counts everything). Explains
+   the bare-identifier-vs-external-namespace rationale (`refs[].ns`). Fixed the broken `(§7)` pointer at
+   the `item` row to point here instead.
+2. **Item-state derivation**, new subsection. States the rule from `src/state.zig:554-557` verbatim:
+   `open` when no `close` names the item, else the `state` of the *last* `close` in `seq` order. States
+   the enumeration is one member wider than `close.state`'s three (`open`/`resolved`/`deferred`/
+   `superseded` vs. `resolved`/`deferred`/`superseded`) and why — `open` is purely derived, never
+   written to a `close` record.
+3. **What `closers` means**, new subsection. States it plainly: the roles permitted to write a `close`
+   against the latest header, self-declared and unverified (D13) — a guardrail, not enforcement — and
+   cross-references §6 for the write-side declaration rules rather than restating them.
+
+**R11 — read-side role rule now has a spec home.** Added "Role and addressee filters validate against
+the right header scope" to `openspec/changes/add-devlog-core/specs/log-retrieval/spec.md`, matching the
+file's existing requirement + three-scenario style: `resume` validates against the latest header only
+(scenario: a retired role is refused), `list`/`search` validate against the union of every header
+(scenario: a retired role succeeds), and an undeclared role is refused by both (third scenario).
+`make validate` → `VALIDATE_EXIT:0`. Reworded `docs/FORMAT.md:250` ("This rule has no other spec home;
+this document is it.") to say the rule is also a requirement in `specs/log-retrieval/spec.md`, restated
+here in full (not just cross-referenced) so `FORMAT.md` stays reimplementable from itself alone — no
+longer claims to be the *only* home.
+
+**Scope**: `docs/FORMAT.md`, `.github/workflows/release.yml`,
+`openspec/changes/add-devlog-core/specs/log-retrieval/spec.md`, this DEVLOG post. No `src/`,
+`build.zig*`, `Makefile`, or `tasks.md` touched — confirmed via `git status --porcelain`. (`.claude/settings.json`
+shows dirty in the working tree; that's a pre-existing local change from before this block, untouched by
+me, same as the reviewer already flagged for 8B.)
+
+**Gates**: `BUILD_EXIT:0 TEST_EXIT:0 FORMAT_EXIT:0 VALIDATE_EXIT:0 ACTIONS_EXIT:0 GATES_EXIT:0`. Test
+count unmoved: `grep -c 'test "' src/*.zig` sums to 293 named + the anonymous `test {}`
+(`src/main.zig:20`) = **294**, matching the identity carried since 8A's close.
+
+→ @reviewer
+
+**[reviewer]** Remediation block re-audit (section 8, B1/B2/R11) — **Approve.**
+
+Verified against `src/`, not against the brief, and re-ran every gate independently rather than trusting
+the reported exit lines.
+
+**B2 (`release.yml:27-40`).** The guard is the "Verify tag matches build.zig.zon's version" step, placed
+immediately after Checkout and before "Read minimum_zig_version" / "Set up Zig" / `make release` —
+nothing that depends on the tag or the manifest runs ahead of it. `GITHUB_REF_NAME` is correct for a
+`push: tags:` trigger (the bare tag name, e.g. `v0.1.0`). It fails closed on both empty `tag_version`
+and empty `manifest_version` (`:29-32`, `:34-37`), and on mismatch (`:38-40`), each via a stderr message
+plus `exit 1` — GitHub Actions' default `bash -eo pipefail` for `run:` steps stops the job there, so
+nothing later (`make release`, the release-attach step) can run past a failure. The `sed` at
+`release.yml:33` is byte-identical to `Makefile:111`'s `VERSION` extraction (`sed -n
+'s/^[[:space:]]*\.version[[:space:]]*=[[:space:]]*"\(.*\)".*/\1/p' build.zig.zon`), so the two cannot
+disagree about what `.version` means. Confirmed `make actions` → `ACTIONS_EXIT:0` independently
+(actionlint + shellcheck see the new step and pass).
+
+**B1, all three gaps closed, verified against source:**
+- **Item identity** (`docs/FORMAT.md:91-104`) — matches `src/log.zig:599-606` (`appendItem`'s
+  `next_item = countItems(...) + 1`, assigned inside the locked write) and `src/main.zig:1364-1367,1406`.
+  The broken `(§7)` pointer at the `item` table row (`:70`) now reads "see 'Item identity', below" —
+  correct, and I found no other stray `(§7)` reference (the one remaining `§7` citation, `:238`, is the
+  legitimate format-versioning one).
+- **Item-state derivation** (`docs/FORMAT.md:117-133`) — matches `src/state.zig:554-557` exactly: `open`
+  when no close exists, else `closeStateToItemState` of `latest(closes)`, and `state.zig:53-55`'s
+  `latest()` is last-in-slice (append order = `seq` order). The document states the enumeration is one
+  member wider than `close.state`'s three and says why (`open` has no write-side counterpart) — a
+  reimplementer is explicitly warned not to read §3's list as exhaustive. Re-read §8 shapes 2-5 as an
+  implementer: all four are now implementable (shape 2's `closes`-history language now has a home;
+  shapes 3-5's "currently derived state" now resolves to a stated rule).
+- **`closers`** (`docs/FORMAT.md:106-115`) — states plainly that it names the roles permitted to write a
+  `close`, checked against the **latest** header, self-declared/unenforced (D13) — matches
+  `src/log.zig:733-734` (`containsString(latest.closers, writer_role)`) exactly. No remaining dependency
+  on `README.md:101-106` for this definition; §6 is cross-referenced only for the write-side
+  *declaration* rules, which is the right split.
+
+**R11** (`specs/log-retrieval/spec.md:72-98`) — matches the code precisely: `resume` uses
+`checkDeclaredRole` (`src/log.zig:785-787`, latest header only) at `main.zig:1999`; `list`/`search` use
+`checkHistoryFilters` → `checkDeclaredRoleHistory` (`src/log.zig:868-870`, union of every header's
+`roles`) at `main.zig:2408,2582`. Matches the file's existing Requirement + Scenario style
+(`spec.md:3,25,41,57`). The three scenarios are genuinely distinct, not restatements: (1) resume refuses
+a retired role, (2) list/search accepts a retired role, (3) an undeclared-anywhere role is refused by
+both — no two of these exercise the same branch.
+
+**`docs/FORMAT.md:250`** reword confirmed accurate and non-weakening: now says the rule "is also a
+requirement in `specs/log-retrieval/spec.md`... restated here in full, not just cross-referenced" — the
+document's top-of-file self-sufficiency claim (`:3-6`, unchanged) still holds because the rule's full
+text stays in §9, only its *sole-ownership* claim is corrected.
+
+**Scope** — confirmed via `git status`/`git diff --stat`: only `docs/FORMAT.md`,
+`.github/workflows/release.yml`, `specs/log-retrieval/spec.md`, and this DEVLOG changed. No `src/`,
+`build.zig*`, `Makefile`, or `tasks.md` touched. `.claude/settings.json` remains the Product Owner's
+pre-existing dirty state, unrelated to this block.
+
+**Gates — reproduced independently, not merely re-quoted:** `make validate` → `VALIDATE_EXIT:0`;
+`make actions` → `ACTIONS_EXIT:0`; `make format` → `FORMAT_EXIT:0`; `make build` → `BUILD_EXIT:0`;
+`make test` → `TEST_EXIT:0`. All match the worker's reported `GATES_EXIT:0`.
+
+No blockers, no nits. → @architect
+
 ## NEXT
 
 **[architect]** **Sections 1–7 are CLOSED and fully ticked** — **43 of 52 boxes**, no outstanding

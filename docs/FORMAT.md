@@ -67,7 +67,7 @@ but `header`) §2's six attributed fields:
 | `section` | `title` string, `base` string | `title`: one line naming what the section delivers. `base`: a commit sha, stored verbatim and never validated — `devlog` never runs `git`. |
 | `brief` | — | the architect's block brief; carries no fields beyond the attributed set |
 | `post` | — | general working-channel traffic; carries no fields beyond the attributed set |
-| `item` | `item` int, `type` string, `blocking` bool | `item` is the raised item's identifier (§7). `type` ∈ `question`, `finding`, `decision`, `note`, `task`. `blocking` is independent of `type`. |
+| `item` | `item` int, `type` string, `blocking` bool | `item` is the raised item's identifier (see "Item identity", below). `type` ∈ `question`, `finding`, `decision`, `note`, `task`. `blocking` is independent of `type`. |
 | `close` | `item` int, `state` string | `item` identifies the item being closed. `state` ∈ `resolved`, `deferred`, `superseded`. `body` is the mandatory reason for the closure — not optional prose the way it is for other kinds. |
 | `verdict` | `outcome` string, `commit` string | `outcome` ∈ `approve`, `approve-with-nits`, `request-changes`. `commit`: stored verbatim, never validated. |
 | `next` | — | the current NEXT narrative; the most recently appended `next` record is the current one, earlier ones remain as history |
@@ -87,6 +87,50 @@ splitting them across `to`.
 Optional common fields (`section`, `block`, `to`, `refs`) that are unset or empty are **omitted from the
 line entirely** — never written as an explicit `null` or an empty array. A reader must treat an absent
 key and an explicit `null` (where a foreign writer emits one) identically: both mean "not set".
+
+### Item identity (D9)
+
+The integer in an `item` record's own `item` field is that item's identifier: the *n*th `item` record
+to appear in the log, in `seq` order, is item `#n`. It is assigned under the same write lock that
+assigns `seq`, at write time — never renumbered, never reused, and independent of gaps or retries
+elsewhere in the log. The sequence counts `item` records only: `header`, `section`, `brief`, `post`,
+`close`, `verdict`, and `next` records do not consume a slot, so an item's number and its `seq` are
+unrelated numbers that both happen to increase over the same log. A `close` record's own `item` field
+names this same identifier — the item it closes.
+
+The identifier is deliberately bare — never a `D`/`N`/`S`/`F`-style prefix. `#n` is `devlog`'s own
+identifier namespace, not one of the external reference namespaces a `refs[].ns` entry names (design
+elements, notes, specs, findings, …); giving item numbers a prefix of their own would make them
+indistinguishable from — and liable to collide with — those external namespaces.
+
+### What `closers` means
+
+A `header` record's `closers` array names the **roles permitted to write a `close` record**: a `close`
+whose writer (`role`) is not a member of the **latest** header's `closers` set is refused. This is a
+**self-declared guardrail, not enforcement** (D13) — the writer's `role` is supplied by the caller and
+never independently verified against anything outside the log, so `closers` makes the correct path the
+easy one without stopping a determined caller from naming any role it likes on the command line. §6,
+below, covers the write-side rules that constrain how `closers` may be *declared* (it must also be
+declared as a `role` in the same write, it has set semantics, and it participates in header-identity
+comparison); this paragraph is what the field *means* once declared.
+
+### Item-state derivation
+
+An item's **state** — the derived value behind `show --item`'s `"state"` key, `resume`'s and
+`status`'s item arrays, and `list`'s `--state`/`--blocking` narrowing (§8, shapes 2 and 5) — is never
+stored directly. It is computed as:
+
+- **`open`** — no `close` record names this item.
+- otherwise, the `state` of the **last** `close` record that names this item, in `seq` order. An item
+  can be closed more than once (§8 shape 2's `closes` array is the full history); only the most recent
+  closure governs the item's current derived state.
+
+The item-state enumeration — `open`, `resolved`, `deferred`, `superseded` — is **one member wider**
+than `close.state`'s enumeration in the table above (`resolved`, `deferred`, `superseded`, no `open`):
+`open` is never written to a `close` record, because it means "no closure exists" and a `close` record
+by definition represents one. It is a purely derived value with no write-side counterpart. A
+reimplementer who reads the `close.state` list above as the complete set of item states will be unable
+to represent an item that has never been closed.
 
 ## 4. Field-level UTF-8 validation (all string fields, not just `body`)
 
@@ -247,7 +291,10 @@ assume one JSON value per line of `devlog ... --json` output, with no shape-spec
 
 ## 9. Read-side role validation: latest header vs. header history
 
-This rule has no other spec home; this document is it.
+This rule is also a requirement in `specs/log-retrieval/spec.md` (the OpenSpec change's spec for the
+read surface) — it is a *retrieval* property, not a property of the on-disk format itself. It is
+restated here in full, not just cross-referenced, because this document must stay reimplementable from
+itself alone.
 
 `--role` and `--to` filters on the read surface are validated against the log's declared role set, but
 **which** declaration differs by command family:
