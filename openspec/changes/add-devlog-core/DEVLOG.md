@@ -11363,6 +11363,100 @@ No test added or widened; comment-only change.
 
 → @reviewer
 
+**[worker]** Follow-up to `8.5`, docs only — `README.md`'s install section. No code, `Makefile`, or
+`build.zig` touched. Documenting the architect's own macOS verification, not re-deriving it:
+
+- **Quarantine kill, with the fix.** macOS binary is ad-hoc/linker-signed but not notarized: a
+  browser-downloaded (quarantined) copy gets silently `SIGKILL`ed by Gatekeeper (exit 137, no message);
+  a `curl`-downloaded copy carries no quarantine attribute and runs. Documented the working install path
+  (`curl … | tar xz`) as the default, and the one-line escape hatch (`xattr -d com.apple.quarantine
+  devlog`) for anyone who already has a quarantined binary.
+- **Minimum macOS version.** `LC_BUILD_VERSION` → `minos 13.0`; stated plainly that macOS 13 (Ventura)
+  or later is required and that nothing today detects or explains a failure on an older one.
+- **Linux verification folded in.** Both triples confirmed running in containers (`x86_64` and native
+  `arm64`), `ldd` → "not a dynamic executable" on both. macOS `otool -L` — libSystem only, no
+  `LC_RPATH` — and binary size (781,608 bytes) added alongside the existing R10 linkage paragraph rather
+  than as a separate section, per "install section prose, not a platform-support matrix."
+
+**Gates**: `BUILD_EXIT:0 TEST_EXIT:0 FORMAT_EXIT:0 VALIDATE_EXIT:0 ACTIONS_EXIT:0 GATES_EXIT:0` — first
+run against the new `actionlint` gate; all green, nothing in this doc-only diff touches
+`.github/workflows/`. Test count unmoved at **294** (no `src/` changes).
+
+→ @reviewer
+
+**[reviewer]** Audited the `README.md` docs follow-up to `8.5` (uncommitted, diff against `eec166b`).
+**Verdict: Approve with nits.**
+
+All seven checkable claims verified directly on this machine, not taken on the worker's word:
+
+1. `codesign -dv zig-out/release/aarch64-macos/devlog` → `flags=0x20002(adhoc,linker-signed)`,
+   `Signature=adhoc`, `Sealed Resources=none` — matches "ad-hoc / linker-signed", "not notarized".
+2. Reproduced the kill in an isolated copy (never touched `zig-out`): copied the binary to a scratch
+   dir, `xattr -w com.apple.quarantine "0081;…;curl;…"`, ran it — **exit 137, empty stdout/stderr**, no
+   message. `xattr -d com.apple.quarantine` on the same file then ran it clean, exit 0. Matches
+   README.md's "silently killed … no error message … exit 137 (SIGKILL)" and the one-line fix exactly.
+3. `curl -sSL` of a real file into the scratch dir → `xattr -l` shows only `com.apple.provenance`, no
+   `com.apple.quarantine`. Matches "verified: only `com.apple.provenance` is present".
+4. `otool -l zig-out/release/aarch64-macos/devlog | grep -A5 LC_BUILD_VERSION` → `minos 13.0`. Matches.
+5. `otool -L` → exactly `/usr/lib/libSystem.B.dylib`; `grep -c LC_RPATH` on the load commands → `0`.
+   Matches "libSystem only, no `LC_RPATH`".
+6. `stat -f%z zig-out/release/aarch64-macos/devlog` → `781608`. Matches exactly.
+7. Linux static wording — README says "verified in containers on both architectures" for `ldd`; that
+   matches the worker's DEVLOG summary ("both triples confirmed running in containers … `ldd` → 'not a
+   dynamic executable' on both"), not an overstatement of what was established.
+
+No blockers. `git diff --stat` for this diff touches only `README.md` and the worker's post to
+`DEVLOG.md` (`openspec/changes/add-devlog-core/DEVLOG.md:11365-11385`) — within scope, nothing in
+`src/`, `build.zig`, `Makefile`, `.github/`, `tasks.md`, or `openspec/` beyond the DEVLOG post.
+
+**Nits (prose findability/ordering, per the review brief):**
+
+- `README.md:19-24` — the `curl`-not-a-browser instruction is appended to the *end* of the same
+  paragraph as "Download the release tarball … from this repo's GitHub releases", which is itself
+  phrased as a browser action (go to the releases page, get the file). A skimming reader acts on the
+  first sentence before reaching the caveat two sentences later. Lead with the `curl` instruction (or at
+  minimum put it in the same sentence as "download"), not append it after the fact.
+- `README.md:19-33` — the pointer "see the macOS note below for why that matters" (line ~24) sends the
+  reader through an entire paragraph of Linux/`otool` verification detail (line 26-31) before they reach
+  the actual quarantine-kill explanation (line 33). That intervening paragraph is unrelated to the
+  install-safety decision the reader is mid-way through making. Moving the bolded macOS quarantine
+  paragraph to immediately follow the install paragraph (ahead of the Linux-static/`otool` detail) would
+  put the two related pieces of guidance — "use curl" and "here's what happens if you don't" — adjacent,
+  instead of separated by a paragraph most readers don't need yet.
+- Findability itself is fine as written: the bolded heading contains "killed", the body contains "137"
+  and "quarantine" verbatim, so a reader who has already hit the failure and searches the README for any
+  of those terms will land on the right paragraph. The nit above is about the *first-read* path, not
+  the *search-after-failure* path.
+
+**Architectural note (not this block's scope, flagging for the architect):** `.claude/settings.json`
+is also dirty in the working tree alongside this diff. The block brief described this diff as
+`README.md` (plus DEVLOG posts) only, and the auditor boundary blocks me from even reading that file's
+diff to check it — by design, `.claude/` is off-limits to auditors. Since it wasn't declared as part of
+this follow-up, please confirm before commit whether it's an unrelated pre-existing local change that
+should stay out of this commit, or something that needs its own path through the workflow.
+
+→ @architect
+
+**[worker]** Reviewer's two ordering nits fixed, `README.md` install section only — reorder, no facts
+restated or expanded, no platform-support matrix:
+
+1. **Curl-before-download.** The paragraph now opens by saying to fetch with `curl`, not a browser, and
+   only then gives the file names / `SHA256SUMS` / `PATH` steps — a reader hits the guidance before they'd
+   reach for a browser, not after.
+2. **Dropped the "see below" indirection.** The quarantine/Gatekeeper paragraph now sits immediately
+   after the curl-first paragraph, ahead of the Linux/`otool` static-linking prose, so a reader following
+   the pointer no longer passes through unrelated linkage detail first. The macOS-13-minimum paragraph
+   stays adjacent to it; Linux verification + `otool -L`/binary-size moved after both, as the closing
+   "what we verified" paragraph.
+
+"Killed" / "137" / "quarantine" left in place, per the reviewer's note that findability there was already
+fine.
+
+**Gates**: `BUILD_EXIT:0 TEST_EXIT:0 FORMAT_EXIT:0 VALIDATE_EXIT:0 ACTIONS_EXIT:0 GATES_EXIT:0`. No `src/`
+changes; test count unmoved at 294.
+
+→ @reviewer
+
 ## NEXT
 
 **[architect]** **Sections 1–7 are CLOSED and fully ticked** — **43 of 52 boxes**, no outstanding

@@ -15,17 +15,34 @@ then discards it on exit. `devlog` is a single self-contained binary with **no t
 
 ## Install
 
-Download the release tarball for your platform from this repo's GitHub releases —
-`devlog-<version>-aarch64-macos.tar.gz`, `devlog-<version>-x86_64-linux-musl.tar.gz`, or
-`devlog-<version>-aarch64-linux-musl.tar.gz` — verify it against the release's `SHA256SUMS`, extract
-it, and put the `devlog` binary on your `PATH`. There is nothing else to install — no runtime, no
-library, no config file.
+Fetch the release tarball for your platform from this repo's GitHub releases with `curl`
+(`curl -sSL <url> | tar xz`, or `curl -O` then extract), **not a browser download** — see immediately
+below for why that matters on macOS. Files: `devlog-<version>-aarch64-macos.tar.gz`,
+`devlog-<version>-x86_64-linux-musl.tar.gz`, `devlog-<version>-aarch64-linux-musl.tar.gz`. Verify against
+the release's `SHA256SUMS`, extract, and put the `devlog` binary on your `PATH`. There is nothing else
+to install — no runtime, no library, no config file.
 
-The two Linux builds are genuinely static (musl, statically linked): `ldd` reports "not a dynamic
-executable". The macOS build is not, and cannot be — Apple does not support statically linking
-libSystem — so `otool -L` on it will always show exactly one entry, `/usr/lib/libSystem.B.dylib`. That
-is the honest floor on macOS, not a third-party dependency: no other linkage of any kind is present on
-either platform.
+**macOS: a browser download gets silently killed; `curl` avoids it.** The macOS binary is ad-hoc /
+linker-signed (`codesign -dv` shows `Signature=adhoc`) — that's what lets it run at all on Apple Silicon
+— but it is **not notarized**. A browser download tags the file with the `com.apple.quarantine`
+extended attribute, and Gatekeeper kills a quarantined, non-notarized binary on first run with **no
+error message** — just exit 137 (SIGKILL). A `curl` download does not set that attribute (verified:
+only `com.apple.provenance` is present), so the binary runs immediately. If you already have a
+quarantined binary, the fix is one line:
+
+```
+xattr -d com.apple.quarantine devlog
+```
+
+**macOS 13 (Ventura) or later is required** (`LC_BUILD_VERSION` reports `minos 13.0`); nothing in the
+binary detects or explains this today, so an older macOS will fail without saying why.
+
+The two Linux builds are genuinely static (musl, statically linked) — verified in containers on both
+architectures: `ldd` reports "not a dynamic executable" and the binary runs. The macOS build is not
+static, and cannot be — Apple does not support statically linking libSystem — so `otool -L` on it shows
+exactly one entry, `/usr/lib/libSystem.B.dylib`, and no `LC_RPATH`. That is the honest floor on macOS,
+not a third-party dependency: no other linkage of any kind is present on either platform. Binary size is
+781,608 bytes.
 
 ## Build from source
 
