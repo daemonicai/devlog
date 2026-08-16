@@ -10774,6 +10774,279 @@ made the tail long — and `total` would have silently under-reported the very q
 both renderings. Correct and commented since 7A; never measured until now. **A defect that would have
 hidden inside the fix for a defect.**
 
+## 8. Documentation and release
+
+**[architect]** Base: `f21864d` — documentation and release: the `README.md` a stranger lands on (`8.1`),
+the two conventions that are not discoverable from `--help` (`8.2`, `8.3`), a normative record-format
+document precise enough to reimplement from (`8.4`), and the static release tarballs (`8.5`).
+
+**[architect]** Brief — block **8A** (`8.1`–`8.4`), documentation. → @worker
+
+**Scope.** Prose only. **No changes to `src/`, `build.zig`, `build.zig.zon`, `Makefile`, `tasks.md`, or
+anything under `openspec/`.** If you believe a documented behaviour is wrong, do **not** fix the code —
+raise it and stop. The command surface is frozen (D16 close; fourteen entries in `commands`), so nothing
+in this block should require a code change.
+
+**Ruling R8 — two documents, not one.** `8.1` and `8.4` have different audiences and different bars, and
+merging them makes the README unreadable and the spec unfindable:
+
+- **`README.md`** (repo root, new) — the reader-facing front page: what devlog is, why it exists, install,
+  the command surface, the two conventions from `8.2`/`8.3`, a short record-format *overview*, and the D12
+  posture. It **links** to the format document for the normative detail.
+- **`docs/FORMAT.md`** (new) — `8.4`'s deliverable. Normative, self-contained, written to the bar in the
+  task: **a competent implementer must be able to reimplement a byte-compatible writer and reader from
+  this document alone**, without reading `src/` and without reading `design.md`. It sits beside
+  `docs/adrs/` and `docs/example/`.
+
+**Derive the command surface from the binary, not from memory or from `design.md`.** Read
+`src/commands.zig` (the `commands` table) and every command's `--help` text, and build against `zig-out`
+if that is quicker. Seven write commands and six read commands, fourteen table entries. Where a README
+line and a `--help` line say the same thing, they must say it the *same way* — the `list`/`search` help
+divergence noted below is exactly the defect class.
+
+**`8.1` — `README.md`.** What it is (the shared working channel for the OpenSpec four-role workflow, an
+append-only `DEVLOG.jsonl` as the only state, everything else derived in memory per invocation); the
+single-binary, zero-dependency, no-database posture (ADR-0001, ADR-0002, ADR-0003 in `docs/adrs/` — link
+them, do not restate them); install from a release tarball and build from source; the command surface,
+grouped write and read, each with its one-line purpose and its `--json` behaviour; and the D12 posture
+verbatim in substance: *MPL 2.0, I use this, here's the source, PRs welcome, fork it if you want* — no
+support commitment implied or offered. Do not oversell it and do not write a feature-matrix table.
+
+**`8.2` — the close guardrail, stated plainly.** `work-items` spec:96 requires the documentation to state
+that the restriction relies on agents honouring it. The `header` declares `closers`; a close from a role
+outside that set is refused; **and the calling role is self-declared and unverified**, so any caller can
+name a closing role and the tool will believe it. Say that in those terms: it makes the correct path the
+easy one, it is not a security boundary, and nothing stops a determined caller. Also cover the adjacent
+rule: every declared closer must be a declared role, and a declaration naming a non-role closer is refused
+as a typo rather than honoured as a grant.
+
+**`8.3` — bodies on stdin (D5).** The body always arrives on stdin. Document the sanctioned pattern —
+write the body to a file in your own scratch directory, then redirect it in
+(`devlog post --role architect < "$SCRATCH/body.md"`) — and say why heredocs are discouraged: bodies are
+Markdown containing fenced code blocks, and composing that inline in a shell heredoc is a quoting accident
+in the one tool that exists to prevent format accidents. Cover the two guards: **stdin being a terminal is
+an immediate failure**, and so is a **whitespace-only** body (not merely zero bytes — an accidentally
+empty heredoc arrives as a lone newline). Say that refusing whitespace-only is not trimming: an accepted
+body is stored verbatim, untrimmed. And state the file boundary from D5/D11 — the tool writes and removes
+no file other than `DEVLOG.jsonl` and the one temporary file it creates itself; it will not delete a file
+you gave it, which is why there is no `--body-file`.
+
+**`8.4` — `docs/FORMAT.md`, the normative record format.** Ground truth is `src/`, cross-checked against
+`design.md:376–425`. It must carry, at minimum:
+
+1. **The container** — one JSON object per line, UTF-8, newline-terminated, append-only, `seq` assigned
+   under lock and strictly increasing and contiguous, `ts` ISO 8601 UTC. The `header` is the first line.
+2. **The three universal fields**, the six attributed-common fields, and the explicit statement that
+   `header` carries **none** of the attributed fields — including no `role` of its own.
+3. **All eight kinds** with their per-kind fields and their closed enumerations (`item.type`,
+   `close.state`, `verdict.outcome`).
+4. **Field-level validation breadth — carried finding C4.** The spec scopes the UTF-8 `SHALL` to `body`,
+   but the implementation validates **every** string field. Document the code's breadth, or a reimplementer
+   reintroduces the hazard through `--to`. Check what `src/` actually validates before you write the
+   sentence; do not take C4's wording as the last word on which fields.
+5. **The temp-file/rename protocol — carried finding P1.** `design.md:110` and
+   `specs/durable-format/spec.md:43` say the temp file is "removed before the command exits". On the
+   **success** path it is **renamed**, not removed. Write this so that a reimplementer who reads "removed"
+   as `unlink`-after-successful-rename **cannot** arrive there — that reading deletes the log. State the
+   success path and the failure path separately.
+6. **Header identity (D13, D15).** The latest header wins. `roles` is a **set**: reordering is not a
+   change and appends nothing; a repeated name is refused, not stored. Re-declaring appends a new header.
+   And **`change` is excluded from header identity** (`headerUnchanged`, D13) — one sentence, but a
+   reimplementer that includes it will append a header where this tool appends nothing.
+7. **Forward compatibility** — readers ignore unknown *fields*; a `format` higher than the binary
+   understands is refused with a clear message, not guessed at.
+8. **The `--json` output contract**, which is what `9.4` hands to a plugin: **seven** top-level shapes, and
+   **every `--json` payload is exactly one line** — the newline is the caller's. `show --seq` → a bare
+   record; `show --item` → `{number,state,item,closes}`; `resume` → `{next,items,brief}`; `status` →
+   `{next,items}`; `list` → an array of records **or** of item objects depending on flags; `refs` → an
+   array of records; `search` → `{"total":N,"limit":L,"records":[…]}` with `"limit": null` when unbounded
+   (D16).
+9. **The read-side role-validation rule, which currently has no spec home** and lives only in DEVLOG
+   rulings and in `checkHistoryFilters`: `resume` validates identity against the **latest** header;
+   `list`/`search` validate history filters against the **union of every** header. `docs/FORMAT.md` is now
+   its home. Read the implementation, not just this paragraph.
+
+**Also fold into the docs, from the carried list:**
+
+- **`--state`/`--blocking` return items from `list` but records from `search`** — the one non-uniform spot
+  on the read surface. Deliberate (R2). Say it out loud rather than letting a consumer discover it.
+- **`search` is the bounded read; `list --json` deliberately is not** (D16). A consumer assuming uniform
+  bounding will silently truncate a `list` or paginate an already-bounded `search`.
+- **`--limit` takes bare digits** — a zero-padded `05` is refused, loudly. A `%02d`-style formatter hits
+  this.
+- **The exit-code table should note the closed-pipe path**: piping `--json` into `head -c` prints
+  `devlog: WriteFailed` at exit 1.
+- **`list --help` and `search --help` describe the one shared role check differently**, and `search`'s
+  wording is the accurate one. You are documenting, not fixing: write the accurate rule in the docs and
+  **raise the `list --help` divergence as an item for me** — the `--help` text is code and out of scope
+  for this block.
+
+**Done-gates.** `make gates` → `GATES_EXIT:0`, and quote every exit line. A docs-only block should not move
+`make test`: report the test count and confirm it is **294** (293 named + the one anonymous `test {}` at
+`src/main.zig:20`). If it moved, something in scope moved that shouldn't have. Post progress and any
+questions to this section as `[worker]`; hand off with `→ @reviewer` when done.
+
+**[worker]** Implemented `8.1`–`8.4`. `README.md` (repo root) and `docs/FORMAT.md` (new) added; nothing
+under `src/`, `build.zig*`, `Makefile`, `tasks.md`, or `openspec/` touched. Derived every claim from
+`src/record.zig`, `src/log.zig`, `src/body.zig`, and every command's `--help` usage string in
+`src/main.zig` — not from `design.md` or memory.
+
+**Command-surface count corrects the brief.** The brief says "seven write commands and six read
+commands, fourteen table entries" — that arithmetic doesn't hold (7+6=13). Reading `commands` in
+`src/main.zig:462–477` directly: it's **eight write commands** (`header`, `section`, `brief`, `post`,
+`item`, `close`, `verdict`, `next`) and **six read commands** (`resume`, `show`, `list`, `refs`,
+`status`, `search`) — 8+6=14, matching the fourteen table entries. `README.md` documents 8+6=14; I did
+not follow the brief's "seven" over the code.
+
+**`8.4` covers all nine required contents**, cross-checked against the implementation rather than only
+`design.md:376–425`:
+
+- §4 (C4) states the full field-level UTF-8 validation set as implemented in
+  `record.zig:validateStrings`/`validateAttributed` — every attributed record's `ts`/`role`/`section`/
+  `block`/`to`/`refs[].ns`/`refs[].id`/`body`, plus `header`'s `tool`/`change`/`roles[]`/`closers[]`,
+  `section`'s `title`/`base`, `verdict`'s `commit` — not just `body`.
+- §5 (P1) states the temp-file protocol from `log.zig`'s `atomicReplace`/`replaceWith` doc comments and
+  code directly: renamed on success (nothing left to unlink), removed only on the failure path before
+  the rename. Written so "removed before the command exits" can't be misread as unlink-after-rename.
+- §6 states header identity from `log.zig`'s `headerUnchanged`/`sameRoleSet`: role/closer sets, `change`
+  excluded, duplicate-role-in-one-write refused, closer-not-also-role refused.
+- §9 states the read-side role rule from `log.zig`'s `checkDeclaredRole` (resume, latest header only)
+  vs. `checkDeclaredRoleHistory`/`checkDeclaredToHistory` (list/search, union of every header), and
+  confirmed both `runList` and `runSearch` route through the shared `checkHistoryFilters` in `main.zig`.
+- The seven `--json` shapes (§8) are stated from each command's own `--help` text plus the JSON-shape
+  tests in `main.zig` (`show --item`'s `{number,state,item,closes}`, `resume`'s `{next,items,brief}`,
+  `status`'s `{next,items}` with no `brief` key at all, `search`'s `{total,limit,records}` with
+  `limit:null` under `--limit 0`).
+
+**Also folded in** (from the carried list): `--state`/`--blocking` narrow `list` to items but never
+`search`; `search` is the one bounded read; `--limit` rejects zero-padded/signed/separated digits;
+exit-code table notes the closed-pipe `devlog: WriteFailed` case.
+
+**Raising, not fixing** — `list --help` and `search --help` describe the shared role-history check
+differently, and `search`'s wording is the accurate one (`src/main.zig` `list_usage`/`search_usage`,
+both `--role`/`--to` lines). `docs/FORMAT.md` §9 states the accurate rule (matching `search`'s wording);
+the `--help` text itself is unchanged, per the brief's scope limit. ❓ @architect — flagging this as an
+item, not fixing it: `list_usage`'s `--role`/`--to` lines should eventually be reworded to match
+`search_usage`'s.
+
+**Gates**: `BUILD_EXIT:0 TEST_EXIT:0 FORMAT_EXIT:0 VALIDATE_EXIT:0 GATES_EXIT:0`. Test count unmoved:
+`grep -rn 'test "' src/*.zig | wc -l` → 293, plus the one anonymous `test {}` at `src/main.zig:20` →
+**294**, confirmed.
+
+→ @reviewer
+
+**[reviewer]** Block **8A** (`8.1`–`8.4`). **Approve.**
+
+Re-ran every claim against `src/`, not against the brief or `design.md`. Everything checked out.
+
+**Scope** — clean. `git diff --stat HEAD` shows only `README.md`, `docs/FORMAT.md` (both new) and
+`DEVLOG.md`; no `src/`, `build.zig*`, `Makefile`, `tasks.md`, or other `openspec/` touched.
+
+**Gates** — reran `make gates` myself: `BUILD_EXIT:0 TEST_EXIT:0 FORMAT_EXIT:0 VALIDATE_EXIT:0
+GATES_EXIT:0`. Test count confirmed: 293 named + the anonymous `test {}` (`src/main.zig:20`) = 294,
+unmoved.
+
+**Command-surface correction** — confirmed against `src/main.zig:462–477`: 8 write + 6 read = 14
+entries. The worker is right, the brief's "seven write" was the error; `README.md:36,44–67` reflects
+8+6 correctly.
+
+**C4 (field-level UTF-8 validation), `docs/FORMAT.md:91–113`** — verified field-for-field against
+`record.zig:294–353` (`validateUtf8`/`validateAttributed`/`validateStrings`): every attributed kind's
+`ts`/`role`/`section?`/`block?`/`to?`/`refs[].ns`/`refs[].id`/`body`, plus `header`'s
+`ts`/`tool`/`change`/`roles[]`/`closers[]`, `section`'s additional `title`/`base`, `verdict`'s
+additional `commit`. Exact match, no field missing or invented.
+
+**P1 (temp-file protocol), `docs/FORMAT.md:115–172`** — walked it side-by-side against
+`log.zig:361–401` (`atomicReplace`) and `openLocked`/`isStaleLock` (`log.zig:113–221`): the stale-lock
+recheck (§5 step 2), in-memory build then staged temp file with `.exclusive=true` creation, `fsync`,
+close, `rename`, directory `fsync` (§5 steps 4–6), and `errdefer`-only-before-rename cleanup on failure
+(§5 step 7) all match the code exactly. The "renamed, not removed, on success — nothing left to
+unlink" paragraph (`FORMAT.md:157–163`) makes the misreading structurally impossible: it states the
+success path and the failure path as two separate, explicit cases rather than one ambiguous "removed
+before exit" sentence. This is the highest-stakes paragraph in the block and it holds up.
+
+**Nine required contents** — all present and each checked against source, not just against the brief's
+wording:
+1. Container (§1) — matches `parseLog`/append-only/`seq`/`ts` behaviour.
+2. Universal + attributed fields, header carrying none (§2) — matches `Attributed`/`HeaderRecord`.
+3. Eight kinds + enumerations (§3) — matches `Kind`, `ItemType`, `CloseState`, `VerdictOutcome`
+   (`record.zig:65–71`) exactly, including the field-order table, which I verified line-by-line against
+   `record.write` (`record.zig:373+`) — the `item` `to`-between-`type`-and-`blocking` exception is real
+   and correctly called out.
+4. C4 — see above.
+5. P1 — see above.
+6. Header identity (§6) — matches `headerUnchanged`/`sameRoleSet` (`log.zig:457–471`): `change` excluded,
+   set semantics, duplicate-role and closer-not-a-role refusals.
+7. Forward compatibility (§7) — consistent with the format-version refusal design; no contradicting code
+   found.
+8. `--json` contract (§8) — all seven shapes verified against the JSON-shape tests in `main.zig` (e.g.
+   `resume`'s `{next,items,brief}`, `status`'s absent `brief` key, `show --item`'s
+   `{number,state,item,closes}`, `search`'s `{total,limit,records}` with `limit:null` under `--limit 0`
+   confirmed at `main.zig:8816–8828`). `--limit` digit rule matches `parseLimit`
+   (`main.zig:1571–1579`) exactly, including the single-`0` exception. The closed-pipe `WriteFailed`
+   claim confirmed via `reportLogError`'s `@errorName(err)` fallback (`main.zig:1001–1004`).
+9. Read-side role rule (§9) — matches `checkDeclaredRole` (latest header, `log.zig:785`) vs.
+   `checkDeclaredRoleHistory`/`checkDeclaredToHistory` (union of every header, `log.zig:868,874`), and
+   both `runList`/`runSearch` route through the shared `checkHistoryFilters`.
+
+**"Also fold in" list** — all four present and accurate: `list`/`search` items-vs-records asymmetry
+(confirmed against `runList`'s `filters.item_only` branch vs. `runSearch`'s always-records candidates,
+`main.zig:2413,2586–2596`); `search` bounded vs. `list --json` unbounded; bare-digit `--limit`; the
+closed-pipe exit path.
+
+**README/`--help`/`FORMAT.md` coherence** — checked beyond the one divergence the worker already
+raised. `list_usage`/`search_usage` (`main.zig:301–440`) do state the shared `--role`/`--to`
+history-validation rule differently — `list`'s wording ("declared by 'devlog header'") reads as
+latest-header-only where the real rule is union-of-history, `search`'s wording is accurate. Correctly
+raised as an item, not silently fixed, and correctly out of scope for a prose-only block since
+`--help` text lives in `src/`. `docs/FORMAT.md:255–263` states the accurate rule, matching `search`'s
+wording rather than `list`'s. No other coherence gap found between `README.md`, `docs/FORMAT.md`, and
+the `--help` text I sampled (JSON-shape counts, kind counts, command counts, D12 posture, licence).
+
+**Nits** — none worth blocking on. Both documents are precise to the point of citing exact field-order
+exceptions and struct layouts; nothing hand-wavy found.
+
+**Architectural note** (not blocking this block) — `docs/FORMAT.md` is now the sole spec home for the
+read-side role-validation rule (§9) and cites `checkHistoryFilters` by name. Worth the supervisor
+confirming, when section 8 closes, that `openspec/specs/` doesn't need a parallel update — the brief
+frames `FORMAT.md` as filling a documentation gap, not as satisfying `durable-format`'s own `SHALL`s,
+and I didn't find a corresponding spec delta in this diff (correctly, since this block is prose-only
+and scoped to `8.1`–`8.4`).
+
+**[architect]** Block **8A** lands. Reviewer `Approve`; gates re-run on my side —
+`BUILD_EXIT:0 TEST_EXIT:0 FORMAT_EXIT:0 VALIDATE_EXIT:0 GATES_EXIT:0`, test count unmoved at **294**, which
+is what a prose-only block should look like. `8.1`–`8.4` ticked. Two new files: `README.md` and
+`docs/FORMAT.md`, per R8.
+
+**My brief was wrong, and the worker caught it.** I wrote "seven write commands and six read commands,
+fourteen table entries" — which is thirteen. `src/main.zig:462–477` has **eight** write commands
+(`header`, `section`, `brief`, `post`, `item`, `close`, `verdict`, `next`) and six read, and that is the
+fourteen. I verified it against the table myself before the reviewer did. The docs say 8+6 and are right.
+
+The origin matters more than the slip: **`## NEXT` has carried "seven write commands" since section 7
+closed**, and I copied it into the brief without re-deriving it. A number in `NEXT` is exactly as
+load-bearing as a number in the code, and this one was rehearsed into a brief that then instructed a worker
+to derive the surface from the binary — which is the only reason it was caught. Corrected in `NEXT` below.
+Ruling: **`NEXT` is not a source; it is a pointer to one.** Counts of anything in `src/` get re-derived at
+the moment they are written down, the way the test-count identity already is.
+
+**Carried out of 8A, both for 8B:**
+
+- **`list --help` and `search --help` state the shared role check differently** (`search`'s wording is
+  accurate). Raised by the worker, confirmed by the reviewer, correctly not fixed — `--help` text is code
+  and 8A was prose-only. It is a one-line fix and goes into **8B**, not a later change: the divergence is
+  now documented-against in `docs/FORMAT.md`, so leaving it would ship docs that disagree with the binary.
+- **Reviewer's parked question for the supervisor:** whether `specs/durable-format/spec.md` needs updating
+  now that `docs/FORMAT.md` is the written home for the read-side role rule (`resume` validates against the
+  **latest** header; `list`/`search` against the **union of every** header). That rule has been homeless
+  since section 6 and this is the first block that gave it prose. Outside a prose block's scope to judge;
+  it is a section-close call and I am putting it to the supervisor at 8's close, not deciding it here.
+
+**[architect]** Next: block **8B** — `8.5`, the release build. Static tarballs for macOS arm64 and Linux
+x86_64/arm64 (D12), plus the two items carried above. The `Makefile` target is **mine** to write, not the
+worker's; `NEXT` also owes this block the `-Dversion=X` breakage (the override makes `build_options.version`
+and `manifest.version` disagree) and the umask pin for the permissions test.
+
 ## NEXT
 
 **[architect]** **Sections 1–7 are CLOSED and fully ticked** — **43 of 52 boxes**, no outstanding
@@ -10781,8 +11054,11 @@ human-in-the-loop items. Section 7 closed on `1216010`; section 6 on `606503c`; 
 each section's close post for its landed commits and test counts.
 
 **Section 8 is next — documentation and release (`8.1`–`8.5`)**, then `9.x` is validation and handoff.
-Section 7 was the last section that adds a command. **The command surface is complete and frozen**: seven
-write commands, six read commands, fourteen entries in `commands`.
+Section 7 was the last section that adds a command. **The command surface is complete and frozen**: **eight**
+write commands (`header`, `section`, `brief`, `post`, `item`, `close`, `verdict`, `next`), six read
+commands, fourteen entries in `commands` (`src/main.zig:462–477`). *Corrected in 8A — this line read
+"seven write" from section 7's close until a worker re-derived it from the table. Counts of things in
+`src/` get re-derived when written, never copied forward.*
 
 **What `8.4` owes, now a closed inventory rather than a growing one.** Seven top-level JSON shapes, not
 six — section 7 added the seventh and it is the only one that is not a bare array or a bare object:

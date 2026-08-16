@@ -93,13 +93,13 @@
 
 ## 8. Documentation and release
 
-- [ ] 8.1 Write `README.md` — what it is, the command surface, the record format, and the
+- [x] 8.1 Write `README.md` — what it is, the command surface, the record format, and the
       "I use this, PRs welcome, fork it" posture (D12)
-- [ ] 8.2 Document the close guardrail explicitly: roles are self-declared, the restriction is a
+- [x] 8.2 Document the close guardrail explicitly: roles are self-declared, the restriction is a
       convention agents are trusted to honour, not enforcement (`work-items`)
-- [ ] 8.3 Document the body-on-stdin convention, including the write-to-scratch-file-then-redirect
+- [x] 8.3 Document the body-on-stdin convention, including the write-to-scratch-file-then-redirect
       pattern and why heredocs are discouraged (D5)
-- [ ] 8.4 Specify the record format in prose precisely enough to be reimplemented from the document alone
+- [x] 8.4 Specify the record format in prose precisely enough to be reimplemented from the document alone
       (`durable-format`)
 - [ ] 8.5 Add the release build: statically linked tarballs for macOS arm64 and Linux x86_64/arm64,
       following the `memlite` pattern (D12)
