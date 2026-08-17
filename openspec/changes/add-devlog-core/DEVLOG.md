@@ -12482,115 +12482,284 @@ already reported and need no re-audit.
 
 → @architect
 
+**[supervisor]** Section 8 re-audit, round four — range `f21864d..HEAD` (`e10430f`, `53abbf9`, `82fe8b2`,
+`eec166b`, `cd7e60a`, `8cb1786`, `335890a`, `a20afad`). **Approve.**
+
+**B4 is closed. I verified the sweep's completeness against source rather than against the table's
+self-report, and the three known rules against `src/` rather than against the worker's summary.**
+
+**1. Completeness of the enumeration — checked, and the 41 holds with one honest caveat about what it
+counts.** I re-derived the site list independently (every `d.set(`, `diag.set(`, `Diagnostics.set` and
+`setUndeclaredMessage(` occurrence in the three files): `record.zig` 26 matches − 3 in the
+`"Diagnostics.set on allocation failure…"` test (`:1225`, `:1238`, `:1249`) = **23**; `log.zig` 15
+matches − the helper declaration (`:895`) and its two internal `d.set(` lines (`:904`, `:908`) = **12**;
+`state.zig` **6**. Every line the table cites exists and does what the row says. The five helper-routed
+branches are real and distinct: `log.zig:722/728/734` are `checkRoleAllowed`'s three write-side refusals,
+`:771` is `checkDeclaredValue`'s read-side call (rows cite `:776/778`, its argument lines), `:850` is
+`checkDeclaredValueHistory`'s. No third indirection exists — I confirmed `Diagnostics.set` and
+`setUndeclaredMessage` are the only two attachment paths.
+
+The caveat, stated so the number is not carried forward wrong a fourth time: **row 35 is the helper, not a
+refusal site** — the table marks it `—` itself. So the honest reading is **40 refusal branches classified
+across 41 table rows**, not "41 refusal branches". The table is right; the sentence people will quote from
+it is off by one. This is a labelling correction, not a completeness failure, and I raise it only because
+this section has now had three different denominators and the next one to repeat the number will be a
+plugin author.
+
+**2. The three B4 rules, verified on the correct side.**
+- **`brief`/`verdict` requiredness.** `src/state.zig:519-540` is a single forward pass with bare `return
+  error.…` — `VerdictMissingKey` (`:522`, `:526`) and `BriefMissingKey` (`:534`, `:538`) abort derivation
+  for the whole log, exactly as `docs/FORMAT.md:96-104` now says. `brief`'s `to` is genuinely **not**
+  checked there — the write-only/read-tolerant asymmetry at `:98-101` is correct, and it is the one
+  place in this document where that distinction is drawn explicitly rather than left to inference.
+  `docs/FORMAT.md:46-48` no longer says "optional" flatly, and `:76` no longer says `brief` "carries no
+  fields beyond the attributed set" without qualification. The contradiction is gone on both sides.
+- **`close` must target an earlier item.** `src/state.zig:509-514` (`cr.item < 1 or cr.item >
+  item_closes.items.len`) confirms both the never-raised and the appears-later cases collapse to one
+  fault in an append-only log; `src/log.zig:687` is the write-side twin. `docs/FORMAT.md:121-127` states
+  the rule, the read-side whole-log consequence, and explicitly reconciles it with the pre-existing
+  "closing an already-closed item is legal" non-rule. The pair is no longer half-documented.
+- **`item.item` = ordinal.** `src/state.zig:491-497` (`ItemNumberMismatch`) confirmed;
+  `docs/FORMAT.md:128-131` now carries the reader consequence beside the writer rule, in §1's `seq`
+  framing as asked.
+
+**3. The generalisation is true, not an overreach — I checked the mechanism, not the claim.**
+`src/record.zig:894-902`: `parseLog`'s loop calls `parseLine` and returns its error immediately, so every
+fault `parseLine` can raise — `InvalidJson` (`:697`), `NotAnObject` (`:705`), `UnknownKind` (`:713`), any
+`requireString`/`requireInt`/`requireBool`/`requireStringArray` miss or type error, and the three inner
+enumerations (`:791`, `:806`, `:818`) — aborts the **whole file**. `validateSeqOrder` (`:910`) runs only
+after every line has parsed. `docs/FORMAT.md:83-90` is scoped to exactly that mechanism and does not
+conflate it with the separate state-derivation faults, which get their own wording in the two new
+subsections. Correctly generalised. The `kind` addition (`:83-84`) closes the one enumeration that had no
+reader guidance.
+
+**4. I pressed the CLI-only classifications, which is where a dismissal would hide a rule. They hold.**
+- Row 25 (`log.zig:277`, read against a missing log) is the only `C` in the table and is defensible: it
+  is a precondition on a nonexistent input, with no wire consequence. Its write-side sibling (row 24,
+  `:191`) is correctly `F`, because *that* one carries the format consequence that only a `header` write
+  creates the file — already at `docs/FORMAT.md:220-222`.
+- `main.zig`'s ~30 `requires` failures: I checked the three that could have hidden a format rule.
+  `:1126`/`:1129` (duplicate `--role`/`--closer`) and `:1134` (closer must also be a role) are documented
+  at `docs/FORMAT.md:277-282`; `:1118`/`:1119` (empty `roles`/`closers`) at `:283-287`, correctly framed
+  write-side-only. `:1387`/`:1456`/`:1508`/`:2263`/`:2269` are the closed enumerations, documented in §3
+  and §9. `:1453`/`:2115` (`--item` positive) is implied by the now-documented ordinal and
+  `CloseTargetMissing` rules. Nothing in that set is a wire rule sitting undocumented.
+- `main.zig:2742` ("not implemented yet") is unreachable from the command surface but is a documented
+  deliberate fallback (`:2735-2741`), not dead scaffolding, and predates this section.
+
+**Convergence judgement — the question you actually asked. Yes: `docs/FORMAT.md` has converged.** Last
+round I said it would not converge under repeated cold reads and named the sweep as what I would treat as
+the close. The sweep was executed properly — enumerated from the semantic definition rather than a grep,
+reconciled rather than padded when its denominator disagreed with the brief, and every row checkable
+against a line of source. I am holding to that commitment. The document went from 361 to 410 lines and
+every one of those lines closed a disagreement with `src/`, not a stylistic gap.
+
+**What remains is bounded, enumerable, and I am listing it in full so the Product Owner can see there is
+no fifth round hiding behind this approval.** Two items, both one-sentence fixes, neither a false
+statement:
+
+- **`docs/FORMAT.md:72-81` (§3's kind table) never states that the kind-specific fields are required.**
+  Every one of them is (`record.zig:720`, `:728-729`, `:775-776`, `:788-794`, `:803-804`, `:816`, `:821`
+  are all `require*`; only `section`/`block`/`to` use `optionalString` at `:751-753`). §2's table carries
+  a `Required?` column because two of its six are optional; §3's has none because none of its are — but
+  that inference is left to the reader. The document's convention (optional is always labelled
+  explicitly) makes the correct reading the natural one, which is why this is not B4 item 1's shape and
+  why I am not blocking on it: there is no false statement, only an unstated one. One sentence under the
+  §3 table — "every field listed in this table is required for its kind; absence is a parse fault per the
+  paragraph below" — closes it.
+- **`README.md:128`** still describes the seven non-`header` kinds as carrying "optional
+  section/block/addressee/references". That is the exact framing B4 corrected in `FORMAT.md` and the
+  remediation did not sweep the sibling document. It is non-normative and immediately defers to
+  `FORMAT.md` (`README.md:133`), which is why it is a nit rather than a doc-set contradiction — but `9.4`
+  hands a plugin author both files and the summary is the one they read first.
+
+**Section integrity across all eight commits — re-checked, not carried.** No dependency in
+`build.zig.zon` (`.dependencies = .{}`). No persisted index, cache, or lock file; the temp file remains
+the single documented exception (§5). Append-only unweakened — no repair, compact, migrate, truncate, or
+in-place rewrite path anywhere in the range. No MCP, JSON-RPC, or daemon surface. No embeddings. Bodies
+still verbatim, with D14's UTF-8 check the only inspection. `#n` remains the bare sequence and
+`docs/FORMAT.md:155-158` states why. D13's guardrail is still checked against the latest `header`'s
+`closers` (`docs/FORMAT.md:160-169`) and still described as a self-declared guardrail, not a security
+boundary. No duplicated derivation — this section adds none, and the two `sed` extractions read different
+keys. No dead scaffolding. The `log-retrieval` spec addition is section 7's read-side rule restated, and
+§9 of `FORMAT.md` restates it in full rather than cross-referencing, which is the right call for a
+document that must be reimplementable from itself. The last two commits (`335890a`, `a20afad`) touch
+`docs/FORMAT.md` and this DEVLOG only — confirmed. Every block in the range quotes its exit lines.
+
+**Two state facts the Architect owns, neither affecting this verdict.** `8.5` is **unticked** and
+correctly so — it is the human-in-the-loop release verification awaiting the Product Owner's tag push, so
+this approval closes the section's *content*, not its last box. And `docs/notes/` is untracked in the
+working tree (the reviewer flagged `field-report-zerowiki.md`); nothing in this thread accounts for it,
+and it sits inside the `docs/` directory `9.4` hands over.
+
+**What section 9 inherits.**
+
+- **A `docs/FORMAT.md` I now consider reimplementable from itself**, with the two one-sentence residuals
+  above unclosed. If `9.4`'s handoff is the moment to spend ten minutes on documentation, spend it there.
+- **The document still has no gate.** Every defect found across four rounds was a disagreement with
+  `src/` that no `make` target could see, and the sweep's own artefact — the refusal-site list — is the
+  shape a mechanical check would take. If `9.x` adds one thing to the Makefile, this is the candidate.
+- **The counting discipline.** Four rounds produced three denominators (42, 38, 41) for one quantity, and
+  a fourth reading (40 branches / 41 rows) is in this post. `## NEXT`'s "escape the dot" rule is right and
+  insufficient: the deeper rule is that a completeness denominator must come from the semantic definition
+  of the thing counted, never from a text search, whenever the thing counted can route through a helper.
+- **`9.4`'s reader is the cold reader this document has been failing.** Hand them `README.md` →
+  `docs/FORMAT.md` in that order and treat the first question they ask as a finding against the document,
+  not a support request.
+
+For `## NEXT`, in addition to the round-three list which still stands (no `FORMAT.md` gate, unstated
+string escaping vs. the "byte-compatible" claim, `README.md:37,45`'s hardcoded build facts,
+`version_overridden`'s untested-path consumer, no CI running `make gates`, the release-engineering
+residuals): the §3 requiredness sentence, the `README.md:128` framing, the counting rule above, and the
+untracked `docs/notes/`.
+
+→ @architect
+
 ## NEXT
 
-**[architect]** **Sections 1–7 are CLOSED and fully ticked** — **43 of 52 boxes**, no outstanding
-human-in-the-loop items. Section 7 closed on `1216010`; section 6 on `606503c`; section 5 on `31eb5e3`. See
-each section's close post for its landed commits and test counts.
+**[architect]** **Sections 1–8 are CLOSED** — **47 of 52 boxes ticked**. Section 8 closed on `a20afad` after
+**four supervisor rounds**; section 7 on `1216010`; section 6 on `606503c`; section 5 on `31eb5e3`.
 
-**Section 8 is next — documentation and release (`8.1`–`8.5`)**, then `9.x` is validation and handoff.
-Section 7 was the last section that adds a command. **The command surface is complete and frozen**: **eight**
-write commands (`header`, `section`, `brief`, `post`, `item`, `close`, `verdict`, `next`), six read
-commands, fourteen entries in `commands` (`src/main.zig:462–477`). *Corrected in 8A — this line read
-"seven write" from section 7's close until a worker re-derived it from the table. Counts of things in
-`src/` get re-derived when written, never copied forward.*
+**Section 9 is next and last — end-to-end validation and handoff (`9.1`–`9.4`).** Then the change archives.
 
-**What `8.4` owes, now a closed inventory rather than a growing one.** Seven top-level JSON shapes, not
-six — section 7 added the seventh and it is the only one that is not a bare array or a bare object:
+### The one unticked box outside section 9
 
-1. `show --seq` — a bare record.
-2. `show --item` — `{number,state,item,closes}`.
-3. `resume` — `{next,items,brief}`.
-4. `status` — `{next,items}`.
-5. `list` — an array of records **or** of item objects, depending on flags.
-6. `refs` — an array of records.
-7. **`search` — `{"total":N,"limit":L,"records":[…]}`**, with `"limit": null` when unbounded (D16).
+**`8.5` is built, reviewed, gated and committed — and deliberately unticked.** Product Owner's ruling: it is
+ticked **just before archiving**, once a real `v0.1.0` has run post-merge. Do not tick it earlier and do not
+treat section 8 as unfinished because of it — the section has its `Approve`; this is one box waiting on an
+event outside the repo.
 
-**Every `--json` payload is exactly one line**, pinned across all seven forms; the newline is the caller's.
-That is contract, and `9.4` hands it to a plugin.
+**Why it cannot be verified yet, which is the finding `8.5` existed to produce.** A real `v0.0.1` tag push
+was made and **nothing ran** — not a failure, nothing:
 
-**Owed to `8.x`, carried and still open:**
+- the tag reached the remote at the right commit, and `release.yml` was present at that ref (2363 bytes);
+- workflow runs on the repository, all time: **0**;
+- **registered workflows: 0**;
+- `main` has never contained `.github/`.
 
-- **C4** — the spec scopes the UTF-8 `SHALL` to `body` while the code validates every string field. `8.4`
-  must carry the field-level breadth or a reimplementer reintroduces the hazard through `--to`.
-- **P1 — "removed before the command exits" is loose on the success path** (`design.md:110`,
-  `specs/durable-format/spec.md:43`): on success the temp file is *renamed*, not removed. A reimplementer
-  who reads "removed" as `unlink` after a successful rename **deletes the log**.
-- **The read-side role-validation rule has no spec home.** It lives only in DEVLOG rulings and code:
-  `resume` validates identity against the **latest** header, `list`/`search` validate history filters
-  against the **union of every** header. Section 7 folded both commands' checks into `checkHistoryFilters`,
-  so there is now one implementation and still no prose.
-- **`headerUnchanged` excludes `change` from header identity** — one sentence in D13.
-- **`8.5`** — `zig build test -Dversion=X` fails (the override makes `build_options.version` and
-  `manifest.version` disagree); pin the umask in the permissions test, which is otherwise
-  environment-dependent.
-- **The exit-code table** should note the closed-pipe path: piping `--json` into `head -c` prints
-  `devlog: WriteFailed` at exit 1. Pre-existing, unchanged by D16's bound, and **less** reachable now — the
-  default result is ~51 KB against a typical pipe buffer where an unbounded one was ~790 KB.
-- **`--state`/`--blocking` return items from `list` but records from `search`** — the one non-uniform spot
-  on the read surface. Deliberate under R2 and it needs saying out loud.
-- **A zero-padded `--limit` (`05`, `007`) is a refusal**, not a silent success. Right trade, fails loudly,
-  but a `%02d`-style formatter would hit it — `9.4`'s plugin must emit bare digits.
-- **`list --help` and `search --help` describe the one shared role check differently**, and `search`'s
-  wording is the accurate one.
+GitHub had never registered the workflow, so a tag push had nothing to fire. Pushing the branch and
+re-pushing the tag changed nothing. The tag was deleted from the remote and locally; the branch
+(`origin/change/add-devlog-core`) is pushed and remains.
 
-**Owed to `9.x`:**
+**Every local check had passed** — `actionlint` clean, YAML valid, all three pinned actions resolving, the
+tag/version guard's logic verified against three inputs. None of it could detect that the workflow was
+invisible to GitHub. **A green gate set and an unrunnable release process are locally indistinguishable.**
+The workflow will not run until `release.yml` reaches the **default branch**; plan the merge accordingly.
 
-- **`9.1` is not a replay exercise** — it is the only automated mechanism this project has that would catch
-  the two classes that have escaped review: a defect in a branch nothing executes, and a defect only
-  visible when the built binary runs. Section 7 adds a third: **a defect only visible at realistic corpus
-  size.** Brief it as such.
-- **`9.4` must tell consumers to ignore the temp-name pattern**, not merely record that it exists.
-  Consumers inherit the orphan risk with none of this repo's `.gitignore` mitigation.
-- **`9.4` must also say that `search` is the bounded read and `list --json` deliberately is not** — a
-  consumer that assumes uniform bounding will silently truncate a `list`, or paginate a `search` that
-  already bounded itself.
+### What section 9 inherits
 
-**Carried, none blocking:**
+- **`docs/FORMAT.md` is now reimplementable from itself** — the supervisor's convergence judgement, given
+  after it had committed in advance to treating the refusal-site sweep's completion as the close. `9.4`
+  hands this document to a plugin author who is exactly the cold reader it failed five times.
+- **`docs/FORMAT.md` has no gate.** Its refusal-site list is the shape such a check would take: every
+  refusal branch either documented or classified CLI-only. Nothing enforces that today, and nothing stops
+  the next `src/` change from silently invalidating the document.
+- **Two bounded fixes, neither a false statement, both one sentence** (supervisor, round four):
+  - `docs/FORMAT.md:72-81` never states that §3's kind-specific fields are **required**. They all are
+    (`record.zig:720`, `:728-729`, `:775-776`, `:788-794`, `:803-804`, `:816`, `:821`); only
+    `section`/`block`/`to` use `optionalString` (`:751-753`). Unstated, not misstated.
+  - `README.md:128` still says non-`header` kinds carry "optional section/block/addressee" — the exact
+    framing B4 corrected in `FORMAT.md`. Non-normative and it defers to `FORMAT.md:133`, so a nit.
+- **`9.1` is not a replay exercise.** It is the only automated mechanism this project has that catches a
+  defect in a branch nothing executes, or one visible only when the built binary runs. Section 7 added a
+  third class: only visible at realistic corpus size. **Section 8 added a fourth: only visible outside this
+  machine.** Brief it as such.
+- **`9.4` owes consumers three warnings**, not merely three facts: ignore the temp-name pattern (consumers
+  inherit the orphan risk with none of this repo's `.gitignore` mitigation); `search` is the bounded read
+  and `list --json` deliberately is not (assume uniform bounding and you silently truncate a `list` or
+  paginate an already-bounded `search`); and `--limit` takes **bare digits** — a `%02d`-style formatter
+  emitting `05` gets a refusal.
 
-- **D3's revisit trigger has tightened.** With a default bound, the evidence to watch for is *the answer
-  falling outside the top 10*, not *search failing to return it*. Recorded in D16 and in the risk list.
-- **`parseArgs` maintains a hand-written flag list per command.** Section 7 added an eighth. It has not
-  bitten, and the command surface is now frozen, so it never will in this change — but a fifteenth command
-  in a later change inherits it.
-- **`commands` is a runtime table with no comptime exhaustiveness check**, which is why the unreachable
-  `not implemented yet` dispatch arm is kept deliberately. Making dispatch table-driven would let the
-  compiler prove what that arm currently guards. A later change's call.
-- **D13's body text never mentions `closers`**; the decision is everywhere except `## Decisions`.
-- **Supervisor notes N1–N9** are in section 1's first supervisor post, including `main.zig:146` citing a
-  `tasks.md` path that moves under `archive/` when this change ships.
+### The command surface is frozen and its count is settled
 
-**What seven sections have taught about where defects actually live:**
+**Eight write commands** (`header`, `section`, `brief`, `post`, `item`, `close`, `verdict`, `next`) and
+**six read commands**, **fourteen** entries in `commands` (`src/main.zig:462-477`). This line read "seven
+write" from section 7's close until a worker re-derived it in 8A. **Seven top-level `--json` shapes**, and
+**every `--json` payload is exactly one line** — the newline is the caller's. That is the contract `9.4`
+hands to a plugin.
+
+### Counting discipline — earned three times in one section
+
+**A completeness denominator must come from the semantic definition of the thing counted, never from a text
+search, whenever what you are counting can route through a helper.** One quantity produced four readings
+this section:
+
+| reading | why it was wrong |
+|---|---|
+| **42** (architect) | `grep -c "d.set"` with an **unescaped** dot — matched `"d set"` inside prose |
+| **38** (worker) | correct pattern, wrong tool — grep counts text, not refusal sites |
+| **41** (reviewer) | five `log.zig` branches route through `setUndeclaredMessage` and carry no `d.set(` |
+| **40 branches / 41 rows** (supervisor) | row 35 *is* the helper, marked `—` |
+
+Also this section: "seven write commands" (wrong, 8A) and "294 is stale" (wrong — 293 **named** plus the one
+anonymous `test {}`). **Every number that reaches a brief, a report or a commit gets re-derived at the
+moment it is written, with an escaped pattern and a second look.** Three of the five bad numbers here were
+caught by a subordinate agent declining to make its report agree with its brief; that is the behaviour to
+preserve.
+
+### Where defects actually live — eight sections of evidence
 
 1. **In branches nothing executes**, and in behaviour only the built binary shows. `9.1` is the only
    mechanism aimed at either.
-2. **Behind coverage that cannot fail** — a fixture too small for the property to break, a bad-value table
-   whose one negative is the one the parser rejects for the wrong reason. **Section 7's whole lesson.**
-3. **In the gap between what a task says and what its requirement means.** `7.1`–`7.4` were all built,
-   correctly, and the requirement still was not met. Ticked boxes are not a closed section, which is why
-   the supervisor exists and why it runs on every section including single-block ones.
-4. **In the second implementation of one idea.** Every extraction this project has made (`fail`,
+2. **Behind coverage that cannot fail** — a fixture too small for the property to break. Section 7's lesson.
+3. **In the gap between what a task says and what its requirement means.** `7.1`–`7.4` were all built
+   correctly and the requirement still was not met.
+4. **In the second implementation of one idea.** Every extraction this project made (`fail`,
    `matchesListFilters`, `selectCandidates`, `checkHistoryFilters`) followed a finding that two call sites
-   had drifted or were about to.
+   had drifted.
+5. **On platforms the gates never run on.** `shasum` is a macOS idiom; stock Ubuntu has only `sha256sum`.
+   `make release` would have built all three tarballs and failed on its last line, **in CI only**, at
+   `RELEASE_EXIT:0` locally every time. Found by running a container, not by a gate.
+6. **In documentation that contradicts working code.** Section 8 found five such defects and changed `src/`
+   **zero times**. A writer built from `FORMAT.md`'s field table produced a log this tool cannot derive
+   state from — in the table since `e10430f`, through five readings.
+7. **In the absence of a statement.** `8.4`'s bar — "reimplementable from this document alone" — is a claim
+   about what is *missing*, and absence is what diff review is worst at seeing. Four cold reads each found
+   exactly one more gap, which is evidence the technique finds **a** gap, not the **last** one. Only
+   enumerating every refusal site terminated.
+8. **Outside this machine.** See `8.5` above.
 
-**Standing facts for a cold start:**
+### Follow-ups outside this change
 
-- Workflow is `dmons` 0.4.0: gates run via `make`, reports quote `LABEL_EXIT:<n>`. Gates run **in-sandbox**
-  — `~/.cache/zig` is on the write allowlist. A `manifest_create PermissionDenied` or `unable to load
-  'std.zig'` means that entry went missing, not a broken toolchain.
-- **The test count identity is settled: named `test "…"` declarations plus the one anonymous `test {}` at
-  `src/main.zig:20`.** At section 7's close that is 293 + 1 = **294**. There are no other test forms in
-  `src/` — no indented blocks, no `test <identifier>` — so this arithmetic holds for later blocks. Three
-  different numbers were reported for one tree before this was pinned.
+- **`add-homebrew-tap`** — a `daemonicai/homebrew-tap` formula. Homebrew formulae download via `curl` and so
+  never carry `com.apple.quarantine`, and a formula's `sha256` makes checksum verification mandatory rather
+  than optional. Not `homebrew-core`: its notability thresholds won't be met and acceptance there is a
+  support obligation against D12. Separate change; D12 and `8.5` specify GitHub release tarballs only.
+- **macOS signing — parked until September 2026**, when Apple Developer program access arrives. Only
+  notarization fixes the browser-download path. **Do not** propose signing CI or further quarantine
+  mitigation before then; the `README` workaround is adequate and the real fix has a date.
+- **Nothing gates a release tag against a red tree** — the workflow will build from a tag pointing at a
+  commit whose tests fail. Supervisor, round three.
+- **`build_options.version_overridden`** exists solely to let one test skip itself on a path no gate runs;
+  under override nothing proves `build_options.version` reflects the `-Dversion` input, since both sides
+  derive from one variable.
+- **`parseArgs` maintains a hand-written flag list per command**, and `commands` is a runtime table with no
+  comptime exhaustiveness check — which is why the unreachable `not implemented yet` arm is kept. A later
+  change's call; the surface is frozen, so neither bites in this one.
+- **D13's body text never mentions `closers`**; the decision is everywhere except `## Decisions`.
+
+### Standing facts for a cold start
+
+- **Gates are `build`, `test`, `format`, `validate` and `actions`** — `make gates` → `GATES_EXIT:0`. The
+  `actions` gate (`actionlint`, added mid-section 8) **fails** rather than skips when `actionlint` is
+  absent, so it is a hard dependency; both refusal paths were exercised. `make release` and `make clean` are
+  **not** gates.
+- **Test-count identity: named `test "…"` declarations plus the one anonymous `test {}` at
+  `src/main.zig:20`.** Currently 293 + 1 = **294**. There are no other test forms in `src/`.
 - **Version is single-source**: `build.zig.zon:3` is the only semver literal in tracked source.
-- **Zig 0.16 changed `main`'s signature** — `pub fn main(init: std.process.Init) !void`;
-  `std.process.argsAlloc` and `std.io.getStdOut` are gone. Write against 0.16's API, never a remembered one.
+- **Zig 0.16 changed `main`'s signature** — `pub fn main(init: std.process.Init) !void`; `argsAlloc` and
+  `getStdOut` are gone. Write against 0.16's API, never a remembered one.
+- Gates run **in-sandbox**; `~/.cache/zig` is on the write allowlist. A `PermissionDenied` naming `std.zig`
+  means that entry went missing, not a broken toolchain. Building anything under `~/.claude/plugins`
+  needs the sandbox disabled.
 - **Parse-ambiguity errors beat `--help`/`--version`.** Any new error condition must be placed on the
-  correct side of that line. `search`'s no-query refusal deliberately sits *after* it, so `search --help`
-  works.
-- **Roles are declared per project in the `header`** (D13), which itself carries no role; the header also
-  declares `closers`. `orchestrator` is retired — the main session is `analyst` and `architect`.
-- **When rewriting this section, match `^## NEXT$` at start of line.** The bootstrap note contains the
-  literal string in prose. See the incident post.
+  correct side of that line.
+- **Roles are declared per project in the `header`** (D13), which carries no role itself and also declares
+  `closers`. `orchestrator` is retired — the main session is `analyst` and `architect`.
+- **When rewriting this section, match `^## NEXT$` at start of line** — the bootstrap note contains the
+  literal string in prose. There is currently exactly one match. See the incident post.
 - **Commit the DEVLOG when a post lands, not only when a block does.** Two supervisor reviews have sat as
-  uncommitted working-tree state, recoverable from nowhere.
+  uncommitted working-tree state.
+- **`docs/notes/field-report-zerowiki.md` is untracked** and unaccounted for anywhere in this thread. It
+  sits inside the directory `9.4` hands over. Not this change's; leave it alone, but do not let it reach a
+  commit by accident.
