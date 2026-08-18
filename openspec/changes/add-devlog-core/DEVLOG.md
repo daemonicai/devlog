@@ -13128,7 +13128,7 @@ Gates: `BUILD_EXIT:0 TEST_EXIT:0 FORMAT_EXIT:0 VALIDATE_EXIT:0 ACTIONS_EXIT:0 GA
 
 **[supervisor]** Section **9** review — scope `git diff 3c7f63f..HEAD` (`554c1f8` 9A, `5f0693d` 9B).
 
-## Verdict: **Request changes** — one blocker, in `9.1`.
+### Verdict: **Request changes** — one blocker, in `9.1`.
 
 ### Blocker — `9.1`'s eight-kind coverage is asserted against the driver's intent, not against the log
 
@@ -13389,149 +13389,297 @@ No blockers, no nits.
 
 → @architect
 
-**[architect]** **Sections 1–8 are CLOSED** — **47 of 52 boxes ticked**. Section 8 closed on `a20afad` after
-**four supervisor rounds**; section 7 on `1216010`; section 6 on `606503c`; section 5 on `31eb5e3`.
 
-**Section 9 is next and last — end-to-end validation and handoff (`9.1`–`9.4`).** Then the change archives.
+---
 
-### The one unticked box outside section 9
+**[supervisor]** Section **9**, round 2 — scope `git diff 3c7f63f..HEAD`, now `554c1f8` (9A), `5f0693d`
+(9B), `5742c43` (remediation).
 
-**`8.5` is built, reviewed, gated and committed — and deliberately unticked.** Product Owner's ruling: it is
-ticked **just before archiving**, once a real `v0.1.0` has run post-merge. Do not tick it earlier and do not
-treat section 8 as unfinished because of it — the section has its `Approve`; this is one box waiting on an
-event outside the repo.
+### Verdict: **Approve** — section 9 closes. One non-code action is required before archiving (below).
 
-**Why it cannot be verified yet, which is the finding `8.5` existed to produce.** A real `v0.0.1` tag push
-was made and **nothing ran** — not a failure, nothing:
+### The `9.1` blocker is closed — verified against the code, not the reports
 
-- the tag reached the remote at the right commit, and `release.yml` was present at that ref (2363 bytes);
-- workflow runs on the repository, all time: **0**;
-- **registered workflows: 0**;
-- `main` has never contained `.github/`.
+The remediation lands exactly what the brief specified, and I checked each claim in source rather than
+taking the thread's word for it.
 
-GitHub had never registered the workflow, so a tag push had nothing to fire. Pushing the branch and
-re-pushing the tag changed nothing. The tag was deleted from the remote and locally; the branch
-(`origin/change/add-devlog-core`) is pushed and remains.
+- **Log-derived kind coverage exists.** `src/e2e_test.zig:566-573` walks the parsed `list --json` array,
+  reads `rec.object.get("kind").?.string`, maps it through `std.meta.stringToEnum(record.Kind, …)` — and
+  fails loudly on an unrecognised string rather than silently dropping it, which is the right shape — and
+  accumulates into `kinds_in_log`. The `inline for` over `record.Kind`'s fields at `:568-575` then requires
+  all eight. This is a statement about bytes the binary wrote, read back through the shipped reader. It is
+  the assertion `9.1`'s task text always claimed.
+- **`kinds_seen` survives as a distinct, correctly-scoped claim** (`:523-540`), and the comment says in
+  plain words why the two loops are not duplicates. A future reader pruning "redundant" coverage would have
+  to override an explicit sentence to do it. That was the right call — deleting `kinds_seen` would have
+  lost the fixture-detection-rule check, which is the thing that fails if `docs/example/DEVLOG.md` is
+  edited such that a paragraph shape stops matching.
+- **The floor is gone.** `:577` is `try testing.expectEqual(replayed.records_written, parsed.value.array.items.len)`.
+  No inequality remains anywhere in `9.1`.
+- **The comment no longer overclaims.** `:541-553` states the two properties and, for each, the input that
+  makes it fail. Checked line by line against the code beneath it; nothing asserted there is unsupported.
+  The previous comment's "silently truncated" claim — asserted by a `>= 45` floor that a five-record
+  truncation cleared — is now actually true of the assertion it sits above.
 
-**Every local check had passed** — `actionlint` clean, YAML valid, all three pinned actions resolving, the
-tag/version guard's logic verified against three inputs. None of it could detect that the workflow was
-invisible to GitHub. **A green gate set and an unrunnable release process are locally indistinguishable.**
-The workflow will not run until `release.yml` reaches the **default branch**; plan the merge accordingly.
+**Is there still a path by which a record is absent, or of the wrong kind, without a failure?** For the
+two failing inputs I named in round 1, no: a `close` serialising `kind:"post"` now leaves `.close` absent
+from `kinds_in_log` and fails at `:571`; a write exiting 0 without appending now makes the parsed length
+fall short of `records_written` and fails at `:577`. Four independent mutations are on record turning the
+suite red across three distinct input classes (wrong kind; success-without-append; an under-counted
+`records_written`, the reviewer's `expected 49, found 50`). That is a properly demonstrated live assertion,
+not an asserted one.
 
-### What section 9 inherits
+### `records_written` is load-bearing and correctly bounded — and it is *not* the same shape of defect
 
-- **`docs/FORMAT.md` is now reimplementable from itself** — the supervisor's convergence judgement, given
-  after it had committed in advance to treating the refusal-site sweep's completion as the close. `9.4`
-  hands this document to a plugin author who is exactly the cold reader it failed five times.
-- **`docs/FORMAT.md` has no gate.** Its refusal-site list is the shape such a check would take: every
-  refusal branch either documented or classified CLI-only. Nothing enforces that today, and nothing stops
-  the next `src/` change from silently invalidating the document.
-- **Two bounded fixes, neither a false statement, both one sentence** (supervisor, round four):
-  - `docs/FORMAT.md:72-81` never states that §3's kind-specific fields are **required**. They all are
-    (`record.zig:720`, `:728-729`, `:775-776`, `:788-794`, `:803-804`, `:816`, `:821`); only
-    `section`/`block`/`to` use `optionalString` (`:751-753`). Unstated, not misstated.
-  - `README.md:128` still says non-`header` kinds carry "optional section/block/addressee" — the exact
-    framing B4 corrected in `FORMAT.md`. Non-normative and it defers to `FORMAT.md:133`, so a nit.
-- **`9.1` is not a replay exercise.** It is the only automated mechanism this project has that catches a
-  defect in a branch nothing executes, or one visible only when the built binary runs. Section 7 added a
-  third class: only visible at realistic corpus size. **Section 8 added a fourth: only visible outside this
-  machine.** Brief it as such.
-- **`9.4` owes consumers three warnings**, not merely three facts: ignore the temp-name pattern (consumers
-  inherit the orphan risk with none of this repo's `.gitignore` mitigation); `search` is the bounded read
-  and `list --json` deliberately is not (assume uniform bounding and you silently truncate a `list` or
-  paginate an already-bounded `search`); and `--limit` takes **bare digits** — a `%02d`-style formatter
-  emitting `05` gets a refusal.
+This was the thing worth checking hardest, since the fix replaces one driver-side number with another.
+It holds, and the reason is worth stating because it is the distinction the whole finding turned on.
 
-### The command surface is frozen and its count is settled
+- **It counts subprocess invocations that exited 0, nothing else.** `grep -n runDevlog src/e2e_test.zig`
+  gives nine call sites; three are writes (`:201` `writeCmd`, `:218` `writeItemCmd`, `:229` `writeHeader`)
+  and six are reads (`list` `:554`, `:631`; `resume` `:732`, `:745`, `:809`). Each write increments exactly
+  once (`:204`, `:221`, `:242`), immediately after `try expectSuccess(...)`, so a non-zero exit returns via
+  the error before the increment. `writeHeader` is called once (`:386`). No write path bypasses the three
+  helpers, and none double-counts. The count is exact.
+- **Why this is categorically different from `kinds_seen`.** `kinds_seen` recorded *what the driver believed
+  it was writing* — a proposition about content, restated from the branch the driver took, and therefore
+  unfalsifiable by the log. `records_written` records *how many times the driver ran the binary* — a fact
+  the driver genuinely owns and that the log cannot influence. The assertion is then an external invariant:
+  **one successful write command appends exactly one record.** That invariant is real, it is a contract the
+  tool owes its callers, and neither side of the comparison can drift to accommodate the other. A
+  driver-side number is only vacuous when it is derived from the same belief as the thing it checks; this
+  one is not. The fix did not reintroduce the defect in subtler form.
+- **The equality also proves something nobody claimed.** `list --json` with no filters returned all 50
+  records, so this assertion incidentally pins `list`'s unfiltered default. Worth knowing if anyone later
+  gives `list` a default filter — `9.1` will go red, and correctly so.
 
-**Eight write commands** (`header`, `section`, `brief`, `post`, `item`, `close`, `verdict`, `next`) and
-**six read commands**, **fourteen** entries in `commands` (`src/main.zig:462-477`). This line read "seven
-write" from section 7's close until a worker re-derived it in 8A. **Seven top-level `--json` shapes**, and
-**every `--json` payload is exactly one line** — the newline is the caller's. That is the contract `9.4`
-hands to a plugin.
+**The one residual, for `## NEXT` and not for this section.** The kind check is *set presence*, not a
+per-kind histogram. A defect that mis-serialises **some but not all** records of a kind — a conditional
+inside one serialiser — leaves the set complete and the total unchanged, and passes. No such conditional
+exists today (each kind has exactly one producing command), so this is a hazard against future change, not
+a present gap. Closing it is cheap: make `kinds_seen` an `EnumMap(record.Kind, usize)` of counts and
+compare per-kind against the log's histogram. Not worth a third round; worth doing when someone next
+touches serialisation.
 
-### Counting discipline — earned three times in one section
+### Section 9 as a whole, and the change as a whole
 
-**A completeness denominator must come from the semantic definition of the thing counted, never from a text
-search, whenever what you are counting can route through a helper.** One quantity produced four readings
-this section:
+Clean, and I looked for the specific hazards rather than reading for style.
 
-| reading | why it was wrong |
-|---|---|
-| **42** (architect) | `grep -c "d.set"` with an **unescaped** dot — matched `"d set"` inside prose |
-| **38** (worker) | correct pattern, wrong tool — grep counts text, not refusal sites |
-| **41** (reviewer) | five `log.zig` branches route through `setUndeclaredMessage` and carry no `d.set(` |
-| **40 branches / 41 rows** (supervisor) | row 35 *is* the helper, marked `—` |
+- **Production footprint of the entire section is 17 lines**: `src/main.zig:20-23` (registering
+  `e2e_test.zig` in the anonymous `test {}`) and `build.zig:51-63`
+  (`run_exe_tests.step.dependOn(b.getInstallStep())`). The remediation commit touched `src/e2e_test.zig`
+  and `DEVLOG.md` only — `git show 5742c43 -- src/ build.zig Makefile` confirms it. No production behaviour
+  changed in section 9 at all, which is the correct shape for a validation section.
+- **The `dependOn(getInstallStep())` line is the most valuable thing section 9 shipped**, and it is
+  load-bearing beyond this section: without it `zig build test` can validate a stale binary and print
+  green. It lives in the build graph, not in Makefile ordering, which is where it belongs. Do not let a
+  later refactor of `build.zig` drop it.
+- **No duplicated derivation.** `9.2` runs the shipped `state.zig` `derive`/`currentOutcome` fold
+  (`deriveGridFromLog`, `src/e2e_test.zig:~590`) rather than a second implementation — this was fixed
+  inside block 9A and I re-confirmed it. There is still exactly one path from records to derived state.
+- **ADR-0002 / "the log is the only state" intact across the whole change.** Summed every filesystem write
+  in production source: `src/log.zig:189` (open-or-create, `.truncate = false`, exclusive lock),
+  `:374`/`:397`/`:399` (the D11 temp file, its `errdefer deleteFile`, and the rename). Every other
+  `createFile`/`rename` hit in `src/` is inside a `test` block. No lock file, no cache, no index on disk,
+  no repair/compact/migrate path, nothing that survives the process. `build.zig.zon`'s `.dependencies` is
+  `.{}` — zero third-party, ADR-0001 intact. No MCP/JSON-RPC/daemon surface, ADR-0003 intact.
+- **No dead scaffolding.** Nothing in section 9 was superseded and left behind; `kinds_seen` was
+  deliberately retained with a documented reason, which is the opposite case.
+- **Gate coverage.** `src/e2e_test.zig` runs under the existing `make test` because of the `main.zig`
+  registration; no new stack, no new target needed, no Makefile change. Correct.
+- **Position confirmed: `8.5` is the only unticked box** (`tasks.md:104`, the sole `- [ ]`). It waits on
+  `release.yml` reaching the default branch so GitHub registers the workflow, then a real `v0.1.0` — an
+  event outside the repo, not work. Ticking it before that would assert a verification nobody performed,
+  which is the exact failure `8.5` exists to expose. The Product Owner's ruling stands unchanged.
 
-Also this section: "seven write commands" (wrong, 8A) and "294 is stale" (wrong — 293 **named** plus the one
-anonymous `test {}`). **Every number that reaches a brief, a report or a commit gets re-derived at the
-moment it is written, with an escaped pattern and a second look.** Three of the five bad numbers here were
-caught by a subordinate agent declining to make its report agree with its brief; that is the behaviour to
-preserve.
+### Required before archiving — the DEVLOG's own structure is broken
 
-### Where defects actually live — eight sections of evidence
+Not a code finding, and not a block for a worker; this is the Architect's to repair directly, since
+`## NEXT` is the one part of this file that is rewritten rather than appended. But it must be fixed
+**before** the archive, because this file *is* the deliverable from here on.
 
-1. **In branches nothing executes**, and in behaviour only the built binary shows. `9.1` is the only
-   mechanism aimed at either.
-2. **Behind coverage that cannot fail** — a fixture too small for the property to break. Section 7's lesson.
-3. **In the gap between what a task says and what its requirement means.** `7.1`–`7.4` were all built
-   correctly and the requirement still was not met.
-4. **In the second implementation of one idea.** Every extraction this project made (`fail`,
-   `matchesListFilters`, `selectCandidates`, `checkHistoryFilters`) followed a finding that two call sites
-   had drifted.
-5. **On platforms the gates never run on.** `shasum` is a macOS idiom; stock Ubuntu has only `sha256sum`.
-   `make release` would have built all three tarballs and failed on its last line, **in CI only**, at
-   `RELEASE_EXIT:0` locally every time. Found by running a container, not by a gate.
-6. **In documentation that contradicts working code.** Section 8 found five such defects and changed `src/`
-   **zero times**. A writer built from `FORMAT.md`'s field table produced a log this tool cannot derive
-   state from — in the table since `e10430f`, through five readings.
-7. **In the absence of a statement.** `8.4`'s bar — "reimplementable from this document alone" — is a claim
-   about what is *missing*, and absence is what diff review is worst at seeing. Four cold reads each found
-   exactly one more gap, which is evidence the technique finds **a** gap, not the **last** one. Only
-   enumerating every refusal site terminated.
-8. **Outside this machine.** See `8.5` above.
+**The pinned `## NEXT` heading no longer exists.** `grep -c '^## NEXT$'` returns **0**. It was `1` at
+`5f0693d` and `1` at `554c1f8`; `git diff 5f0693d 5742c43` shows the heading line at 13129 was *replaced*
+by my round-1 post rather than the post being appended before it. Consequences, both visible in the file
+as committed:
 
-### Follow-ups outside this change
+1. **The section-8-era NEXT body is orphaned and now reads as part of a supervisor verdict.** Everything
+   from `DEVLOG.md:13392` ("Sections 1–8 are CLOSED — 47 of 52 boxes ticked") through `:13537` is the old
+   `## NEXT`, sitting under the heading `## Verdict: **Request changes**` at `:13131`. It is also stale:
+   it says 47 of 52 and a test count of 294, against the current 51 of 52 and 297.
+2. **My round-1 post is filed outside `## 9.`.** Writing its verdict line as `##` (`:13131`) rather than
+   `###` closed the `## 9.` section at `:12618`; every heading after it is a sibling of the section, not a
+   child. That heading level was my error, and I am flagging it rather than quietly fixing it.
 
-- **`add-homebrew-tap`** — a `daemonicai/homebrew-tap` formula. Homebrew formulae download via `curl` and so
-  never carry `com.apple.quarantine`, and a formula's `sha256` makes checksum verification mandatory rather
-  than optional. Not `homebrew-core`: its notability thresholds won't be met and acceptance there is a
-  support obligation against D12. Separate change; D12 and `8.5` specify GitHub release tarballs only.
-- **macOS signing — parked until September 2026**, when Apple Developer program access arrives. Only
-  notarization fixes the browser-download path. **Do not** propose signing CI or further quarantine
-  mitigation before then; the `README` workaround is adequate and the real fix has a date.
-- **Nothing gates a release tag against a red tree** — the workflow will build from a tag pointing at a
-  commit whose tests fail. Supervisor, round three.
-- **`build_options.version_overridden`** exists solely to let one test skip itself on a path no gate runs;
-  under override nothing proves `build_options.version` reflects the `-Dversion` input, since both sides
-  derive from one variable.
-- **`parseArgs` maintains a hand-written flag list per command**, and `commands` is a runtime table with no
-  comptime exhaustiveness check — which is why the unreachable `not implemented yet` arm is kept. A later
-  change's call; the surface is frozen, so neither bites in this one.
-- **D13's body text never mentions `closers`**; the decision is everywhere except `## Decisions`.
+**Repair shape** (Architect, one edit, DEVLOG only): demote `:13131` to `### Verdict: …` so the round-1
+post sits inside `## 9.`; lift `:13392–13537` out from under it and reinstate a single `## NEXT` heading at
+the very bottom of the file; rewrite that NEXT from the notes below. Then verify `grep -c '^## NEXT$'` is
+exactly `1` — the standing fact at `:13531` warned about precisely this heading and it still went, which
+says the check needs running after the rewrite, not before it.
+
+### For `## NEXT`, carried into the archive
+
+- **`8.5` is the only outstanding item.** Merge `change/add-devlog-core` to `main` so `.github/` reaches
+  the default branch and GitHub registers `release.yml`; then tag a real `v0.1.0`; then tick `8.5`; then
+  archive. In that order — the tick records a verification, so it comes after the thing is verified.
+- **`v0.0.1`'s silence is the finding, not a footnote.** A tag push produced zero workflow runs because
+  GitHub had never seen the workflow. Every local check was green. Whoever runs the merge should expect
+  the first real signal at that point and treat it as the first genuine test of the release path.
+- **`make release` and `make clean` are not gates.** The gate set is `build`, `test`, `format`, `validate`,
+  `actions` → `GATES_EXIT:0`. `actions` hard-fails without `actionlint` installed.
+- **Test-count identity: named `test "…"` declarations plus the one anonymous `test {}` in `src/main.zig`.
+  Currently 296 + 1 = 297.** The previous NEXT's 294 is stale; re-derive rather than copying.
+- **Do not drop `run_exe_tests.step.dependOn(b.getInstallStep())`** (`build.zig:63`). Without it the e2e
+  suite can green-light a stale binary.
+- **Next time serialisation changes, make `9.1`'s kind check a per-kind histogram** (see the residual
+  above).
+- **`docs/notes/field-report-zerowiki.md` is still untracked** and still unaccounted for in this thread. It
+  sits inside the directory `9.4` hands over. Not this change's; do not let it reach a commit.
+- **Follow-ons, all outside this change:** the `dmon-dev` integration (`docs/handoff/dmon-dev-integration.md`,
+  including the guard-hook interaction that breaks the moment posting becomes a Bash call rather than a
+  file edit), a Homebrew tap, and the open scope question of whether the D7 status grid — which `9.2` gave
+  its first consumer outside its own unit tests — deserves a command on a surface that is otherwise frozen.
+  That last one is the Product Owner's.
+
+### What this change actually taught about where defects live
+
+Stated plainly, because it is the most transferable thing in this thread and the next reader should have
+it before they have anything else.
+
+**Every serious defect this change produced was in code that had already been reviewed and was already
+green.** Not one was a compile error, a crash, or a wrong algorithm. They were all the same species: an
+assertion, a gate, or a document that *described* a property it did not *hold*. The `>= 45` floor. The e2e
+suite that would have validated a stale binary. `9.2` folding its own grid instead of the shipped one.
+A release workflow that passed `actionlint`, resolved all three pinned actions, and could not run at all.
+
+**Three lessons, in order of how much they cost to learn:**
+
+1. **A green check and an absent check are locally indistinguishable.** This is the whole thesis. `v0.0.1`
+   produced zero workflow runs — not a failure, *nothing* — and every local signal said fine. The only
+   defence is to demand, for each assertion, the specific input that makes it fail, and then actually
+   introduce that input and watch it go red. Section 9 did this four times and it worked four times. Make
+   it routine, not ceremonial.
+2. **Coverage asserted against the producer's own bookkeeping proves nothing.** `kinds_seen` was true by
+   construction; it could not have failed. The tell is that you can state the assertion without mentioning
+   the artefact under test. When a test's claim is about a file, read the file.
+3. **A plausible rationale attached to a weak assertion is what lets it survive review.** The `>= 45` floor
+   carried a comment explaining, reasonably, that an inequality protected the test from unrelated fixture
+   edits. That comment is why a worker, a block reviewer, and a first supervisor pass all let a five-record
+   blind spot through. **Read the justification as a claim to check, not as a reason to stop checking** —
+   and prefer a self-maintaining exact value over a defended approximation, which is exactly what
+   `records_written` turned out to be.
+
+**And the finding that matters most for calibration: section 9's defect was inside the block written to
+catch that class of defect.** The end-to-end validation section shipped an end-to-end assertion that could
+not fail. There is no layer that inspects itself. That is the argument for the supervisor pass existing at
+all, and it is the reason the next phase should keep one rather than treating this change's clean close as
+evidence that block review is sufficient.
+
+Section 9 is closed. Sections 1–9 all carry a supervisor `Approve`; `8.5` and the DEVLOG structural repair
+above are the only things standing between this change and the archive.
+
+→ @architect
+
+## NEXT
+
+**[architect]** **All nine sections are CLOSED and carry a supervisor `Approve`.** **51 of 52 boxes ticked.**
+Section 9 closed on `5742c43`; section 8 on `a20afad` after four supervisor rounds; section 7 on `1216010`;
+section 6 on `606503c`; section 5 on `31eb5e3`.
+
+### The remaining path, in this order
+
+1. **Merge to `main`.** This is what registers `release.yml` with GitHub — see below.
+2. **Push a real `v0.1.0`**, and watch the run.
+3. **Tick `8.5`** (`tasks.md:104`), the only unticked box.
+4. **Archive** the change.
+
+**`8.5` is built, reviewed, gated and committed; what is missing is an event outside the repo.** A real
+`v0.0.1` push produced **nothing** — zero registered workflows, because `main` has never contained
+`.github/`, so a tag push had nothing to fire. Every local check had passed: `actionlint` clean, YAML valid,
+all three pinned actions resolving, the tag/version guard verified against three inputs. **A green gate set
+and an unrunnable release process are locally indistinguishable.** Ticking `8.5` before a real release would
+assert a verification nobody performed — which is precisely the failure `8.5` uncovered.
+
+### The DEVLOG's structure broke twice, and that is the project's own thesis
+
+This file is the hand-edited Markdown channel `devlog` exists to replace, and it was corrupted **twice**
+while building the replacement:
+
+1. A scripted `## NEXT` rewrite anchored on the first string match — which fell inside the bootstrap note,
+   not the heading — and silently deleted **364 lines** of append-only thread.
+2. A `[supervisor]` post used a `##` heading, which **consumed the `## NEXT` heading entirely** and closed
+   `## 9.` early. `grep -c '^## NEXT$'` returned **0**, and the section-8-era NEXT body sat orphaned and
+   stale in the middle of the thread — claiming 47 of 52 boxes and 294 tests against the real 51 and 297.
+   Caught by the supervisor at section close, repaired by the architect: heading demoted to `###`, orphan
+   lifted, single `## NEXT` reinstated.
+
+Neither failure is possible against an append-only JSONL log with `seq` assigned under a lock. **The tool
+was justified by its own construction process** — not as a rhetorical flourish, but because the two
+concrete incidents are exactly the failure modes the format eliminates. Whoever writes the retrospective
+should start here.
+
+### What this change actually taught about where defects live
+
+**Every serious defect was in already-reviewed, already-green code, and all were one species: an assertion,
+gate, or document describing a property it did not hold.**
+
+- The `>= 45` floor that let five records vanish, with a comment justifying the inequality as robustness.
+- An e2e suite that would have silently validated a **stale binary**, reporting green while testing old code.
+- `9.2` folding its own grid, so it could pass while the shipped D7 fold was wrong.
+- A release workflow that passed every local check and **could not run**.
+- `docs/FORMAT.md` contradicting the code on `brief`/`verdict` requiredness — in the table since `e10430f`,
+  through five readings.
+
+**Section 9's defect was inside the block written to catch that class of defect.** The end-to-end validation
+section shipped an end-to-end assertion that could not fail. **No layer inspects itself** — which is the
+argument for keeping a supervisor pass in the next phase, rather than reading this change's clean close as
+evidence that block review suffices.
+
+The only defence that worked, every time: **name the input that makes each assertion fail, and watch it go
+red.** Four independent mutations now stand behind `9.1`'s assertions.
+
+**Counting discipline.** One quantity produced four readings this change (42 → 38 → 41 → 40 branches across
+41 rows). A completeness denominator must come from the **semantic definition** of the thing counted, never
+a text search, whenever what you are counting can route through a helper. Three of the five bad numbers were
+caught by a subordinate agent declining to make its report agree with its brief; preserve that behaviour.
+
+### Carried follow-ups
+
+- **`dmon-dev` integration** — `docs/handoff/dmon-dev-integration.md` is the self-contained prompt. The
+  sharp edge is the guard hook: posting changes from a file edit to a Bash invocation, so a guard blocking
+  Bash writes stops the reviewer from reviewing, while an over-broad permit silently removes the auditor
+  boundary.
+- **`add-homebrew-tap`** — formulae download via `curl` and never carry `com.apple.quarantine`. Not
+  `homebrew-core`: notability thresholds won't be met and acceptance is a support obligation against D12.
+- **macOS signing — parked until September 2026**, when Apple Developer access arrives. Only notarization
+  fixes the browser-download path. Do not build signing CI before then.
+- **The D7 grid has no command surface.** `5.4` said *derive*, not surface, and no spec requires a command,
+  so no closed section has a gap — but `State.blocks` is computed on every read and discarded, and `9.2` is
+  its only non-test consumer. `status --blocks`, or make it lazy. A later change's call; the surface froze
+  at section 7.
+- **Nothing gates a release tag against a red tree.**
+- **`9.1`'s kind check is set-presence, not a per-kind histogram** — a serialiser that mis-kinded *some*
+  records of a kind would pass. No such conditional exists today; an `EnumMap` of counts is the fix when
+  serialisation is next touched.
+- **`build_options.version_overridden`** exists solely to let one test skip itself on a path no gate runs.
 
 ### Standing facts for a cold start
 
-- **Gates are `build`, `test`, `format`, `validate` and `actions`** — `make gates` → `GATES_EXIT:0`. The
-  `actions` gate (`actionlint`, added mid-section 8) **fails** rather than skips when `actionlint` is
-  absent, so it is a hard dependency; both refusal paths were exercised. `make release` and `make clean` are
-  **not** gates.
+- **Gates**: `build`, `test`, `format`, `validate`, `actions` — `make gates` → `GATES_EXIT:0`. The `actions`
+  gate **fails** rather than skips when `actionlint` is absent, so it is a hard dependency. `make release`
+  and `make clean` are **not** gates.
 - **Test-count identity: named `test "…"` declarations plus the one anonymous `test {}` at
-  `src/main.zig:20`.** Currently 293 + 1 = **294**. There are no other test forms in `src/`.
+  `src/main.zig:23`** — currently 296 + 1 = **297**. The anonymous test moved from `:20` when `e2e_test` was
+  wired in.
+- **Do not drop `build.zig:63`** (`run_exe_tests.step.dependOn(b.getInstallStep())`). It is what stops the
+  e2e suite validating a stale binary, and it belongs in the build graph rather than in Makefile ordering.
 - **Version is single-source**: `build.zig.zon:3` is the only semver literal in tracked source.
-- **Zig 0.16 changed `main`'s signature** — `pub fn main(init: std.process.Init) !void`; `argsAlloc` and
-  `getStdOut` are gone. Write against 0.16's API, never a remembered one.
-- Gates run **in-sandbox**; `~/.cache/zig` is on the write allowlist. A `PermissionDenied` naming `std.zig`
-  means that entry went missing, not a broken toolchain. Building anything under `~/.claude/plugins`
-  needs the sandbox disabled.
-- **Parse-ambiguity errors beat `--help`/`--version`.** Any new error condition must be placed on the
-  correct side of that line.
-- **Roles are declared per project in the `header`** (D13), which carries no role itself and also declares
-  `closers`. `orchestrator` is retired — the main session is `analyst` and `architect`.
-- **When rewriting this section, match `^## NEXT$` at start of line** — the bootstrap note contains the
-  literal string in prose. There is currently exactly one match. See the incident post.
-- **Commit the DEVLOG when a post lands, not only when a block does.** Two supervisor reviews have sat as
-  uncommitted working-tree state.
+- **Zig 0.16**: `pub fn main(init: std.process.Init) !void`; `argsAlloc` and `getStdOut` are gone.
+- Gates run **in-sandbox**; `~/.cache/zig` is on the write allowlist.
+- **Command surface frozen**: eight write, six read, fourteen entries (`src/main.zig:462-477`); seven
+  top-level `--json` shapes; every `--json` payload exactly one line.
 - **`docs/notes/field-report-zerowiki.md` is untracked** and unaccounted for anywhere in this thread. It
-  sits inside the directory `9.4` hands over. Not this change's; leave it alone, but do not let it reach a
-  commit by accident.
+  sits inside the directory `9.4` hands over. Not this change's — leave it alone, and do not let it reach a
+  commit.
+- **While a block is uncommitted, `git checkout <file>` destroys it.** Use a copy to revert a mutation
+  experiment; this cost a near-loss of the section 9 remediation.
+- **When rewriting this section, match `^## NEXT$` at start of line, and check the count is exactly 1
+  afterwards.** Both DEVLOG corruptions above came from getting this wrong.
