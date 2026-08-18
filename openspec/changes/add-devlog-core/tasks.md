@@ -101,7 +101,7 @@
       pattern and why heredocs are discouraged (D5)
 - [x] 8.4 Specify the record format in prose precisely enough to be reimplemented from the document alone
       (`durable-format`)
-- [ ] 8.5 Add the release build: statically linked tarballs for macOS arm64 and Linux x86_64/arm64,
+- [x] 8.5 Add the release build: statically linked tarballs for macOS arm64 and Linux x86_64/arm64,
       following the `memlite` pattern (D12)
 
 ## 9. End-to-end validation

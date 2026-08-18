@@ -13578,25 +13578,56 @@ above are the only things standing between this change and the archive.
 
 → @architect
 
+**[architect]** `8.5` verified and ticked. **52 of 52.** The release path is proven end to end against the
+published artefact, not against a local build.
+
+`v0.1.0` → run `32128784643` → **success**. Release carries all three tarballs plus `SHA256SUMS`. Then,
+downloading what was actually published:
+
+- `shasum -a 256 -c SHA256SUMS` → **OK** on all three.
+- macOS tarball: no `com.apple.quarantine` (fetched by tool, not a browser), `otool -L` shows
+  `/usr/lib/libSystem.B.dylib` and nothing else, contents are `devlog` + `LICENSE` + `README.md`.
+- The downloaded binary **runs and works**: `devlog --version` → `devlog 0.1.0`, and `devlog header`
+  created a log whose first line is
+  `{"kind":"header","seq":1,"ts":"…","format":1,"tool":"devlog 0.1.0","change":"smoke","roles":[…],"closers":[…]}`
+  — `format` is `1`, `tool` is `devlog <semver>`, and the `header` carries no `role`, exactly as
+  `docs/FORMAT.md` §3 and §6 specify. A published binary independently confirming the format document.
+
+**The first `v0.1.0` run failed, and the failure is the whole argument for `8.5` existing.** The tag guard
+passed and the workflow fired correctly, then `mlugg/setup-zig@v1.2.1` could not obtain the toolchain:
+every mirror **and** the official source returned 404 for `zig-linux-x86_64-0.16.0.tar.xz`. Zig `0.16.0` is
+published — but its tarball is named **arch-first**, `zig-x86_64-linux-0.16.0.tar.xz`, and `v1.2.1`
+predates that rename, so it requests a filename that exists nowhere. Fixed on `main` in `4ce822d` by
+bumping to `v2.2.1`, whose `version` input is unchanged.
+
+**Nothing local could have caught it.** `actionlint` passed. The YAML validated. All three pinned actions
+resolved to real tags — *including that one*. The pin was correct, existed, and could not work. This is the
+eighth defect class in this change's list, in its sharpest form yet: **a green gate set and an unrunnable
+release process are locally indistinguishable, and the pin intended to prevent drift is what locked in a
+version older than the toolchain it fetches.**
+
+**[architect]** The change is **complete**: nine sections, all with a supervisor `Approve`, 52 of 52 boxes,
+`v0.1.0` released and verified. Ready to archive on the Product Owner's word.
+
 ## NEXT
 
-**[architect]** **All nine sections are CLOSED and carry a supervisor `Approve`.** **51 of 52 boxes ticked.**
-Section 9 closed on `5742c43`; section 8 on `a20afad` after four supervisor rounds; section 7 on `1216010`;
-section 6 on `606503c`; section 5 on `31eb5e3`.
+**[architect]** **All nine sections are CLOSED and carry a supervisor `Approve`. 52 of 52 boxes ticked.**
+`v0.1.0` is **released and verified**. Section 9 closed on `5742c43`; section 8 on `a20afad` after four
+supervisor rounds; section 7 on `1216010`; section 6 on `606503c`; section 5 on `31eb5e3`.
 
-### The remaining path, in this order
+### Remaining: archive the change
 
-1. **Merge to `main`.** This is what registers `release.yml` with GitHub — see below.
-2. **Push a real `v0.1.0`**, and watch the run.
-3. **Tick `8.5`** (`tasks.md:104`), the only unticked box.
-4. **Archive** the change.
+Merge, release and verification are **done**. `8.5` is ticked on evidence from the published artefact —
+checksums verified, the downloaded macOS binary run, and its emitted `header` record checked against
+`docs/FORMAT.md`. The only step left is `/opsx:archive`.
 
-**`8.5` is built, reviewed, gated and committed; what is missing is an event outside the repo.** A real
-`v0.0.1` push produced **nothing** — zero registered workflows, because `main` has never contained
-`.github/`, so a tag push had nothing to fire. Every local check had passed: `actionlint` clean, YAML valid,
-all three pinned actions resolving, the tag/version guard verified against three inputs. **A green gate set
-and an unrunnable release process are locally indistinguishable.** Ticking `8.5` before a real release would
-assert a verification nobody performed — which is precisely the failure `8.5` uncovered.
+**Two release-path facts worth carrying forward**, both discovered only by running the real thing:
+
+- **A workflow must reach the default branch before GitHub registers it.** Before the merge there were
+  **zero** registered workflows, and a `v0.0.1` tag push produced no run at all — not a failure, nothing.
+- **A pinned action can be correct, resolvable, and still unusable.** `setup-zig@v1.2.1` predated Zig's
+  arch-first tarball rename and 404'd on every mirror. Fixed in `4ce822d`. When pinning, check the action
+  postdates the toolchain it fetches.
 
 ### The DEVLOG's structure broke twice, and that is the project's own thesis
 
