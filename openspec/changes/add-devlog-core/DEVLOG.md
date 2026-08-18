@@ -13126,7 +13126,268 @@ Gates: `BUILD_EXIT:0 TEST_EXIT:0 FORMAT_EXIT:0 VALIDATE_EXIT:0 ACTIONS_EXIT:0 GA
 
 → @reviewer
 
-## NEXT
+**[supervisor]** Section **9** review — scope `git diff 3c7f63f..HEAD` (`554c1f8` 9A, `5f0693d` 9B).
+
+## Verdict: **Request changes** — one blocker, in `9.1`.
+
+### Blocker — `9.1`'s eight-kind coverage is asserted against the driver's intent, not against the log
+
+`src/e2e_test.zig:516-523` iterates `record.Kind` and requires `replayed.kinds_seen.contains(k)`. But
+`kinds_seen` is **driver-side bookkeeping**: every insert (`:233`, `:322`, `:333`, `:345`, `:363`,
+`:368`, `:393`, `:418`) fires in the replay driver immediately after its own `writeCmd`/`writeItemCmd`
+returned exit 0. Nothing reads a `kind` back out of the log. So what `9.1` actually proves is *"the
+fixture's eight detection rules each matched at least one paragraph, and the binary exited 0 on each"* —
+which is a statement about `docs/example/DEVLOG.md` and about exit codes, not about the record kinds the
+tool wrote.
+
+The only assertion in `9.1` that touches the produced log is the record-count floor at
+`src/e2e_test.zig:538` (`>= 45` against an actual 50).
+
+**The failing inputs it cannot distinguish.** Both are in the exact defect class the section exists for —
+a write path that exits 0 and is wrong anyway, visible only through the built binary:
+
+- **A write command serialising the wrong `kind`.** Make `close` emit `kind: "post"`: `kinds_seen` still
+  gets `.close` (the subprocess exited 0), the record count is unchanged, `9.2` is verdict-only, and
+  `9.3` moves both its before and after outputs identically so `expectEqualStrings` (`:786`) still holds.
+  All three tests pass on a log that contains seven kinds.
+- **A write path that exits 0 without appending.** Up to **five** records can vanish and still clear the
+  `>= 45` floor. The comment at `:534-537` claims this assertion catches "a refusal partway through the
+  replay that silently truncated the log" — it catches a truncation of six or more, not a truncation.
+
+`list --json` is already parsed two lines above (`:531-533`); the fix reads the kinds off the array that
+is already in hand. This is the one assertion the section's own task text names ("producing a log covering
+every record kind") and it is currently the only one of the three whose headline claim isn't verified end
+to end — `9.2` and `9.3` both pass this bar (see below), which is what makes `9.1` the outlier rather than
+a general weakness.
+
+**Remediation shape** (one fix block, `src/e2e_test.zig` only — no `src/` production code, no `Makefile`,
+no new tasks):
+
+1. In `9.1`, build an `EnumSet(record.Kind)` from the `kind` field of each element of the already-parsed
+   `list --json` array, and assert it contains all eight. Keep the `kinds_seen` loop as well — it is a
+   real check that the fixture's detection rules all fire, which is a different (and also useful) claim;
+   just stop it being the *only* one.
+2. Replace the `>= 45` floor with an exact count the driver already knows: `Ctx` can carry a
+   `records_written` counter incremented in `writeCmd`/`writeItemCmd`/`writeHeader`, and `9.1` asserts
+   `parsed.value.array.items.len == records_written`. That makes "silently truncated" true of the
+   comment. If an exact count is judged too brittle, delete the truncation claim from the comment instead
+   — but the counter is free and strictly better.
+3. State in the DEVLOG post what input makes each new assertion fail, per the standing hazard in
+   `## NEXT`.
+
+### What I verified and am **not** asking to change
+
+- **`9.3` is sound, and its bound is airtight rather than loose** — I re-derived this rather than taking
+  the reviewer's word. `expectEqualStrings(base_result.stdout, grown_result.stdout)`
+  (`src/e2e_test.zig:786`) is the strongest bound available, and the noise is constructed so that three
+  distinct linear-in-history bugs each break it: leaking open items regardless of role surfaces the 300
+  reviewer items (`:754-762`), leaking closed items surfaces the 100 worker items (`:763-775`), and any
+  recency/history echo in the payload surfaces the 400 posts (`:743-752`). The `> before_stat.size * 3`
+  guard (`:779`) is a genuine measurement — `before_stat` on the original, `after_stat` on the grown copy
+  — and it exists to stop the identity assertion passing vacuously on a corpus that never grew. Answering
+  the brief's question directly: a `resume` that grew linearly **would** breach this, on any of those
+  three paths. Byte identity also survives a zero-item baseline, so it is non-vacuous for
+  `reviewer`/`supervisor` too.
+- **`9.2` is genuinely tool-derived on both sides after the reviewer's finding was addressed.**
+  `deriveGridFromLog` (`:551-580`) runs `state.zig`'s shipped `derive` over the log the binary produced,
+  so the latest-wins assertion at `:645-654` fails if the shipped fold is changed to first-wins — proved
+  by mutation, on record. The fixture side (`foldGrid`, `:484-498`) folds the driver's own record of what
+  it queued, which never touched the tool's derivation, so this is not one derivation implemented twice.
+- **The replay drives the shipped binary end to end.** `requireBinaryBuilt` (`:70`) + `runDevlog` (`:99`)
+  spawn `zig-out/bin/devlog`; bodies go in as a real file on the child's stdin (`writeStdinFile`, `:156`),
+  so D5's path is exercised for real rather than simulated.
+- **`build.zig:51`'s `run_exe_tests.step.dependOn(b.getInstallStep())` is the most valuable line in the
+  section.** Without it the suite validated whatever binary happened to be installed. It fixes the defect
+  in the build graph rather than by Makefile target ordering, so it holds for a bare `zig build test` —
+  correct call, and correctly kept out of the `Makefile`.
+- **`9.4`'s handoff document does not lead a reader toward an over-broad permit.** Item 3
+  (`docs/handoff/dmon-dev-integration.md:36-51`) names *both* failure directions explicitly and rules out
+  the dangerous one in the same breath — "A guard that is loosened to 'just allow Bash' removes the
+  confinement entirely" — then prescribes the correct shape: recognise and permit the eight `devlog`
+  *write* subcommands specifically while continuing to block git writes, `tasks.md`, the `Makefile`,
+  `CLAUDE.md`/`.claude/`, and agent spawning. It also names the four `dmon-dev` paths, tells the reader to
+  verify line counts against their own tree rather than trusting the document, refuses to invent the
+  migration version, and points at `docs/FORMAT.md` as normative instead of restating field shapes. An
+  agent can act on this without guessing. No finding.
+- **Binding invariants intact across the section.** No `build.zig.zon` change, no third-party dependency,
+  no MCP/daemon surface, no repair/compact/truncate path, no new persisted state — the only files written
+  are the tests' own scratch stdin files and the grown log copy under `.zig-cache/tmp`, torn down by
+  `Replayed.cleanup`/`tmp.cleanup()` on every path. `docs/example/DEVLOG.md` unmodified. Bodies still
+  verbatim. `e2e_test.zig` reaches the binary only through `main.zig`'s `test` block, so nothing of it is
+  in the shipped executable.
+
+### ❓ @architect / Product Owner — `state.zig`'s D7 fold, my reading
+
+You asked for a position. Mine: **leave it, and record the cost — it is neither dead scaffolding nor a
+missing command.**
+
+- **No requirement is unmet.** `5.4` says "*Derive* the per-block status grid by folding `verdict`
+  records" — a derivation task, ticked correctly. `design.md:154` frames the grid as "a fold over verdict
+  records", i.e. a rule, not a CLI feature, and **no requirement in `openspec/changes/add-devlog-core/specs/`
+  mandates a command that surfaces it**. I checked; the only `specs/` mention of "status grids" is
+  `next-state/spec.md:27`, which forbids restating them in `next`. So this is not a gap in a closed
+  section.
+- **It is not dead scaffolding.** Dead scaffolding is a superseded placeholder. This is the normative
+  implementation of a documented decision, it is unit-tested, and as of `9.2` it has an end-to-end
+  consumer exercising it against a real log. A client that wants the grid has everything it needs from
+  `list --kind verdict --json` plus D7's rule, which `docs/FORMAT.md` states.
+- **But it is not free, and that is the part worth recording.** `State.blocks` is computed on *every*
+  read command and then discarded — `runStatus` (`src/main.zig:2068-2079`) calls `state_mod.derive` and
+  surfaces only `currentNext()` and the open-item index; `grep` confirms the only reference to `.blocks`
+  or `currentOutcome` outside `state.zig` in all of `src/` is `src/e2e_test.zig:571,575`. So today every
+  `status`, `resume` and `show` invocation pays for a fold nobody reads.
+
+That is a later change's call (surface it as `status --blocks`, or make it lazy), not this section's — the
+command surface froze at the end of section 7 and reopening it here would be scope creep. Noted for
+`## NEXT` below.
+
+### The change-level position
+
+I agree **`8.5` is the only thing outstanding**. Every other box in `tasks.md` is ticked, sections 1–8 all
+carry a supervisor `Approve`, and `8.5`'s code is built, reviewed, gated and committed — what is missing is
+an *event outside the repo* (`release.yml` reaching the default branch so GitHub registers the workflow,
+then a real `v0.1.0`), not work. The Product Owner's ruling that it is ticked immediately before archiving,
+after that release, is the right shape: ticking it earlier would assert a verification nobody has
+performed, which is the precise failure `8.5` existed to expose. Nothing in section 9 changes that
+position, and section 9 introduces no new outstanding item of its own beyond the blocker above.
+
+### Process note (not a blocker)
+
+The 9B thread ends on `→ @reviewer` after the worker's nit fix, with no recorded second-pass reviewer post,
+yet `5f0693d` committed. The reviewer's verdict was already **Approve with nits** and the fix was wording
+only, so the block was properly signed off — but the thread as it stands reads as an open handoff. Worth a
+line closing it so the archived record isn't ambiguous.
+
+→ @architect
+
+**[architect]** Supervisor requests changes on section 9. Carving a **remediation block** (§3c.3): no new
+`N.M` numbers, nothing ticked, nothing untickeds. → @worker
+
+**The finding is the best one this project has produced, and it lands in the block written to prevent it.**
+`9.1` asserts eight-kind coverage against **the replay driver's own bookkeeping**, not against the log the
+binary produced. I verified it: every `kinds_seen.insert` (`src/e2e_test.zig:233, :322, :333, :345, :363,
+:368, :393, :418`) fires in the driver immediately after its `writeCmd` returned exit 0. Nothing ever reads
+a `kind` back out of the log. The check at `:516-523` therefore asserts **what the driver intended to
+write**, which is true by construction.
+
+The only assertion touching the produced log is the floor at `:538`, `parsed.value.array.items.len >= 45`
+against an actual 50.
+
+**Two failing inputs it cannot distinguish**, both squarely in the class this section exists to catch:
+
+1. **A write command serialising the wrong kind.** Make `close` emit `kind: "post"` and all three tests
+   still pass — `kinds_seen` still receives `.close`, the count is unchanged, `9.2` is verdict-only, and
+   `9.3`'s before/after shift identically so its byte-for-byte identity still holds.
+2. **A write path that exits 0 without appending.** Up to **five** records can vanish under the `>= 45`
+   floor — while the comment at `:534-537` claims the assertion catches silent truncation.
+
+**Note what the comment did.** It justifies the inequality as protecting the test from unrelated fixture
+prose edits. That is a *reasonable* rationale, and it produced a five-record blind spot in the one assertion
+guarding against records not being written. This is `## NEXT` defect class 2 — coverage that cannot fail —
+arriving with a plausible explanation attached, which is why it survived a worker, a block reviewer, and me.
+
+**The fix** (`src/e2e_test.zig` only, no other file):
+
+- **Derive coverage from the log.** Build an `EnumSet(record.Kind)` from the `kind` field of each element of
+  the `list --json` array **already parsed** at `:531-533`, and assert all eight are present. This is the
+  assertion `9.1` was supposed to make.
+- **Replace the floor with an exact count.** Add a `records_written` counter to `Ctx`, incremented once per
+  successful write, and assert the parsed array length equals it. The count becomes self-maintaining, so the
+  brittleness the comment feared does not apply — a fixture edit moves both sides together.
+- **Keep the `kinds_seen` loop.** It is a valid and separate claim: that every one of the fixture's
+  paragraph-detection rules fired at least once. Say so in the comment, so the two assertions are not later
+  mistaken for duplicates and one deleted.
+- **Rewrite the comment at `:534-537`.** It currently asserts a property the code does not have.
+
+**Then prove the fix rather than asserting it.** Demonstrate both failing inputs are now caught: temporarily
+make a write emit the wrong `kind`, and temporarily make one write path return success without appending.
+Show each turns the suite red, revert both, and quote the exit lines. **If either does not fail, the fix is
+not done** — report that rather than adjusting the test until it goes green.
+
+**Also close the 9B thread.** It ends on `→ @reviewer` with no recorded second-pass post, though the verdict
+was already Approve-with-nits and the fix was wording only. Post one line under `## 9.` closing it, so the
+archived record is unambiguous.
+
+**Scope**: `src/e2e_test.zig` and your DEVLOG posts. No `src/` production code, no `Makefile`, no
+`tasks.md`, no `docs/`. Do not touch `docs/notes/`.
+
+**Done-gates**: `make gates` → `GATES_EXIT:0`, every exit line quoted, and the test count (expect **297** —
+296 named + 1 anonymous at `src/main.zig:23`; this block should add no tests). Post to `## 9.` as
+`[worker]`, hand off `→ @reviewer`.
+
+**[worker]** 9B thread closed: the reviewer's Approve-with-nits stands as final. The worker's fix was
+wording only (the nit at `docs/handoff/dmon-dev-integration.md:136`), no facts restated or expanded, so
+no second-pass reviewer post was needed. Closing it here so the archived record is unambiguous.
+
+**[worker]** Remediation for the supervisor's `9.1` finding (`kinds_seen` true by construction). Fixed
+`src/e2e_test.zig` only:
+
+- Built an `EnumSet(record.Kind)` from the `kind` field of each element of the already-parsed
+  `list --json` array, asserting all eight kinds present in the **produced log** — the check `9.1` was
+  missing.
+- Added a `records_written` counter to `Ctx`, incremented once per successful `writeCmd`/`writeItemCmd`/
+  `writeHeader` call; replaced the `>= 45` floor with exact equality against the parsed array length.
+  Self-maintaining — a fixture prose edit now moves both sides together instead of leaving a blind spot.
+- Kept the `kinds_seen` loop — a separate, valid claim (each of the fixture's paragraph-detection rules
+  fired at least once) — and commented both checks so they aren't later mistaken for duplicates.
+- Rewrote the stale comment that claimed the old floor caught truncation.
+
+**Proved, not asserted — two failing inputs, both now caught:**
+
+1. Temporarily patched `record.zig`'s `write()` to force `close` records to serialise `kind: "post"`.
+   `zig build test` went red: `e2e_test.zig:573` failed, `missing record kind from produced log: close`
+   (plus collateral failures elsewhere, since the tamper is global — expected for a shared serialiser).
+   Reverted; `git diff src/record.zig` clean.
+2. Temporarily patched `main.zig`'s `runPost` to return 0 without calling `log.appendRecord`.
+   `zig build test` went red: `9.1` failed, `missing record kind from produced log: post`
+   (291 pass, 5 fail, 1 crash / 297). Reverted; `git diff src/main.zig` clean.
+
+Test count unchanged: 296 named + 1 anonymous = **297** — no new tests, per brief.
+
+**Gates** (clean tree): `rm -rf zig-out .zig-cache && make gates` →
+`BUILD_EXIT:0 TEST_EXIT:0 FORMAT_EXIT:0 VALIDATE_EXIT:0 ACTIONS_EXIT:0 GATES_EXIT:0`.
+
+→ @reviewer
+
+**[reviewer]** Verdict on the section 9 remediation block: **Approve.**
+
+Audited `src/e2e_test.zig` only (the DEVLOG post above and this reply are the only other change).
+`git diff src/record.zig src/main.zig` is empty — confirmed. Ran the gates myself on a clean tree:
+`BUILD_EXIT:0`, `FORMAT_EXIT:0`, `VALIDATE_EXIT:0`, and `TEST_EXIT:0` on a forced rebuild
+(`rm -rf .zig-cache zig-out && zig build test`, 296 pass / 297 total) — the worker's exit lines check out.
+
+**Reproduced the defect being fixed, on a scratch copy of the tree (not the reviewed one — auditor
+boundary), with a mutation neither the worker nor the supervisor used on record**: removed
+`self.records_written += 1;` from `writeHeader` (`src/e2e_test.zig:242`), forced a clean `zig build test`.
+Result: `9.1` failed — `expected 49, found 50` at `e2e_test.zig:576`, 296 pass / 1 fail / 297 total. Confirms
+the equality assertion is live, not vacuous, on a third input class (an under-counted `records_written`)
+beyond the two the worker already proved (wrong `kind` serialised; a write that exits 0 without appending).
+Discarded the scratch copy; `git status` on the real tree is unchanged before and after
+(`.claude/settings.json`, `DEVLOG.md`, `src/e2e_test.zig` modified; `docs/notes/` untracked — as given).
+
+**Checks from the brief:**
+
+1. **`records_written` increment paths** (`file:line`) — `writeCmd` (`:204`), `writeItemCmd` (`:221`),
+   `writeHeader` (`:242`) are the only three call sites (`grep -n runDevlog`), each increments exactly
+   once, immediately after `try expectSuccess(...)` — so a non-zero exit returns via the error before the
+   increment runs, and no path double-counts (`writeHeader` is called exactly once, `:386`). Matches the
+   log's record count with no over- or under-count I could find.
+2. **`kinds_seen` retained as a distinct claim** — yes. The rewritten comment at `:522-533` explicitly
+   separates the two: `kinds_seen` is "a claim about the *driver*... not the log," the new loop is "the
+   separate, log-derived check below," and it spells out why they aren't duplicates despite both walking
+   all eight kinds. Clear enough that a future reader pruning "duplicate" coverage would have to ignore an
+   explicit sentence saying they aren't.
+3. **Rewritten comment accuracy** — checked against the code it describes. `:534-552` says the kind check
+   reads `kind` back from `list --json` (matches `:566-573`) and that the count assertion catches "a write
+   path that exits 0 without appending" via exact equality (matches `:577` and the worker's proof #2). No
+   overclaim left — this is the property the previous comment (`>= 45` floor) asserted without having.
+4. **9B closure** — posted, `:13318-13320`, one line, states the reviewer's original Approve-with-nits
+   stands and why no second-pass review was needed. Matches the actual history (`docs/handoff/dmon-dev-integration.md:136`
+   wording fix only).
+
+No blockers, no nits.
+
+→ @architect
 
 **[architect]** **Sections 1–8 are CLOSED** — **47 of 52 boxes ticked**. Section 8 closed on `a20afad` after
 **four supervisor rounds**; section 7 on `1216010`; section 6 on `606503c`; section 5 on `31eb5e3`.

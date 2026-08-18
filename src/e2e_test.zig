@@ -182,6 +182,12 @@ const Ctx = struct {
     log_path: []const u8,
     kinds_seen: std.EnumSet(record.Kind) = .initEmpty(),
     expected_verdicts: std.ArrayList(VerdictTriple) = .empty,
+    /// Incremented once per write command that returned exit 0 — the
+    /// independent count 9.1 checks the produced log against, so a write
+    /// path that exits success without actually appending (nothing else
+    /// here reads a record back out of the log to catch that) diverges
+    /// from `list --json`'s length instead of passing silently.
+    records_written: usize = 0,
 
     fn writeCmd(self: *Ctx, role: Role, cmd: []const u8, extra: []const []const u8, body: []const u8) !void {
         var argv: std.ArrayList([]const u8) = .empty;
@@ -195,6 +201,7 @@ const Ctx = struct {
         var result = try runDevlog(self.allocator, self.io, argv.items, stdin_file);
         defer result.deinit(self.allocator);
         try expectSuccess(result, cmd);
+        self.records_written += 1;
     }
 
     /// `item` is the one write command whose stdout is load-bearing: the
@@ -211,6 +218,7 @@ const Ctx = struct {
         var result = try runDevlog(self.allocator, self.io, argv.items, stdin_file);
         defer result.deinit(self.allocator);
         try expectSuccess(result, "item");
+        self.records_written += 1;
 
         const trimmed = std.mem.trim(u8, result.stdout, " \t\r\n");
         if (trimmed.len < 2 or trimmed[0] != '#') return error.UnexpectedItemOutput;
@@ -231,6 +239,7 @@ const Ctx = struct {
         defer result.deinit(self.allocator);
         try expectSuccess(result, "header");
         self.kinds_seen.insert(.header);
+        self.records_written += 1;
     }
 };
 
@@ -452,6 +461,7 @@ const Replayed = struct {
     log_path: []const u8,
     kinds_seen: std.EnumSet(record.Kind),
     expected_verdicts: std.ArrayList(VerdictTriple),
+    records_written: usize,
 
     fn cleanup(self: *Replayed) void {
         self.tmp.cleanup();
@@ -478,6 +488,7 @@ fn setupReplay(allocator: Allocator, arena: Allocator, io: Io) !Replayed {
         .log_path = log_path,
         .kinds_seen = ctx.kinds_seen,
         .expected_verdicts = ctx.expected_verdicts,
+        .records_written = ctx.records_written,
     };
 }
 
@@ -509,34 +520,61 @@ test "9.1: replaying docs/example/DEVLOG.md through the built binary covers ever
     var replayed = try setupReplay(allocator, arena, testing.io);
     defer replayed.cleanup();
 
-    // All eight kinds, asserted explicitly — never assumed from the
-    // fixture's size. What would make this fail: any single kind's
-    // detection rule above matching zero paragraphs (e.g. the fixture no
-    // longer contains a literal "Verdict on block").
+    // `kinds_seen`: a claim about the *driver*, not the log — each insert
+    // fires in `handleParagraph`/`writeHeader` the moment the fixture's
+    // paragraph-detection rule matched and the write returned exit 0, so
+    // this loop asserts every one of the fixture's eight paragraph-shape
+    // rules fired at least once (e.g. some paragraph really did open with
+    // "Verdict on"). It says nothing about what actually landed in the
+    // log — that is the separate, log-derived check below — so the two
+    // are not duplicates of each other despite both mentioning all eight
+    // kinds. What would make this fail: a detection rule's pattern no
+    // longer matching anything in the fixture text.
     inline for (@typeInfo(record.Kind).@"enum".fields) |f| {
         const k = @field(record.Kind, f.name);
         if (!replayed.kinds_seen.contains(k)) {
-            std.debug.print("missing record kind from replay: {s}\n", .{f.name});
+            std.debug.print("missing record kind from replay driver: {s}\n", .{f.name});
             return error.RecordKindNotCovered;
         }
     }
 
-    // The replay produced a real, non-trivial log — driven by the built
-    // binary end to end, body on stdin, one record per invocation. What
-    // would make this fail: a refusal partway through the replay that
-    // silently truncated the log (every write above already checks its
-    // own exit code, but this is the outside view of the same thing).
+    // The log-derived claim: read back what the binary actually wrote,
+    // via `list --json`, and check both that every kind is *present in
+    // the log itself* (not merely attempted by the driver — this is what
+    // would catch a write command serialising the wrong `kind`, e.g.
+    // `close` emitting `"kind":"post"`, which `kinds_seen` above cannot
+    // see since it is set from which branch the driver took, not from
+    // anything read back) and that the record *count* matches exactly how
+    // many writes succeeded (`records_written`, incremented once per
+    // `writeCmd`/`writeItemCmd`/`writeHeader` call that returned exit 0).
+    // What would make the count assertion fail: a write path that exits 0
+    // without appending — the count read back would fall short of
+    // `records_written` instead of merely clearing a floor that a
+    // truncated replay could still clear.
     var result = try runDevlog(allocator, testing.io, &.{ "--log", replayed.log_path, "list", "--json" }, null);
     defer result.deinit(allocator);
     try expectSuccess(result, "list");
     var parsed = try std.json.parseFromSlice(std.json.Value, allocator, result.stdout, .{});
     defer parsed.deinit();
-    // 1 header + 1 next + one record per role-tagged paragraph in the
-    // fixture (48, `grep -c "^\*\*\["`) = 50. Asserted as an inequality,
-    // not the exact count, so an unrelated future edit to the fixture's
-    // prose doesn't make this test brittle — the floor is what matters:
-    // a truncated replay, not an exact match.
-    try testing.expect(parsed.value.array.items.len >= 45);
+
+    var kinds_in_log: std.EnumSet(record.Kind) = .initEmpty();
+    for (parsed.value.array.items) |rec| {
+        const kind_str = rec.object.get("kind").?.string;
+        const k = std.meta.stringToEnum(record.Kind, kind_str) orelse {
+            std.debug.print("unrecognised kind in produced log: {s}\n", .{kind_str});
+            return error.RecordKindNotCovered;
+        };
+        kinds_in_log.insert(k);
+    }
+    inline for (@typeInfo(record.Kind).@"enum".fields) |f| {
+        const k = @field(record.Kind, f.name);
+        if (!kinds_in_log.contains(k)) {
+            std.debug.print("missing record kind from produced log: {s}\n", .{f.name});
+            return error.RecordKindNotCovered;
+        }
+    }
+
+    try testing.expectEqual(replayed.records_written, parsed.value.array.items.len);
 }
 
 // --- 9.2 ---------------------------------------------------------------------
