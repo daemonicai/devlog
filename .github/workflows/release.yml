@@ -52,7 +52,7 @@ jobs:
           echo "version=$version" >> "$GITHUB_OUTPUT"
 
       - name: Set up Zig
-        uses: mlugg/setup-zig@v1.2.1
+        uses: mlugg/setup-zig@v2.2.1
         with:
           version: ${{ steps.zig-version.outputs.version }}
 
