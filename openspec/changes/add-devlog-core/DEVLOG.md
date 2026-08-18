@@ -12969,6 +12969,163 @@ Block 9A's `Approve` stands; the architectural note is closed.
 
 → @architect
 
+**[architect]** Brief — block **9B** (`9.4`), the `dmon-dev` handoff. → @worker
+
+**Deliverable**: `docs/handoff/dmon-dev-integration.md` (new; `docs/handoff/` does not exist yet). It is a
+**self-contained prompt for an agent to run in the `dmon-dev` repo** — not a summary for a human, and not
+notes for us. Write it as instructions to that agent.
+
+**Hard boundary: make no edits to `dmon-dev`.** It is a sibling working directory and you may **read** it to
+be accurate, but every change there is that agent's to make, in its own repo, with its own history and
+memories that this session does not have. If you find yourself wanting to fix something over there, describe
+it in the document instead.
+
+**The bootstrap this closes.** This change exists to replace the hand-edited `DEVLOG.md` with a tool, and
+was itself built using the mechanism it replaces. `9.4` is what lets `dmon-dev` stop hand-editing. So the
+document's job is not "here is what devlog does" — it is **"here is what you must change, and why, and what
+will break if you get it wrong."**
+
+**What the receiving agent actually has to change** — I inspected the sibling repo; name these paths:
+
+- `plugins/dmons/skills/devlog/SKILL.md` (133 lines) — the skill that maintains `DEVLOG.md` today. It becomes
+  a skill that shells out to the binary.
+- `plugins/dmons/skills/scaffold/templates/worker.md.template`, `reviewer.md.template`,
+  `supervisor.md.template`, `CLAUDE.md.template` — every role prompt that tells an agent to write to
+  `DEVLOG.md`.
+- `plugins/dmons/skills/scaffold/templates/dmons-guard.sh.template` — **the one with teeth.** Today it
+  confines the auditors to writing `DEVLOG.md` and nothing else, which works because posting *is* a file
+  edit. Under `devlog`, posting is a **Bash invocation**, so a guard that blocks Bash writes now blocks the
+  reviewer from reviewing. Whoever changes this must permit `devlog` write subcommands while still blocking
+  git writes, `tasks.md`, the `Makefile` and agent spawning. Getting this wrong either breaks the workflow or
+  silently removes the boundary — say so plainly.
+- `plugins/dmons/skills/update-scaffold/migrations/` — the repo versions its scaffold migrations
+  (`0.3.0`…`0.5.1`). Adopting `devlog` is a scaffold change and needs a new migration, so already-scaffolded
+  repos can move. Do not invent the version number; tell the agent to pick the next one.
+
+**What the document must carry** (ground truth is this repo, not memory — verify each):
+
+1. **The command surface**: eight write commands, six read, fourteen entries in `commands`
+   (`src/main.zig:462-477`). List them with their required flags.
+2. **The record format**: point at `docs/FORMAT.md` as normative rather than restating it. Say it is written
+   to be reimplementable from itself — the receiving agent does not need to read `src/`.
+3. **Bodies on stdin (D5)**: the scratch-file-then-redirect pattern, why heredocs are discouraged, and the
+   two refusals — stdin being a terminal, and a whitespace-only body. This changes how every role posts, so
+   it is the single most behaviour-affecting item for the skill rewrite.
+4. **The `--json` contract**: seven top-level shapes, **every payload exactly one line**, the newline is the
+   caller's. This is what a plugin parses.
+5. **Three warnings, not facts** — from `## NEXT`, and phrase them as things that will bite:
+   - **ignore the temp-name pattern**; consumers inherit the orphan risk with none of this repo's
+     `.gitignore` mitigation;
+   - **`search` is bounded by default and `list --json` deliberately is not** — assume uniform bounding and
+     you silently truncate a `list`, or paginate an already-bounded `search`;
+   - **`--limit` takes bare digits** — a `%02d`-style formatter emitting `05` gets a refusal, not a silent
+     success.
+6. **Roles are declared per project in the `header` (D13)**, and `closers` too. `dmon-dev`'s four roles are
+   not built in; the plugin must run `devlog header` and declare them. An undeclared role is refused.
+7. **Install reality, stated honestly**: there is no published release yet. `v0.1.0` has not shipped, the
+   release workflow has never run, and on macOS a browser-downloaded tarball is killed by Gatekeeper with no
+   message (use `curl`, or `xattr -d com.apple.quarantine`). macOS 13+. Do not let the document imply
+   `brew install devlog` or a downloadable binary exists today.
+
+**What it must NOT do**: restate `docs/FORMAT.md`, speculate about `dmon-dev`'s internals beyond the paths
+above, or prescribe the exact wording of that repo's skill and prompts. Give the receiving agent the
+constraints and the reasons; it knows its own repo better than we do.
+
+**Done-gates**: `make gates` -> `GATES_EXIT:0`, every exit line quoted. Test count should stay **297** (296
+named + 1 anonymous at `src/main.zig:23`) — this is a docs block. Post to `## 9.` as `[worker]`, hand off
+`-> @reviewer`.
+
+**[worker]** Block **9B** (`9.4`) done. Wrote `docs/handoff/dmon-dev-integration.md` — a self-contained
+prompt for an agent working in `dmon-dev`, not a summary. It names the four paths from the brief
+(`skills/devlog/SKILL.md`, the four scaffold templates, `dmons-guard.sh.template` with the Bash-vs-file-edit
+consequence spelled out, `update-scaffold/migrations/`), and carries all seven items: the 14-command surface
+split write/read with required flags (`src/main.zig:462-477` plus each `*_usage` block); points at
+`docs/FORMAT.md` as normative rather than restating it; the stdin body pattern (D5) with both refusals
+(terminal, empty/whitespace-only) and why heredocs are discouraged; the `--json` one-line-per-payload
+contract; the three `## NEXT` warnings (temp-name/gitignore orphan risk, `search` bounded vs `list --json`
+unbounded, `--limit` bare-digits-only); `header`'s per-project role/closer declaration (D13) and its
+idempotent-on-unchanged-identity behaviour; and install reality (no `v0.1.0` release yet, Gatekeeper kill +
+`xattr` fix, macOS 13+) stated as a caveat rather than implying a working install path. Confirmed the hard
+boundary held — no edits made under `/Users/rendle/github/daemonicai/dmon-dev`, only reads for accuracy.
+Left `docs/notes/field-report-zerowiki.md` untouched per the standing note above.
+
+Gates: `BUILD_EXIT:0 TEST_EXIT:0 FORMAT_EXIT:0 VALIDATE_EXIT:0 ACTIONS_EXIT:0 GATES_EXIT:0`. Test count
+unchanged (docs-only block).
+
+→ @reviewer
+
+**[reviewer]** Block **9B** (`9.4`) — **Approve with nits**.
+
+Verified every factual claim in `docs/handoff/dmon-dev-integration.md` against this repo's own source
+rather than the brief's paraphrase, and checked the sibling repo's paths and current guard mechanics for
+accuracy. Everything checked out:
+
+- **Command surface** (item 1): 14 entries in `commands` (`src/main.zig:462-477`), 8 write / 6 read,
+  matches the doc's table exactly. Required-flag claims verified per command against each `*_usage`
+  block — `header` (`src/main.zig:59-83`), `section` (106), `brief` (127), `item` (148), `close` (174),
+  `verdict` (202), `next` (225), and the read commands `show` (244), `resume` (263), `list` (305),
+  `refs` (347), `search` (369) — all match, including `post`/`next` correctly having no required flags.
+- **Format pointer** (item 2): points at `docs/FORMAT.md` as normative (`docs/handoff/dmon-dev-integration.md:60-65,103-107`)
+  and does not restate field shapes.
+- **Stdin/D5** (item 3): terminal refusal and empty/whitespace-only refusal both stated
+  (`docs/handoff/dmon-dev-integration.md:123-129`), matching `src/body.zig:52-77` and its `isTty`/blank
+  checks, including the correct "not trimming" nuance the code actually implements
+  (`src/body.zig:23-28`).
+- **`--json` contract** (item 4): "seven distinct top-level shapes" and "every payload exactly one
+  line" (`docs/handoff/dmon-dev-integration.md:137-146`) match `docs/FORMAT.md:327,358` verbatim.
+- **Three warnings** (item 5): temp-name pattern `.<basename>.tmp-<32 hex chars>` matches
+  `src/log.zig:84,289,299`; the claim that `dmon-dev` has no matching `.gitignore` entry verified true
+  against the sibling repo; `search` bounded/`list --json` unbounded and the `--limit` bare-digits rule
+  both match `src/main.zig:412-415,2574-2575` and the `search_usage` text.
+- **Roles/closers, D13** (item 6): `header`'s required `--role`/`--closer` (≥1 each), the "every closer
+  must also be a role" rule, and the guardrail-not-enforcement framing all match
+  `src/main.zig:1138`, `src/log.zig:733-734`, and `header_usage`.
+- **Install reality** (item 7): no-release, Gatekeeper exit 137 with no message, `xattr -d
+  com.apple.quarantine` fix, macOS 13+ — all consistent with the recorded verification under `## NEXT`
+  (`openspec/changes/add-devlog-core/DEVLOG.md:11373-11397,11529`), and the doc does not imply
+  `brew install` or a downloadable binary exists.
+
+**Guard-hook section** (`docs/handoff/dmon-dev-integration.md:40-51`): checked against
+`dmon-dev`'s actual `plugins/dmons/skills/scaffold/templates/dmons-guard.sh.template`. The current
+auditor confinement is file-based (`BASE != DEVLOG.md`, template line ~102), not Bash-based — the
+document's framing that this "works because posting *is* a file edit" and will stop working once
+posting becomes a Bash call is accurate, not a mischaracterization of the current hook. Both failure
+directions are stated explicitly and distinctly: blocking Bash wholesale breaks the reviewer's own
+posting, and a blanket Bash allowance removes the confinement — matches the two failure modes actually
+possible under the hook's existing `case "$TOOL"` structure (`dmons-guard.sh.template:53-73`). This is
+the one item the brief called "the one with teeth" and it is the best-argued section in the document.
+
+**Boundary check**: `src/`, `Makefile`, `openspec/changes/add-devlog-core/tasks.md` are untouched
+(`git diff --stat` shows only `DEVLOG.md` plus the unrelated `.claude/settings.json`). The document
+never instructs a reader to edit anything in this repo, and explicitly tells the receiving agent to
+make every change in `dmon-dev`'s own repo (`docs/handoff/dmon-dev-integration.md:6`). The sibling
+`dmon-dev` working tree is clean — no edits landed there either.
+
+**Nit** — `docs/handoff/dmon-dev-integration.md:136`: "Six read commands (all but `search`'s underlying
+shape differs slightly — see below) accept `--json` and emit..." is a broken sentence — the parenthetical
+isn't a grammatical unit and forces a re-read to recover the intended meaning ("`search`'s shape differs
+slightly, covered below"). Not a factual error — `search`'s object shape vs. the other five's bare-array
+shape is correctly explained two paragraphs later — but this is a document whose whole job is being
+followed without a human editor in the loop, so a sentence a reader has to parse twice is worth fixing.
+Suggest: "Six read commands accept `--json` and emit the same derived answer as the rendered text form,
+as JSON instead (`search`'s shape differs slightly from the other five — see below)."
+
+No blockers. Architectural notes: none beyond the nit above — item 3 (guard hook) is exactly the kind of
+document a `dmon-dev`-side reviewer will need to hold this repo's diff against later, and it does that
+job.
+
+→ @architect
+
+**[worker]** Fixed the nit. `docs/handoff/dmon-dev-integration.md`'s `--json` section now reads: "All six
+read commands accept `--json` and emit the same derived answer as the rendered text form, as JSON
+instead — though `search`'s underlying shape differs slightly from the other five, as explained below.
+There are **seven** distinct top-level shapes across the read surface..." Wording only — no facts
+restated or expanded.
+
+Gates: `BUILD_EXIT:0 TEST_EXIT:0 FORMAT_EXIT:0 VALIDATE_EXIT:0 ACTIONS_EXIT:0 GATES_EXIT:0`.
+
+→ @reviewer
+
 ## NEXT
 
 **[architect]** **Sections 1–8 are CLOSED** — **47 of 52 boxes ticked**. Section 8 closed on `a20afad` after
