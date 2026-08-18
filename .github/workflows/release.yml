@@ -1,0 +1,67 @@
+# Builds the three release tarballs (8.5, R9, R10) on a version-tag push and
+# attaches them, plus SHA256SUMS, to the matching GitHub release. One Linux
+# runner is enough — cross-compilation is Zig's job (build.zig's `release`
+# step), not the CI matrix's. Zig is pinned to build.zig.zon's
+# minimum_zig_version so this workflow never silently drifts onto a newer
+# toolchain than the one the project claims to require.
+#
+# This workflow is not gated locally (CLAUDE.md §4) — it needs human
+# verification on a real tag push.
+name: release
+
+on:
+  push:
+    tags:
+      - "v[0-9]+.[0-9]+.[0-9]+"
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4.2.2
+
+      - name: Verify tag matches build.zig.zon's version
+        run: |
+          tag_version="${GITHUB_REF_NAME#v}"
+          if [ -z "$tag_version" ]; then
+            echo "could not read a version from GITHUB_REF_NAME ('$GITHUB_REF_NAME')" >&2
+            exit 1
+          fi
+          manifest_version=$(sed -n 's/^[[:space:]]*\.version[[:space:]]*=[[:space:]]*"\(.*\)".*/\1/p' build.zig.zon)
+          if [ -z "$manifest_version" ]; then
+            echo "could not read .version from build.zig.zon" >&2
+            exit 1
+          fi
+          if [ "$tag_version" != "$manifest_version" ]; then
+            echo "tag v$tag_version does not match build.zig.zon's version $manifest_version — refusing to publish mislabelled tarballs" >&2
+            exit 1
+          fi
+
+      - name: Read minimum_zig_version from build.zig.zon
+        id: zig-version
+        run: |
+          version=$(sed -n 's/^[[:space:]]*\.minimum_zig_version[[:space:]]*=[[:space:]]*"\(.*\)".*/\1/p' build.zig.zon)
+          if [ -z "$version" ]; then
+            echo "could not read .minimum_zig_version from build.zig.zon" >&2
+            exit 1
+          fi
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+
+      - name: Set up Zig
+        uses: mlugg/setup-zig@v1.2.1
+        with:
+          version: ${{ steps.zig-version.outputs.version }}
+
+      - name: Build release tarballs
+        run: make release
+
+      - name: Attach tarballs and SHA256SUMS to the release
+        uses: softprops/action-gh-release@v2.1.0
+        with:
+          files: |
+            zig-out/dist/*.tar.gz
+            zig-out/dist/SHA256SUMS

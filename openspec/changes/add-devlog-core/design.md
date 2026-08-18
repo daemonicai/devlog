@@ -1,0 +1,447 @@
+## Context
+
+The four-role OpenSpec agent workflow talks through `DEVLOG.md`, a Markdown file every role edits by
+hand. A real four-section change produced 240 KB across 51 posts, and its `## NEXT` grew into 14 KB of
+hand-maintained state that the format required be rewritten in full on every write. It got mangled. The
+same change invented four identifier namespaces (`D1–D3`, `N1–N14`, `S1–S7`, `F1–F3`) and a lifecycle
+vocabulary entirely in prose, because informal items had no way to be resolved.
+
+`devlog` replaces hand-editing with a tool the agents invoke. The requirements are captured in
+`proposal.md` and the six spec files; this document records the technology decisions made against them.
+
+Measurement that shaped these decisions: parsing the full 244 KB log, building role and reference
+indexes, and scanning every body took **0.31 ms median in JavaScript**; a 2.4 MB / 510-record log parsed
+in 2.7 ms. Zig is materially faster again.
+
+Precedent consulted: `memlite` (same author) — Zig 0.16, statically linking SQLite, sqlite-vec,
+llama.cpp and md4c into a 6.0 MB binary with no dynamic third-party dependencies, shipped as static
+tarballs for macOS arm64 and Linux x86_64/arm64.
+
+## Goals / Non-Goals
+
+**Goals:**
+
+- Structure enforced at the point of writing, so agents fall into doing the right thing.
+- `## NEXT` cannot be corrupted, because nothing is ever rewritten.
+- Informal items have an explicit, attributable resolution.
+- An agent resuming work reads what is open, not the whole history.
+- The committed artifact is precisely specified and reconstructible.
+- A single binary, nothing to install, start-up indistinguishable from zero.
+
+**Non-Goals:**
+
+- Semantic search in v1 (see D3).
+- Any human-editing path — no human edits these files.
+- Concurrency as a use case. Locking exists so that future parallelism cannot corrupt a log.
+- Search across archived changes.
+- The HTML viewer, which is a later phase.
+
+## Decisions
+
+### D1 — Zig 0.16 as the implementation language
+
+The requirement is a single self-contained binary, nothing to install, instant start, invoked dozens of
+times per block. `memlite` demonstrates Zig 0.16 meeting exactly this profile at 6.0 MB *including*
+llama.cpp; without it this binary should land near 1 MB, linking nothing third-party.
+
+**Rejected — .NET 10**, which is the author's standing default for back-end work and is therefore worth
+recording as a deliberate departure. NativeAOT does produce a single file, but it lands in the tens of MB
+and carries measurable start-up cost in a process invoked this often. **Rejected — Go**: viable, and
+easier to staff, but there is no team to staff; it forfeits the memlite precedent and buys nothing back.
+**Rejected — Rust**: the strongest alternative, technically equivalent for this problem, rejected only
+because it duplicates what Zig already gives this author at the cost of the existing build knowledge.
+
+**Known risk:** Zig 0.16 is pre-1.0 and its build API breaks between releases. This cost has already been
+paid once on memlite, so it is a known quantity rather than a discovery.
+
+### D2 — No database. The JSONL is read and indexed in memory on each invocation
+
+The Product Owner's initial shape was an embedded database (SQLite + sqlite-vec) as a git-ignored cache.
+Measurement does not support it: a full parse, index build and scan of the real log costs 0.31 ms. A
+database exists to avoid re-reading data, and there is nothing here worth avoiding.
+
+The token argument — the actual motivation — is also satisfied without one. Context is consumed by what
+enters the *agent's* window, not by what the binary reads. A tool that reads 244 KB internally and prints
+three records has already achieved the entire saving.
+
+So: read `DEVLOG.jsonl`, build the indexes in memory, answer, exit. No `DEVLOG.db`, no C interop, no
+third-party linking.
+
+**Rejected — SQLite + sqlite-vec as a cache**: unjustified at this corpus size, and it would drag in the
+embedding stack, a model download, a model cache, and roughly 5 MB of binary for semantic recall over
+~50 records.
+
+**This decision is deliberately cheap to reverse.** Because the JSONL is the source of truth and every
+index is derived, adding a database later is purely additive — no format change and no migration.
+
+**Product Owner note:** this overrides their stated constraint that `DEVLOG.db` be a git-ignored cache.
+They accepted the argument; the constraint is withdrawn rather than forgotten.
+
+### D3 — Lexical search now; embeddings only on evidence
+
+BM25 over bodies, plus exact filters on role, section, block, kind, state and reference. No embeddings,
+no llama.cpp, no GGUF download.
+
+What this gives up is real: lexical search does not match paraphrase, so "abandoned requests" will not
+find a post that only says "cancellation". Three things blunt it. The corpus is 50–200 records, far below
+where embeddings earn their cost. External identifiers are now first-class structured references, which
+covers the highest-value recall case exactly — the example log made 198 such mentions. And a single
+change's log has narrow, repetitive vocabulary by nature.
+
+Revisit only if lexical search demonstrably fails on a real change. Follows D2 and inherits its
+reversibility.
+
+### D4 — A CLI, not an MCP server
+
+Commands invoked from the shell. Works in any agent harness, needs no per-project configuration, and
+costs an agent no context until actually used.
+
+**Rejected — MCP stdio**, which is what memlite chose, so this is a deliberate divergence. MCP tool
+schemas occupy every agent's context permanently, and these subagents already have shell access. An MCP
+surface can be added later over the same core if a harness ever needs it.
+
+### D5 — Bodies arrive on stdin; the tool touches nothing but the log and its own temporary file
+
+Bodies are Markdown containing fenced code blocks, so composing them inline in a shell heredoc is a
+quoting accident waiting to happen — in a tool whose purpose is preventing format accidents. Agents write
+the body to a file in their own ephemeral scratch directory and redirect it in.
+
+The tool writes and deletes no file other than `DEVLOG.jsonl` and — **amended with D11 during block 2B** —
+the single temporary file a write replaces the log through, which it creates itself and removes before the
+command exits. A tool that deletes files it did **not** create is a footgun: one mistyped path destroys
+real work, and there is no good answer to whether it should also delete on failure. That is the line, and
+it is unchanged: the tool cleans up after itself and touches nothing else.
+
+**Guard against hanging:** if stdin is a terminal, or the body is empty, the tool fails immediately with
+a clear message. A hung invocation is worse than an error in an agent harness — it burns the turn with no
+diagnostic.
+
+**"Empty" means whitespace-only, not merely zero bytes** (architect ruling, section 3 — codified here on
+a supervisor finding that this line said "empty" while the implementation refused whitespace-only bodies
+too, and the two had never been reconciled in writing). An accidentally-empty heredoc typically arrives
+as a lone newline, not zero bytes, and a record whose body is `"\n"` is noise in a permanent log the same
+way a genuinely empty one would be. This is the one place the body-read boundary inspects content at all,
+and only to decide whether to refuse: the bytes it returns on acceptance are always the untrimmed
+original, never a trimmed copy — refusing whitespace-only does not mean trimming whitespace.
+
+**Amended by D14 during section 3**: "no encoding validation" was overstated. A body must be valid UTF-8,
+because this format cannot store one that is not and still read it back. That is the only property of a
+body the tool inspects — see D14 for why, and for what remains untouched.
+
+**Rejected — `--body-file <path>` with the tool deleting the file afterwards** (the Product Owner's
+initial suggestion): unsafe for the reason above. **Rejected — a `devlog draft` / `--draft` handshake**
+where the tool owns and therefore may delete the file: correct but costs a second round-trip and a new
+concept; reconsider only if scratch-file litter becomes a real problem.
+
+### D6 — One append-only stream; an item is a record kind
+
+Eight record kinds in a single stream: `header`, `section`, `brief`, `post`, `item`, `close`, `verdict`,
+`next`. An `item` record *is* the raising of the item and carries its own body, so there is no
+post-plus-item duplication and no second entity to keep in sync. `close` records target an item by
+number.
+
+**Consequence, accepted deliberately:** a supervisor that today writes one post containing three findings
+writes three `item` records instead, because each finding needs its own lifecycle. More calls; that is
+the point.
+
+**Rejected — item as a flag on a post**: fewer concepts, but it conflates "a thing said" with "a thing
+tracked", and makes an item's lifecycle ambiguous when it is discussed across many posts — which the
+example log does extensively.
+
+### D7 — Verdicts are typed records
+
+A `verdict` carries the block, an outcome (`approve`, `approve-with-nits`, `request-changes` — all three
+occur in the example log) and the commit. The per-block status grid is then a fold over verdict records
+rather than the largest hand-maintained table in `NEXT`.
+
+**Rejected — verdicts as prose in a post**: less ceremony per review, but leaves the grid manual, which
+is one of the two things this project exists to eliminate.
+
+### D8 — `brief` is a record kind, and `resume` returns three things
+
+The architect's block brief is neither an item nor NEXT, so an agent resuming cold could not reach it.
+Making it a record kind addressed to a role closes the gap. `devlog resume --role <r>` returns the current
+NEXT narrative, the open items addressed to that role, and the latest brief for its block — bounded by
+what is open rather than by history.
+
+### D9 — Item identifiers are a neutral `#n` sequence
+
+Prefixing by kind (`Q1`, `F1`, `D1`, `N1`) collides head-on with the external namespaces already in use:
+`D1–D3` means design decisions and `N1–N14` means architect's notes, referenced 202 times between them in
+the example log. `#12` can never be confused with `D2`.
+
+Numbering is derivable — the *n*th `item` record is `#n` — so a rebuild reproduces identical numbers with
+no counter to persist. It is stored explicitly regardless, so the file stays self-describing.
+
+### D10 — `refs` may appear on every attributed record kind
+
+Including `close`, since a closure's reasoning frequently cites the decision that settled it. Uniform
+across the attributed kinds; no per-kind exceptions to remember among them.
+
+**Narrowed during block 4A, on the same ground as D13's role exemption.** `header` carries no `refs`,
+because `header` carries none of the common fields at all — it is not an attributed record. This was
+already true in the implementation the moment 2A gave `header` its own struct rather than the shared
+`Attributed` one, and the earlier phrasing ("every record kind", "no per-kind exceptions") had never been
+reconciled with it. The exemption is the same one, for the same reason: a `header` is the record that
+establishes who may write, so it precedes the vocabulary the other kinds are written in. Nothing else
+changes — `refs` remains free-form, unvalidated, and repeatable on every kind an agent actually addresses
+to anyone. `devlog header` therefore takes no `--ref`, and offering one is an unknown-flag refusal.
+
+This matters beyond tidiness because `8.4` requires the format be reimplementable from the prose alone: a
+reimplementer reading "every record kind" puts a `refs` field on `header` and writes a record this tool
+will not produce.
+
+### D11 — Locked, atomic appends
+
+A write takes an exclusive lock on the log for its duration, assigns `seq` under that lock, and appends
+the complete line or nothing. An interrupted write must never leave a partial record. Agents run in
+series today; this exists so that ceasing to does not corrupt a log.
+
+**Amended during block 2B.** "The complete line or nothing" cannot be delivered by appending in place.
+`writePositionalAll` loops until every byte lands, so a record whose line spans more than one write
+syscall can leave a partial line on disk if the process is killed mid-loop — and no in-process test can
+exercise that, which is how the gap went unnoticed until the reviewer read the implementation. A write
+therefore stages the new content in a temporary file alongside the log and `rename`s it into place;
+`rename` is atomic, so a reader sees either the old log or the new one and never a torn record.
+`durable-format`'s no-stray-files requirement is amended to carve out exactly this one temporary file,
+which must not outlive the write that made it.
+
+Three consequences, all accepted deliberately:
+
+- **A write is O(size of log), not O(size of record)**, because atomic replacement means writing the whole
+  file. DEVLOGs are small — a long-running change is hundreds of kilobytes — and a write happens once per
+  agent post, so the cost is irrelevant at this scale. Revisit only if a log ever gets large enough to
+  notice, which would itself be a signal the format is being misused.
+- **The lock is on the log's inode, and a rename replaces that inode.** A second writer that acquires the
+  lock on the file it opened can therefore be holding a lock on an inode the first writer has already
+  replaced, and would silently write its record into an orphan. After taking the lock, a writer must
+  confirm the path still resolves to the inode it holds open, and start over if it does not. This is the
+  hazard the strategy introduces; it is not optional.
+- **A killed write leaves its temporary file in a source-controlled directory.** The log lives in
+  `openspec/changes/<slug>/`, so an abandoned `.DEVLOG.jsonl.tmp-<hex>` shows up in `git status` and is
+  one careless `git add -A` away from being committed. The tool cleans up on every path it controls, but
+  it cannot clean up after `SIGKILL`, so the pattern is `.gitignore`d. This is also why the temp name must
+  stay recognisable rather than becoming an opaque random string. The trade-off is real and accepted:
+  ignoring the artefact also removes the `git status` line that would otherwise be the only signal a write
+  was ever killed mid-flight. An accidentally committed temp file is the worse outcome — it would be a
+  second copy of the log, in the repository, that no command knows how to interpret.
+
+### D12 — MPL 2.0, static tarballs, no support burden
+
+MPL 2.0. Distribution mirrors memlite: statically linked tarballs attached to tagged GitHub releases for
+macOS arm64 and Linux x86_64/arm64. Posture is "I use this, here's the source, PRs welcome, fork it if
+you want" — no support commitment implied or offered.
+
+### D13 — Roles are declared per project, in the header
+
+The tool fixes no role vocabulary. A project declares the roles its workflow actually has, and the
+declaration lives in the log's own `header` record, so the log carries its vocabulary with it and an agent
+reading it cold needs nothing external to interpret attribution. `devlog header` writes that record: it
+creates the log, and re-declaring later appends a new header, exactly as a tool-version change already
+does. The latest header wins.
+
+A write whose `role` is not in the declared set is **rejected**, naming the declared roles. The
+flexibility is in what a project may declare, not in whether a writer may invent a role mid-stream: an
+undeclared role is far more often `reviewr` than a genuine new participant, and a typo that silently
+fragments attribution is exactly the class of accident this tool exists to prevent. Adding a participant
+is a deliberate act — one `devlog header` call — rather than a side effect of a misspelling.
+
+**The declaration is a set (section 4 supervisor finding B2).** Two declarations differ only if the roles
+themselves differ; naming them in a different order is not a change and appends nothing. Naming the same
+role twice is refused rather than stored — a repeated name is a typo in every case that matters, and
+storing it would make the tool report `declared roles: architect, architect` back at a writer. The rule
+matters because re-declaring *appends* to an append-only file: an agent that defensively re-runs `devlog
+header` must be able to rely on an unchanged declaration writing nothing at all, and a positional
+comparison silently made that guarantee depend on argument order. The same distinctness rule applies to
+`closers`, which must additionally be a subset of `roles` — see `work-items` for why a closer outside the
+role set is a typo rather than a permission.
+
+**Extended to the addressee during block 4B, on the Product Owner's confirmation.** `to` is held to the
+same declared set as `role`, and `--to reviewr` is refused exactly as `--role reviewr` is. This was raised
+as a question rather than assumed, because the requirement as originally written names only the writer's
+role — but the argument for the writer is *stronger* for the addressee, not weaker. A record attributed to
+a misspelt author is visibly misattributed and someone eventually notices. A record addressed to a misspelt
+role is addressed to **nobody**: it is stored correctly, reads correctly, and is silently absent from every
+derived per-role view — `resume --role <r>`'s open items and latest brief (D8), and the addressee index.
+The one participant it was written for never sees it, and nothing anywhere reports a fault. That is the
+same silent-fragmentation failure this decision already exists to prevent, one field over, with a worse
+blast radius.
+
+**Rejected — a fixed enum of `architect`/`worker`/`worker-<stack>`/`reviewer`/`supervisor`.** It encodes
+one workflow's roster into the format. The four-role split is `dmons`' convention, not a property of
+keeping an append-only log, and a project with a different shape should not have to fork the tool.
+
+**Rejected — accept any non-empty string, with the declared set as documentation.** Maximum permissiveness
+at the point of writing, but it makes attribution silently unreliable: nothing catches the typo, and the
+derived per-role views (`resume --role`, the addressee index) quietly split in two.
+
+**Rejected — accept with a warning on stderr.** Costs the tool a third outcome between success and
+failure. Agents parse exit codes reliably and prose unreliably, so a warning is a rejection that doesn't
+work.
+
+### D14 — The tool never writes a record it cannot read back; bodies must be valid UTF-8
+
+**Added during section 3, on a supervisor finding.** D5 said bodies are bytes and the tool validates no
+encoding. That is not implementable in this format. Zig's `std.json.Stringify` switches representation on
+content: a valid-UTF-8 string is emitted as a JSON string, and an invalid one silently becomes **an array
+of byte numbers**. No error is raised and the write succeeds — but the reader requires a string, so the
+record fails to parse. Since every command parses the whole log before doing anything, one such body
+breaks **every subsequent invocation, read and write**, in a file that is append-only by design and has no
+repair path. The tool would have corrupted its own log, permanently, while exiting `0`.
+
+So the invariant is: **the tool never writes a record it cannot read back.** A body must be valid UTF-8,
+and a write whose body is not is refused before anything is written.
+
+This is enforced in serialisation, not per command. Every string field has the same hazard, not just
+`body` — the rest arrive from `argv`, which is equally unvalidated — and a check at the write boundary
+covers all of them once, where a per-command check would have to be remembered eight times.
+
+D5's "no encoding validation" is narrowed by exactly this one property and nothing else. There is still no
+trimming, no CRLF translation, no BOM stripping, and no interpretation of content; UTF-8 validity is a
+question about whether the log survives, not about what the prose means.
+
+**Rejected — teach the reader to accept the array-of-bytes form**, which would keep "stored exactly as
+supplied" literally true for every possible input. It buys fidelity for an input class that does not
+occur in practice (bodies are Markdown written by agents; invalid UTF-8 means a corrupt file, not an
+exotic body) and charges for it in the one place this project cannot afford complexity: `8.4` requires the
+format be reimplementable from the prose specification alone, and "a body is a string, except when it is
+an array of integers" is exactly the kind of clause a second implementation gets wrong.
+
+### D15 — Reads render for a human by default and emit JSON on `--json`
+
+Every read command (`resume`, `show`, `list`, `refs`, `status`, `search`) prints rendered, agent-readable
+text by default, and the same content as JSON on `stdout` when given `--json`. The default is what a
+person or an agent reads in a terminal or pastes into a thread; `--json` is what a consumer parses.
+
+**Decided by the Product Owner during section 6**, because nothing in this document, the specs or the
+proposal had settled it, and all five read commands emit something. Recorded here rather than in a review
+because the output format is a contract: `9.4` hands the `dmon-dev` plugin a way to consume this tool, and
+`8.4` requires the surface be documented precisely enough to reimplement.
+
+The two forms are one derivation with two renderers, never two derivations. Anything a `--json` payload
+carries that the text form cannot show is a signal the text form is under-rendering, not a licence for the
+two to diverge — a consumer that parses `--json` and a human reading the default must never be told
+different things about the same log.
+
+**That equivalence is about what was found, not about what was asked.** A `--json` payload may echo the
+request's own parameters — `search`'s `"limit"` is the only case (D16) — without the text form being
+obliged to restate them. The distinction is that `total` and the records are *derived from the log* and so
+must agree across both forms, whereas `limit` is *the caller's own input handed back*. It is echoed because
+the process that parses the payload is often not the process that built the command line: a plugin
+receiving a result needs to know the bound applied to it, while the human who typed `--limit 5` does not
+need reminding. Nothing derived from the log may hide behind this clause.
+
+`--json` is a flag on the read commands only. The write commands' output is a confirmation, not a query
+result, and is out of scope for this decision.
+
+**Rejected — text only**, which the tasks' wording implies (`6.5` says "the rendered current state") and
+which is the smaller surface. It leaves every consumer parsing prose, and the first consumer is a plugin
+in another repository whose breakage would show up as a workflow that silently stops resuming correctly.
+
+**Rejected — JSON only**, which is unambiguous for machines and unreadable in the terminal where the
+Product Owner checks the tool by hand. It also makes an agent reformat before pasting a status into a
+thread, which is the tool's most common use.
+
+### D16 — `search` is bounded by default, and says so in both forms
+
+`search` returns at most **10** records unless `--limit <n>` says otherwise; `--limit 0` lifts the bound
+entirely. The text form renders `records (10 of 156):` when the bound cut the result and `records (10):`
+when it did not. The `--json` form is an envelope — `{"total":156,"limit":10,"records":[…]}` — and is the
+one read payload that is not a bare array. `"limit"` is `null` when unbounded, never `0`.
+
+**Decided during section 7's supervisor review, on measurement rather than judgement.** Unbounded, a
+natural-language question against this change's own 200-record log returned 96% of it — the tool's purpose
+clause is that an agent can find what was decided "without ingesting the log", so the requirement was not
+met. The measured result after the bound is 6.0%, and the answer's rank in the *uncapped* ranking was 3 or
+better on all six probe questions, so the bound costs no recall at this corpus size.
+
+**This is not a retreat from D3.** Ranking quality was verified good before the cap was chosen, and
+AND-semantics — the obvious alternative — was tested and rejected because it collapses the same questions
+to one or two hits. BM25 works; it was the *tail* that was unbounded.
+
+**The bound is applied in the one derivation**, after the ranking sort and before either renderer, so the
+two forms cannot disagree about what was dropped. `list` and `refs` are deliberately **not** bounded: they
+answer a closed question ("everything matching these filters") where a partial answer is a wrong answer,
+whereas `search` answers an open one where the tail is noise by construction. A consumer wanting an
+unbounded ranking asks for it with `--limit 0`.
+
+**Ranking quality is now load-bearing in a way it was not.** Before the bound, a relevant record ranked
+11th was merely late in a long list; now it is invisible. D3's revisit trigger tightens accordingly: the
+evidence to watch for is *the answer falling outside the top 10*, not *search failing to return it at all*.
+
+**`--limit` accepts ASCII digits only** — no sign, no `_` separators, no leading zeros beyond `0` itself.
+It does not inherit `std.fmt.parseInt`'s liberality, because it did once, and `--limit -0` was accepted and
+returned the whole log.
+
+## Record schema
+
+One JSON object per line. Three fields are carried by every kind without exception:
+
+| Field | Type | Notes |
+|---|---|---|
+| `kind` | string | one of the eight kinds; determines the remaining fields |
+| `seq` | int | assigned under lock, strictly increasing, contiguous — the total order |
+| `ts` | string | ISO 8601 UTC |
+
+The remaining common fields are carried by the seven **attributed** kinds — every kind except `header`,
+which carries none of them (D13 for `role`, D10 for `refs`, and the rest for the same reason: a `header`
+is provenance and declaration, not a post addressed by someone to someone about something):
+
+| Field | Type | Notes |
+|---|---|---|
+| `role` | string | must be one of the roles declared in the log's latest `header` (D13) |
+| `section` | string | optional — the `tasks.md` section, e.g. `"3"` |
+| `block` | string | optional — task range, e.g. `"3.1-3.3"` |
+| `to` | string | optional — addressed role |
+| `refs` | array | optional — `[{"ns":"D","id":"2"}]`, any namespace, unvalidated |
+| `body` | string | Markdown, verbatim, from stdin |
+
+Per-kind fields:
+
+| `kind` | Additional fields | Purpose |
+|---|---|---|
+| `header` | `format` int, `tool` string, `change` string, `roles` array of string, `closers` array of string | provenance, the project's declared role set, and which of those roles may close items; carries no `role` of its own; first line, and appended again whenever a different tool version writes or the declaration changes (D13) |
+| `section` | `title`, `base` (commit sha) | opens a section and fixes the supervisor's diff range |
+| `brief` | — | the architect's block brief, addressed to a worker |
+| `post` | — | thread traffic: progress, answers, handoffs |
+| `item` | `item` int, `type`, `blocking` bool | `type` ∈ question, finding, decision, note, task |
+| `close` | `item` int, `state` | `state` ∈ resolved, deferred, superseded; `body` is the mandatory reason |
+| `verdict` | `outcome`, `commit` | `outcome` ∈ approve, approve-with-nits, request-changes |
+| `next` | — | the narrative; latest wins |
+
+Example:
+
+```jsonl
+{"kind":"header","seq":1,"ts":"2026-08-12T09:00:00Z","format":1,"tool":"devlog 0.1.0","change":"add-devlog-core","roles":["analyst","architect","worker-frontend","reviewer","supervisor"],"closers":["architect"]}
+{"kind":"section","seq":2,"ts":"2026-08-12T09:01:00Z","role":"architect","section":"3","title":"Submission form","base":"a1b2c3d","body":"Submission form, validation, and the submit pipeline."}
+{"kind":"brief","seq":3,"ts":"2026-08-12T09:02:00Z","role":"architect","section":"3","block":"3.1-3.3","to":"worker-frontend","refs":[{"ns":"D","id":"2"}],"body":"Build the form + validation.\n\n**Decision:** debounce on submit, not keystroke."}
+{"kind":"item","seq":5,"ts":"2026-08-12T10:15:00Z","role":"worker-frontend","section":"3","block":"3.1-3.3","item":1,"type":"question","to":"architect","blocking":true,"refs":[{"ns":"S","id":"4"}],"body":"Spec says 300ms, design says 500ms. Which wins?"}
+{"kind":"close","seq":6,"ts":"2026-08-12T10:20:00Z","role":"architect","item":1,"state":"resolved","refs":[{"ns":"D","id":"2"}],"body":"500ms — design wins. The spec is stale; I'll flag it separately."}
+{"kind":"verdict","seq":11,"ts":"2026-08-12T11:55:00Z","role":"reviewer","section":"3","block":"3.1-3.3","outcome":"approve","commit":"c9d0e1f","body":"Approve."}
+{"kind":"next","seq":14,"ts":"2026-08-12T14:25:00Z","role":"architect","body":"Section 3 closed and approved. Resume at 4.1 — open the section with its base commit first."}
+```
+
+Forward compatibility: readers ignore unknown *fields*; a `format` value higher than the binary
+understands is refused with a clear message rather than guessed at.
+
+## Risks / Trade-offs
+
+- **`git diff` on the JSONL is close to unreadable.** JSON escapes newlines, so a 46-line post is one very
+  long line. This is the direct cost of the chosen format and is what the later-phase HTML viewer repays.
+  Append-only softens it: diffs are almost always pure additions.
+- **Lexical search will miss paraphrase.** Accepted under D3, with structured references covering the
+  highest-value case. Revisit on evidence from a real change.
+- **The default bound makes ranking quality load-bearing.** Under D16 a relevant record ranked 11th is not
+  merely late, it is unseen. Measured at 200 records the answer ranked 3 or better on every probe, so the
+  margin is comfortable today — but the margin, not the bound, is what a larger corpus erodes first.
+- **More calls per block than the Markdown file required.** Three findings become three invocations
+  (D6), and reviews now emit a typed verdict (D7). The trade is deliberate: ceremony at write time buys
+  state that cannot drift.
+- **Reviewer approval does not close the finding.** Only a declared closing role closes, so an approval is a
+  signal and the close is a separate step. In the example log that is 41 verdicts and 7 request-changes
+  worth of extra traffic. Kept because the Product Owner set the guardrail explicitly.
+- **The close guardrail is not enforcement.** Roles are self-declared; the tool refuses a close from a
+  role the header did not declare as a closer, but nothing prevents an agent claiming that role.
+  Documented as a guardrail, and a
+  spec scenario asserts the documentation says so.
+- **Zig 0.16 is pre-1.0.** Build API churn between releases is expected maintenance.
