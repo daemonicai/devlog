@@ -17,12 +17,16 @@ const body = @import("body.zig");
 // (block 6A) is the first command to derive read-side state.
 const state_mod = @import("state.zig");
 const search = @import("search.zig");
+// Block 9A (9.1-9.3): end-to-end validation against the built binary,
+// never `run()` in-process — see src/e2e_test.zig's own doc comment.
+const e2e_test = @import("e2e_test.zig");
 test {
     _ = record;
     _ = log;
     _ = body;
     _ = state_mod;
     _ = search;
+    _ = e2e_test;
 }
 
 /// One subcommand of the surface. `section` names the `tasks.md` section

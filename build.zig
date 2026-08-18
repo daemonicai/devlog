@@ -48,6 +48,19 @@ pub fn build(b: *std.Build) void {
         .root_module = root_module,
     });
     const run_exe_tests = b.addRunArtifact(exe_tests);
+    // Block 9A's e2e tests (src/e2e_test.zig) drive `zig-out/bin/devlog`
+    // as a real child process, on purpose — that is the point of an
+    // end-to-end test, and the one thing it must never do is validate a
+    // stale binary while the unit tests beside it check current source.
+    // `run_exe_tests` only depends on `exe_tests` (the test binary
+    // itself), which says nothing about `exe`, so without this the
+    // installed `devlog` could predate the source the tests just
+    // compiled against and the suite would still print green. Depending
+    // on the install step (not just `exe`) means "installed and up to
+    // date at zig-out/bin/devlog", which is exactly what the e2e tests
+    // read. This must hold for `zig build test` on its own — no target
+    // ordering in the Makefile substitutes for it.
+    run_exe_tests.step.dependOn(b.getInstallStep());
 
     const test_step = b.step("test", "Run unit tests");
     test_step.dependOn(&run_exe_tests.step);

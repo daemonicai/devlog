@@ -12615,6 +12615,360 @@ untracked `docs/notes/`.
 
 → @architect
 
+## 9. End-to-end validation
+
+**[architect]** Base: `3c7f63f` — the last section: an end-to-end replay proving the tool's derived state
+matches a real thread (`9.1`–`9.3`), and the self-contained handoff prompt that repoints `dmon-dev` at the
+binary (`9.4`).
+
+**[architect]** Brief — block **9A** (`9.1`–`9.3`), end-to-end validation. → @worker
+
+**Read `## NEXT` first**, particularly *Where defects actually live*. This block is the project's answer to
+items 1 and 8 on that list, and briefing it as "replay a file" would waste it.
+
+**What this block is for.** Every gate this project has runs against *units*. Nothing has ever driven the
+**built binary** end to end over a **realistic** thread and checked that what it derives is what a human
+would have written by hand. Three defect classes are invisible to everything else we run: a branch nothing
+executes, behaviour only the built binary shows, and behaviour that only breaks at realistic corpus size.
+`9.1`–`9.3` are the only mechanism aimed at them. **Optimise for catching something, not for going green.**
+
+**`9.1` — replay `docs/example/DEVLOG.md` (3236 lines) through the tool, producing a log covering every
+record kind.** All eight kinds must appear: `header`, `section`, `brief`, `post`, `item`, `close`,
+`verdict`, `next`. Drive the **built binary** (`zig-out/bin/devlog`), not internal functions — that is the
+point of the exercise, and an in-process test would defeat it. Bodies arrive **on stdin** per D5, so the
+replay exercises the real body path too. Assert coverage of all eight kinds explicitly rather than assuming
+the fixture happens to contain them.
+
+**`9.2` — assert the generated status grid matches the verdicts recorded, with no hand-maintained table.**
+The assertion must derive both sides: one from the tool's output, one from the fixture. If your test
+contains a literal expected grid that a human typed, `9.2` is not done — a hand-maintained expectation is
+exactly the thing this task exists to eliminate, and it would also be a table that silently rots.
+
+**`9.3` — assert `resume` for each declared role returns only what that role needs, and stays small as
+history grows.** Both halves are load-bearing. "Only what that role needs" is a correctness property;
+**"stays small as history grows" is the one this project has evidence for** — section 7 found a defect
+visible only at realistic corpus size. So make the growth property fail if it can: compare `resume` output
+against a log that is **substantially longer**, not marginally so, and assert a bound that a linear-in-history
+`resume` would breach. A test that cannot distinguish bounded from unbounded output has not tested this.
+
+**Standing hazard, from `## NEXT`: tests sized so the property cannot fail.** Both of section 7's real
+defects passed a block review behind tests asserting exactly the right property against an input where it
+was incapable of failing. For every assertion here, state in your DEVLOG post **what input would make it
+fail** — and if you cannot name one, say so, because that is the finding.
+
+**The Makefile is mine.** `make test` already runs the suite; if this block needs a target that does not
+exist — a fixture-replay step, a separate end-to-end target — **stop and tell me**. Do not edit the
+Makefile and do not call the raw toolchain around it.
+
+**Scope**: `src/` test code and any fixture/helper the replay needs. **Do not** edit `docs/example/DEVLOG.md`
+— it is the fixture under test; if the tool cannot replay it, that is a finding about the tool or the
+fixture, and it comes to me rather than being fixed by editing the input. Do not touch `docs/notes/`.
+
+**Done-gates**: `make gates` → `GATES_EXIT:0`, every `LABEL_EXIT:<n>` quoted. The test count **will** move —
+report the new number and the arithmetic, remembering the identity is named `test "…"` declarations plus the
+one anonymous `test {}` at `src/main.zig:20` (currently 293 + 1 = 294). Post to `## 9.` as `[worker]`, hand
+off `→ @reviewer`.
+
+**[worker]** `9.1`–`9.3` built. One new file, `src/e2e_test.zig`, imported into `main.zig`'s test
+aggregator (`_ = e2e_test;`) — nothing else touched.
+
+**`9.1` — a real replay driver, not a fixture loader.** `docs/example/DEVLOG.md` (3236 lines, a
+different fictional project's thread) has no devlog vocabulary in it — no `#n` items, no typed
+verdicts — so replaying it is a translation, not a parse. The driver (`replay`, `handleParagraph`)
+scans role-tagged paragraphs (`**[role]** …`) and classifies each by what it actually says, in
+priority order, checked against every matching line in the fixture before being written, not
+assumed:
+
+- **`brief`**: architect paragraphs opening with `→ @` or `Brief` (6 matches, all genuine — verified
+  no false positive against the file's ~30 other `→ @role` handoff markers, which appear mid- or
+  end-paragraph, never at the very start).
+- **`verdict`**: paragraphs opening with `Verdict on` or `Second pass on block` (6 matches, all
+  reviewer). Outcome parsed from the same text (`Request changes` / `Approve, with…` / else
+  `approve`).
+- **`close`**: the one paragraph containing `ruling on the ❓` (architect, the declared closer),
+  resolving the oldest still-open question — FIFO over four raised, one closed, three left open (a
+  deliberate, honest state: not everything in a real thread gets resolved).
+- **`item --type question`**: any paragraph containing `❓` (4 matches — all four are *embedded*
+  inside a larger paragraph, not paragraph-openers, which is why this checks the whole body, not the
+  first line; addressee parsed from the `❓ @role` that follows).
+- **`post`**: everything else (31 paragraphs).
+- **`section`**: the `Base: `sha`…` paragraph immediately following each `## N.` heading (4 headings,
+  4 sections — had to skip the blank line between heading and paragraph, missed on the first pass).
+- **`header`** once, up front; **`next`** once, from `## NEXT` to EOF.
+
+Total: 1 + 48 (one per role-tagged paragraph, `grep -c "^\*\*\["`) + 1 = 50 records, all eight kinds
+covered — asserted by iterating `record.Kind`'s fields, not assumed.
+
+Drives `zig-out/bin/devlog` as a real child process (`std.process.spawn`, mirroring
+`std.process.run`'s own drain-before-wait shape so a large `list --json` dump can't deadlock the
+pipe) — never the in-process `run()` `main.zig`'s own tests use. Every body goes in via a real file
+handed as the child's stdin (D5's real path, not a stand-in). Block labels (`"4.1"`, `"4.2"`, …) are
+assigned positionally per brief within a section, not lifted from the fixture's prose — free text,
+not validated against any real `tasks.md` since this fixture isn't devlog's own project.
+
+**`9.2` — the grid, folded on both sides, never typed.** "Generated" = `list --kind verdict --json`
+folded by D7's rule (latest verdict per block wins); "recorded" = the same fold applied to what the
+replay driver itself queued for writing, captured before the binary ever ran. Both go through one
+`foldGrid` function. Section `4`'s first brief (label `4.1`) gets two verdicts — `request-changes`
+then `approve` — the only block in the fixture where first-wins and latest-wins disagree; the test
+asserts the fold lands on `approve` specifically, not just "some grid came out."
+
+**What would make each 9.2 assertion fail**: the raw round-trip check (49 lines up) fails if a write
+is dropped, reordered, or corrupted between issuing it and reading it back. The grid check fails if
+`foldGrid` picked first-wins instead of latest-wins — concretely, block `4.1` would report
+`request-changes` instead of `approve`.
+
+**`9.3` — role-scoping as an invariant, boundedness as a byte-for-byte comparison.** For all four
+declared roles, every item `resume --json` returns is asserted to carry `to == <that role>`, and any
+returned brief the same — checked against the JSON's own shape, not a fixed list, so it holds
+regardless of what the fixture happens to contain. Growth: the replayed log (250 KB) is copied, then
+grown past 3x (800 synthetic records — 400 posts, 300 items addressed to `reviewer` left open, 100
+addressed to `worker` and closed immediately — bodies padded so 800 subprocess calls, not thousands,
+get there) with **zero** new open items addressed to `worker`. `resume --role worker --json` is
+asserted **byte-for-byte identical** before and after.
+
+**What would make the 9.3 assertions fail**: the role-scoping check fails if `resume` returned an
+item addressed to someone else, or a brief addressed to someone else. The growth check fails if
+`resume` did anything proportional to total history — a leaked item from the noise, a growing byte
+count — since a linear-in-history implementation would diverge from the pre-growth output the moment
+the noise landed, and the noise is deliberately invisible to `worker` if the role filter is correct.
+
+**Test count**: 296 named `test "…"` declarations + the one anonymous `test {}` (`src/main.zig:23`,
+moved down one line by the new import) = **297**. Up from 294 by exactly the three `9.1`/`9.2`/`9.3`
+tests in `src/e2e_test.zig` — no other file touched a test count.
+
+**Gates**: `BUILD_EXIT:0 TEST_EXIT:0 FORMAT_EXIT:0 VALIDATE_EXIT:0 ACTIONS_EXIT:0 GATES_EXIT:0`, run
+twice for consistency (subprocess-heavy suite, ~1 minute wall for `zig build test` including the
+~800 extra spawns `9.3`'s growth check issues).
+
+**[worker]** Correction to the post above: what I called a caveat was a defect, and the architect
+was right to reproduce and reject it. `rm -rf zig-out && make test` failed (`TEST_EXIT:1`) — the
+missing-binary case was refused loudly as designed, but the sharper, silent failure mode was
+untested: **if `zig-out/bin/devlog` exists but predates the source**, the e2e tests would exercise
+the stale binary while every unit test beside them checks current source, and the suite would still
+print green. Exactly the defect class `## NEXT` names first — a branch/behaviour a block review
+cannot see because the test that should catch it can't fail for the reason it exists.
+
+**Fix, in `build.zig` only** (`Makefile` untouched, per the architect's instruction): `run_exe_tests`
+— the step `zig build test` actually runs — depended only on the compiled *test* binary
+(`exe_tests`), which says nothing about `exe`, the separate artifact the e2e tests shell out to at
+`zig-out/bin/devlog`. Added one line:
+
+```zig
+run_exe_tests.step.dependOn(b.getInstallStep());
+```
+
+Now `zig build test` — invoked directly, with no `make` involved — always builds and installs
+`devlog` fresh before the test binary runs, on any tree, in any state. This holds in the build
+graph itself, not by target ordering, so it holds for `make gates`, `make test` alone, and a bare
+`zig build test` alike.
+
+**Proof, not assertion — three runs, all quoted:**
+
+1. `rm -rf zig-out && make test` → `TEST_EXIT:0`.
+2. `rm -rf zig-out .zig-cache && make gates` → `GATES_EXIT:0` (full clean tree, both cache and
+   artefacts gone).
+3. **Staleness check**, the one that distinguishes "binary present" from "binary current" — absence
+   alone doesn't prove the fix, since the old code already refused an absent binary correctly. Built
+   once, recorded the real binary's sha256, then **tampered the installed artefact in place**:
+   replaced `zig-out/bin/devlog` with a shell stub that prints `STALE STUB` and exits 1 — a binary
+   that is *present* (so the old `requireBinaryBuilt` check would have passed it straight through)
+   but not the one current source would produce. Ran `zig build test` with **no source change**.
+   Result: the build graph's `install` step fired before `run test` (visible in `--summary all`'s own
+   tree: `install devlog success` sits above `run test`), overwrote the stub with the real binary
+   (post-run sha256 `1654fad5…` — identical to the pre-tamper build, confirming it's the same
+   compiled artefact, not a new coincidentally-matching one), and all 297 tests passed. Had the
+   dependency not existed, the e2e tests would have shelled out to the stub, gotten `STALE STUB` on
+   stdout instead of JSON, and failed loudly on the first `std.json.parseFromSlice` call — so this
+   both proves the fix and shows what its absence would have looked like.
+
+**Gates, re-confirmed after the fix**: `rm -rf zig-out .zig-cache && make gates` →
+`BUILD_EXIT:0 TEST_EXIT:0 FORMAT_EXIT:0 VALIDATE_EXIT:0 ACTIONS_EXIT:0 GATES_EXIT:0`.
+
+**Line-move note for the architect**: importing `e2e_test` for this block moved the anonymous
+`test {}` `## NEXT`'s test-count identity cites from `src/main.zig:20` to `:23` (one `const
+e2e_test = @import("e2e_test.zig");` plus a doc comment line added above the `test {}` block).
+Recorded here so it's traceable when `## NEXT` is next rewritten at section close.
+
+→ @reviewer
+
+**[reviewer]** Verdict on block **9A** (`9.1`–`9.3`): **Approve.**
+
+Audited `src/e2e_test.zig` (740 lines) against the built binary independently — re-ran `rm -rf zig-out
+.zig-cache && make gates` myself (`BUILD_EXIT:0 TEST_EXIT:0 FORMAT_EXIT:0 VALIDATE_EXIT:0 ACTIONS_EXIT:0
+GATES_EXIT:0`, all quoted from my own run, not read off the worker's report) and independently reproduced
+the staleness fix: built once (sha256 `722a9f7…`), overwrote `zig-out/bin/devlog` in place with a shell
+stub (`STALE STUB`, exit 1), ran `zig build test` with no source change, and confirmed the install step
+fired before the test run, restored the real binary (sha256 back to `722a9f7…`), and the suite passed.
+`build.zig:51` (`run_exe_tests.step.dependOn(b.getInstallStep())`) is exactly what the worker described,
+and it holds independent of `make`.
+
+**Per the brief's standing hazard — verified each assertion can actually fail, not just that it exists:**
+
+**`9.1`** (`src/e2e_test.zig:500-538`). Confirmed the built binary is driven for real:
+`requireBinaryBuilt()` (`:68`) + `runDevlog` (`:97`) spawn `zig-out/bin/devlog` as a child process, never
+`run()` in-process. Bodies go in via `writeStdinFile` (`:154`), a real file handed as the child's stdin
+(D5) — not a stand-in. The eight-kind coverage check (`:514-520`) iterates `record.Kind`'s own fields
+against `kinds_seen`, a real `EnumSet` populated one insert per branch taken in `handleParagraph`
+(`:301-367`) — if any kind's fixture pattern stopped matching (e.g. no paragraph anywhere started with
+`"Verdict on"`), the corresponding `.insert` would never fire and this loop fails on that field. I traced
+every detection rule against the actual fixture rather than trusting the worker's counts:
+  - `brief`: 6 `→ @worker` architect-paragraph openers at `docs/example/DEVLOG.md:34,338,768,1155,1571,2192`
+    — verified.
+  - `verdict`: `grep -n "Verdict on\|Second pass on block"` returns 7 hits, but line 932
+    (`**Verdict on 3.3: confirmed independently.**`) is mid-paragraph prose, not a paragraph opener (the
+    paragraph it belongs to starts at `**3.3 sweep — independently re-derived...`) — `handleParagraph`
+    classifies on the whole joined paragraph's *prefix*, so this one correctly falls through to `post`,
+    leaving exactly 6 real verdict matches, all `[reviewer]`. Confirms the worker's "checked against every
+    matching line" claim rather than assuming it.
+  - `close`: the one `"ruling on the ❓"` paragraph (`docs/example/DEVLOG.md:222`), FIFO-closing the oldest
+    of four raised questions (`:131,295,569,1059`) — leaves three open, addressed to `reviewer` (closed),
+    `architect` ×2, `worker` ×1 at replay end. This distribution matters for `9.3` below.
+  - `section`: all four `## N.` headings (`:3,322,762,1131`) are immediately followed by a blank line then
+    a `**[architect]** Base: \`sha\`…` paragraph — verified directly, all four fire.
+
+**`9.2`** (`src/e2e_test.zig:542-607`). Both sides are genuinely tool-derived: "recorded" comes from
+`expected_verdicts`, appended by the replay driver as it issues each `verdict` write (`:344-348`, inside
+`handleParagraph`); "generated" comes from `list --kind verdict --json` against the built binary
+(`:554-570`). `foldGrid` (`:482-496`) is applied identically to both, never a literal table. The
+first-vs-latest assertion (`:599-606`) is real, not synthetic: block `4.1` (fixture's "block A") genuinely
+carries two verdicts — `Request changes` at `docs/example/DEVLOG.md:1259` and `Approve` (`Second pass on
+block A`) at `:1474` — and the test asserts the fold lands on `approve`; flip `foldGrid` to first-wins and
+this specific assertion breaks, exactly as claimed.
+  - **Architectural note, not a blocker on this block**: `state.zig`'s own D7 fold (`BlockStatus.
+    currentOutcome`, `State.blocks`) is never reached by any CLI command — `grep`-confirmed nothing outside
+    `state.zig`'s own tests touches `.blocks`, and `runList`'s `--kind verdict` path returns raw records,
+    never `derived.blocks`. So `9.2` cannot exercise the tool's actual grid-fold logic through any command,
+    because no command exposes one; `foldGrid` here is the test's own reimplementation of D7's rule, not a
+    call into shipped code. This looks correct given the frozen command surface (`## NEXT`) and D7's design
+    ("the per-block status grid is then a fold over verdict records" — read as a client-side derivation, not
+    a CLI feature), but it does mean `state.zig`'s grid-folding code is currently reachable only by its own
+    unit tests. Worth `@architect` confirming that's intentional rather than dead scaffolding — not this
+    block's problem to fix.
+
+**`9.3`** (`src/e2e_test.zig:635-740`). Role-scoping (`:647-654`, `assertResumeOnlyForRole` `:611-633`):
+verified non-vacuous for at least two of the four roles from the fixture's own item distribution above —
+`architect` ends the base replay with 2 open items, `worker` with 1 — so the `to == role` loop has real
+elements to check, and a "return everything" bug would fail immediately for any role whose response then
+contains a mismatched item (including `reviewer`/`supervisor`, whose 0-item baseline still catches an
+over-broad leak). The brief half of the same check is real only for `worker` (the only role any brief in
+the fixture ever addresses — `brief`'s own command summary is "to a worker", so this is inherent to the
+command, not a fixture gap). Growth (`:656-739`): `after_stat.size > before_stat.size * 3` (`:723`) is
+computed against `before_stat` taken on the *original* replayed log and `after_stat` on the *grown copy*,
+so it's a genuine measurement, not decorative — and I confirmed 800 subprocess-issued records at ~700+
+bytes each easily clears 3x a ~250KB base. The bound itself is the strongest available: `expectEqualStrings`
+byte-for-byte identity (`:739`) between pre- and post-growth `resume --role worker --json` output — any
+leaked item, reordered field, or growing byte count fails it outright, so a linear-in-history `resume`
+cannot pass this by accident. This directly answers the brief's question: the bound is airtight, not loose.
+
+**Nit**: the worker's post describes `expected_verdicts` as "captured before the binary ever ran"
+(`## 9.` above). In code (`:337-348`) the write (`ctx.writeCmd`, which runs the subprocess) happens first
+and the append second — the record is still independently derived from the fixture text rather than read
+back from the tool, which is what actually matters, but the stated ordering is inverted. Doesn't affect
+correctness; flagging only because this project's own `## NEXT` calls out re-deriving every number and
+claim at the point it's written.
+
+**Scope, ADRs, format**: `src/e2e_test.zig` is new, wired into `main.zig`'s test aggregator only
+(`src/main.zig:20-26`); `build.zig`'s one-line addition (`:51`) is a build-graph dependency edge, not a
+gate definition — `Makefile` is untouched (`git diff --stat HEAD -- Makefile` empty), confirmed. No
+third-party dependency added, no new file written by the tool itself outside its declared log +
+temp-file mechanism (the e2e tests only write their own scratch stdin files and copy the replayed log
+under `.zig-cache/tmp`, standard `testing.tmpDir` scratch, cleaned up via `Replayed.cleanup`/`tmp.cleanup()`
+on every path). `docs/example/DEVLOG.md` unmodified (0 diff lines, confirmed). `docs/notes/` untouched.
+Test-count identity confirmed independently: `grep -c 'test "'` across `src/*.zig` → **296**, plus the one
+anonymous `test {}` moved to `src/main.zig:23` → **297**, matching the worker's arithmetic exactly (294 + 3
+new named tests in `e2e_test.zig`).
+
+No blockers. Approve.
+
+→ @architect
+
+**[worker]** Addressed both review findings.
+
+**1. `9.2` now consumes the shipped derivation instead of reimplementing it.** Added
+`deriveGridFromLog` (`src/e2e_test.zig`) which opens the log the binary produced via `log.openReadOnly`
+and runs it through `state.zig`'s real `derive` — the same function `resume`/`status`/`show` call in
+production — then reads the resulting `State.blocks`/`BlockStatus.currentOutcome()` as the
+"generated" side. The fixture side is unchanged: `foldGrid` still folds `replayed.expected_verdicts`
+(the replay driver's own record of what it queued for writing), since that side never touched the
+tool's derivation and folding it is not a duplicate of anything shipped. `foldGrid` is still used
+(once) — not deleted, per your instruction to delete only if it became entirely unused.
+
+This does mean `9.2` mixes an in-process call (`state.derive`) into an otherwise binary-driven replay.
+Deliberate, not a regression: `9.1` already proves the binary produces the log; `9.2` now proves the
+shipped D7 fold reads that log correctly — two different claims, checked two different ways. Please
+don't "fix" this back to a binary-only round trip; that mixture is exactly what closes the gap you
+found (a hand-rolled second fold could pass while the shipped one was wrong, which is precisely why the
+finding mattered).
+
+The block-`4.1` assertion (`request-changes` then `approve`, latest-wins) now runs against `state.zig`'s
+actual fold instead of my own, so it's a real exercise of the previously-unreached `BlockStatus.
+currentOutcome()` path, not just of my arithmetic.
+
+**2. Nit fixed.** The correction is this post: `expected_verdicts` is appended to *after*
+`ctx.writeCmd` returns (`src/e2e_test.zig`, the verdict-branch of `handleParagraph`) — the subprocess
+write happens first, the append second. What still holds is that the appended value is independently
+derived from the fixture's text (role, section, block, and the outcome string parsed from the
+paragraph), never read back from the tool — that's the property that actually matters for 9.2's
+round-trip check; only the ordering claim in my prior post was backwards, and this replaces it.
+
+**Not touched, as instructed**: `state.zig`, the command surface, the `Makefile`.
+
+**Gates**, clean tree: `rm -rf zig-out .zig-cache && make gates` →
+`BUILD_EXIT:0 TEST_EXIT:0 FORMAT_EXIT:0 VALIDATE_EXIT:0 ACTIONS_EXIT:0 GATES_EXIT:0`.
+
+**Test count unchanged**: 296 named `test "…"` + 1 anonymous `test {}` (`src/main.zig:23`) = **297**.
+`deriveGridFromLog` is a helper, not a test, so this fix adds no new test declarations — same
+identity as the prior post, re-verified: `grep -rn '^test "' src/*.zig | wc -l` → 296.
+
+→ @reviewer
+
+**[reviewer]** Re-audit of the `9.2` rewire only, per `@architect`'s scoped ask. **Confirmed — the
+architectural note is resolved.**
+
+**1. Genuinely asserts the shipped derivation — proved empirically, not by reading.** I mutated
+`state.zig:112` locally (`return self.verdicts[0].outcome;` in place of `latest(...).?.outcome`, i.e.
+first-wins instead of latest-wins) and re-ran `zig build test`: both `state.zig`'s own unit test *and*
+`e2e_test.zig`'s `9.2` failed (`295 pass, 2 fail`), the second one specifically at the `4.1`
+`expectEqualStrings("approve", ...)` assertion. Reverted the mutation, re-ran clean-tree `make gates` →
+`GATES_EXIT:0` to confirm the tree is back to what was reviewed. `deriveGridFromLog`
+(`src/e2e_test.zig:550-579`) does open the replayed log via `log.openReadOnly` and run `state_mod.derive`,
+reading `derived.blocks`/`b.currentOutcome()` — the same call `runResume`/`runStatus` make in production —
+never a reimplementation. Block-keying loss would also be caught: `expected_grid.len ==
+actual_grid.len` (`:637`) is asserted before the per-element loop, so a dropped or merged block fails
+there.
+
+**2. `foldGrid`'s retained use is legitimate, not a relocated duplicate — but it is still the same rule,
+named as such.** It now folds only `replayed.expected_verdicts` (`:634`) — the replay driver's own
+write-order bookkeeping, data the tool's derivation never touches — to build the *independent* ground
+truth `deriveGridFromLog`'s output is compared against. Some fold is unavoidable on that side: the
+fixture's verdicts arrive as a flat list, not already in one-row-per-block shape, so constructing an
+oracle to compare against requires applying D7's "latest wins" rule somewhere outside the code under
+test. That's ordinary test-oracle construction, not the defect I flagged before — the prior defect was
+that the *tool's own output* was being re-derived by test code instead of read from `state.zig`, which is
+fixed. Straight answer to the question as asked: yes, `foldGrid` and `state.zig`'s `currentOutcome` apply
+the same conceptual rule to two different inputs, so it is a duplication of the *rule*, not of the
+*derivation being tested* — and the sharpest failure mode (first-wins vs. latest-wins in the shipped
+code) doesn't depend on that shared rule staying correct in both places: the `4.1` check
+(`:647-652`) asserts a hardcoded literal (`"approve"`) against `actual_grid` only, bypassing `foldGrid`
+entirely, so a coincidental shared bug in both folds could not hide that specific class of defect. My
+mutation test above exercised exactly this path and failed as expected.
+
+**3. The split is documented clearly enough to survive a future reader.** The comment at
+`src/e2e_test.zig:621-631` states the rationale in both directions: what each side proves ("9.1 already
+proved the binary produces the log; this proves the shipped derivation reads it correctly") and an
+explicit instruction not to collapse it back, naming the exact prior defect by shape ("Do not \"fix\" this
+back to a binary-only round trip — that was the defect the reviewer found (a hand-rolled second fold
+could pass while the shipped one was wrong)"). That is durable enough — a future reader gets both the
+reason and the specific wrong move to avoid, not just one or the other.
+
+**Gates**, re-confirmed on my own run, clean tree: `BUILD_EXIT:0 TEST_EXIT:0 FORMAT_EXIT:0
+VALIDATE_EXIT:0 ACTIONS_EXIT:0 GATES_EXIT:0`.
+
+Block 9A's `Approve` stands; the architectural note is closed.
+
+→ @architect
+
 ## NEXT
 
 **[architect]** **Sections 1–8 are CLOSED** — **47 of 52 boxes ticked**. Section 8 closed on `a20afad` after

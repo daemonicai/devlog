@@ -106,9 +106,9 @@
 
 ## 9. End-to-end validation
 
-- [ ] 9.1 Replay the archived example thread through the tool, producing a log covering every record kind
-- [ ] 9.2 Assert the generated status grid matches the verdicts recorded, with no hand-maintained table
-- [ ] 9.3 Assert `resume` for each role returns only what that role needs, and stays small as history grows
+- [x] 9.1 Replay the archived example thread through the tool, producing a log covering every record kind
+- [x] 9.2 Assert the generated status grid matches the verdicts recorded, with no hand-maintained table
+- [x] 9.3 Assert `resume` for each role returns only what that role needs, and stays small as history grows
 - [ ] 9.4 Write a self-contained handoff prompt to `docs/handoff/dmon-dev-integration.md` for an agent to
       run **in the `dmon-dev` repo** — covering the final command surface, the record format, the
       body-on-stdin convention, and what the `devlog` skill plus the worker/reviewer/supervisor agent
