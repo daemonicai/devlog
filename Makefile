@@ -43,15 +43,23 @@ fmt:
 
 # --- spec ----------------------------------------------------------------------
 
-# Validates every active change (archive excluded). No active change is a failure,
-# not a silent pass — an empty run would otherwise report VALIDATE_EXIT:0 while
-# having validated nothing.
+# Validates every active change (archive excluded), or — when none is active —
+# the main specs under openspec/specs/. The rule is that this target must never
+# report success having checked nothing: it validated a change, or it validated
+# the specs, and an empty repo with neither is still a failure.
+#
+# It used to fail outright on zero active changes, which was right while a change
+# was always in flight and wrong the moment one was archived: `make gates` went
+# permanently red on a clean repo. Archiving add-devlog-core is what surfaced it.
 validate:
 	@fail=0; \
-	if [ -z "$(CHANGES)" ]; then \
-		echo "no active change found under openspec/changes/"; fail=1; \
-	else \
+	if [ -n "$(CHANGES)" ]; then \
 		for c in $(CHANGES); do openspec validate $$c --strict || fail=1; done; \
+	elif [ -d openspec/specs ]; then \
+		echo "no active change — validating the main specs instead"; \
+		openspec validate --specs --strict || fail=1; \
+	else \
+		echo "nothing to validate: no active change and no openspec/specs/"; fail=1; \
 	fi; \
 	echo "VALIDATE_EXIT:$$fail"; exit $$fail
 
